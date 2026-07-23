@@ -5,6 +5,7 @@ build/
 build-ninja/
 release/
 *.bak*
+*.rs
 *.exe
 *.obj
 *.o
