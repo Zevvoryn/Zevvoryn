@@ -38,6 +38,14 @@ package-lock.json
 # ===========================
 .mcp-hidden/
 .mimocode/
+server.js
+server.json
+package.json
+hotfix18_multiplayer.py
+start-mcp-hidden.ps1
+start-mcp-proxy.bat
+stop-mcp-hidden.ps1
+stop-mcp.bat
 
 # ===========================
 # OS / IDE
