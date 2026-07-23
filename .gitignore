@@ -34,7 +34,7 @@ node_modules/
 package-lock.json
 
 # ===========================
-# MCP / MiMoCode internal
+# Local dev tools
 # ===========================
 .mcp-hidden/
 .mimocode/
