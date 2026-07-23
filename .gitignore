@@ -1,0 +1,52 @@
+# ===========================
+# C++ build artifacts
+# ===========================
+build/
+build-ninja/
+release/
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.a
+*.dll
+*.so
+*.dylib
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+_deps/
+
+# Ninja build files
+.ninja_deps
+.ninja_log
+build.ninja
+
+# ===========================
+# Node.js
+# ===========================
+node_modules/
+package-lock.json
+
+# ===========================
+# MCP / MiMoCode internal
+# ===========================
+.mcp-hidden/
+.mimocode/
+
+# ===========================
+# OS / IDE
+# ===========================
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+Thumbs.db
+Desktop.ini
+.DS_Store

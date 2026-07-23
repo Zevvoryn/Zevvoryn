@@ -1,0 +1,11 @@
+{
+    "compression_threshold": 256,
+    "max_players": 20,
+    "motd": "A C++ Minecraft Server",
+    "online_mode": true,
+    "port": 25565,
+    "server_name": "NetherCraft",
+    "view_distance": 10,
+    "world_seed": 0,
+    "world_type": "flat"
+}

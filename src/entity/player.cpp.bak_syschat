@@ -1,0 +1,19 @@
+#include "player.hpp"
+#include "../protocol/codec_1_21_1/packet_ids.hpp"
+#include "../core/log.hpp"
+
+namespace nc::entity {
+
+void Player::sendPacket(protocol::PacketId id, const std::vector<u8>& data) {
+    if (!connection_ || !connection_->isConnected()) return;
+    connection_->sendPacket(static_cast<i32>(id), data);
+}
+
+void Player::sendSystemMessage(std::string_view message) {
+    net::Buffer buf;
+    buf.writeString(std::string(message));
+    buf.writeBool(false); // not in actionbar
+    sendPacket(protocol::PacketId::PlaySystemChatMessage, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+}
+
+} // namespace nc::entity

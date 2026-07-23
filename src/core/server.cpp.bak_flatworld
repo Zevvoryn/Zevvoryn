@@ -1,0 +1,996 @@
+#include "server.hpp"
+#include "log.hpp"
+#include "../registries/registry.hpp"
+#include "../utils/nbt.hpp"
+
+#include <nlohmann/json.hpp>
+#include <format>
+#include <thread>
+#include <fstream>
+#include <filesystem>
+
+namespace nc {
+
+NetherCraftServer::NetherCraftServer() {
+    registries::RegistryManager::instance().loadDefaults();
+}
+
+NetherCraftServer::~NetherCraftServer() {
+    stop();
+}
+
+bool NetherCraftServer::start(const std::string& configPath) {
+    config_ = ServerConfig::loadFrom(configPath);
+    return startCommon();
+}
+
+bool NetherCraftServer::startWithConfig(const ServerConfig& cfg) {
+    config_ = cfg;
+    return startCommon();
+}
+
+bool NetherCraftServer::startCommon() {
+    auto startTime = std::chrono::steady_clock::now();
+
+    // ── Баннер запуска ──
+    std::cout << "\n";
+    std::cout << "\033[36m[Starting server...]\033[0m\n\n";
+
+    std::cout << "\033[32m\033[1m";
+    std::cout << "  ███████╗███████╗██╗   ██╗██╗   ██╗ ██████╗ ██████╗ ██╗   ██╗███╗   ██╗\n";
+    std::cout << "  ╚══███╔╝██╔════╝██║   ██║██║   ██║██╔═══██╗██╔══██╗╚██╗ ██╔╝████╗  ██║\n";
+    std::cout << "    ███╔╝ █████╗  ██║   ██║██║   ██║██║   ██║██████╔╝ ╚████╔╝ ██╔██╗ ██║\n";
+    std::cout << "   ███╔╝  ██╔══╝  ╚██╗ ██╔╝╚██╗ ██╔╝██║   ██║██╔══██╗  ╚██╔╝  ██║╚██╗██║\n";
+    std::cout << "  ███████╗███████╗ ╚████╔╝  ╚████╔╝ ╚██████╔╝██║  ██║   ██║   ██║ ╚████║\n";
+    std::cout << "  ╚══════╝╚══════╝  ╚═══╝    ╚═══╝   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═══╝\n";
+    std::cout << "\033[0m";
+
+    std::cout << "\n";
+    const char* tl = "\xe2\x95\x94"; // ╔
+    const char* tr = "\xe2\x95\x97"; // ╗
+    const char* bl = "\xe2\x95\x9a"; // ╚
+    const char* br = "\xe2\x95\x9d"; // ╝
+    const char* h  = "\xe2\x95\x90"; // ═
+    const char* v  = "\xe2\x95\x91"; // ║
+    int bw = 52; // ширина внутренней области
+    auto line = [&](const char* l, const char* r) {
+        std::cout << "  " << l;
+        for (int i = 0; i < bw; ++i) std::cout << h;
+        std::cout << r << "\n";
+    };
+    auto row = [&](const std::string& content, int displayWidth) {
+        int pad = bw - displayWidth;
+        if (pad < 0) pad = 0;
+        int leftPad = pad / 2;
+        int rightPad = pad - leftPad;
+        std::cout << "  " << v;
+        for (int i = 0; i < leftPad; ++i) std::cout << ' ';
+        std::cout << content;
+        for (int i = 0; i < rightPad; ++i) std::cout << ' ';
+        std::cout << v << "\n";
+    };
+    std::cout << "\033[36m\033[1m";
+    line(tl, tr);
+    row("Minecraft Java Edition 1.21.1", 30);
+    row("High Performance C++20", 22);
+    row("No JVM | No JNI | No Wrappers", 30);
+    line(bl, br);
+    std::cout << "\033[0m\n";
+
+    // Создаём структуру директорий
+    std::filesystem::create_directories(config_.levelName);
+    std::filesystem::create_directories("logs");
+    log::initFileLog(config_.language); // LOGNAME_V1: logs/log-ДД.ММ.ГГ.log (eng: ММ.ДД.ГГ), 15 последних
+
+    NC_INFO("Server", "Loading server configuration");
+
+    // Определяем язык
+    if (config_.language == "rus") {
+        NC_INFO("Server", "Выбран русский (rus) как основной язык");
+    } else {
+        NC_INFO("Server", "Language set to English (eng)");
+    }
+
+    NC_INFO("Server", "Starting Minecraft: Java Edition server v1.21.1");
+    NC_INFO("Server", "Online mode: {}", config_.xboxAuth ? "enabled" : "disabled");
+
+    i32 radius = config_.viewDistance / 16 + 1;
+    // WORLDSAVE_V1: сначала пробуем загрузить сохранённый мир
+    if (world_.loadFromDisk("world/world.dat")) {
+        NC_INFO("Server", "Мир загружен с диска: {} чанков", world_.getLoadedChunkCount());
+    } else {
+        if (config_.generator == "FLAT") {
+            world_.generateFlat(config_.levelSeed, 0, 0, radius);
+        } else {
+            world_.generateFlat(config_.levelSeed, 0, 0, radius);
+        }
+        world_.saveToDisk("world/world.dat");
+        NC_INFO("Server", "Новый мир создан и сохранён в world/world.dat");
+    }
+
+    network_.onConnection([this](auto conn) { onPlayerConnect(conn); });
+    network_.onDisconnect([this](auto conn) { onPlayerDisconnect(conn); });
+    network_.onPacket([this](auto conn, auto& data, auto id) { onPacketReceived(conn, data, id); });
+
+    if (!network_.start(static_cast<u16>(config_.port))) {
+        NC_FATAL("Server", "Failed to start server on port {}", config_.port);
+        return false;
+    }
+
+    std::string lang = (config_.language == "rus") ? "Русский (rus)" : "English (eng)";
+
+    // Информация о сервере (как PMMP)
+    std::cout << "\n";
+    NC_INFO("Server", "Network interface listening on 0.0.0.0:{}", config_.port);
+    NC_INFO("Server", "Default gamemode: {}", config_.gamemode);
+    NC_INFO("Server", "Difficulty: {} ({})", config_.difficulty,
+        config_.difficulty == 0 ? "Peaceful" :
+        config_.difficulty == 1 ? "Easy" :
+        config_.difficulty == 2 ? "Normal" : "Hard");
+    NC_INFO("Server", "Language: {}", lang);
+    NC_INFO("Server", "View distance: {} chunks", config_.viewDistance);
+    NC_INFO("Server", "Max players: {}", config_.maxPlayers);
+    std::cout << "\n";
+
+    // Ссылки
+    std::cout << "\033[36m";
+    std::cout << "  - GitHub:     https://github.com/zevvoryn/zevvoryn\n";
+    std::cout << "  - Docs:       https://docs.zevvoryn.dev\n";
+    std::cout << "  - Report bug: https://github.com/zevvoryn/zevvoryn/issues\n";
+    std::cout << "\033[0m\n";
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - startTime).count();
+    double seconds = elapsed / 1000.0;
+
+    if (config_.language == "rus") {
+        NC_INFO("Server", "Done! (\xd0\xb7\xd0\xb0 {:.2f} \xd1\x81\xd0\xb5\xd0\xba.) \xd0\xa2\xd0\xb8\xd0\xbf \xe2\x80\x9chelp\xe2\x80\x9d \xd0\xb4\xd0\xbb\xd1\x8f \xd1\x81\xd0\xbf\xd1\x80\xd0\xb0\xd0\xb2\xd0\xba\xd0\xb8.", seconds);
+    } else {
+        NC_INFO("Server", "Done! ({}s) Type 'help' for a list of commands.", seconds);
+    }
+    std::cout << "\n";
+
+    return true;
+}
+
+void NetherCraftServer::stop() {
+    // WORLDSAVE_V1: сохраняем мир и игроков при остановке
+    if (world_.getLoadedChunkCount() > 0) {
+        world_.saveToDisk("world/world.dat");
+        for (auto& p : getAllPlayersCopy()) savePlayerData(p);
+        NC_INFO("Server", "Мир сохранён в world/world.dat");
+    }
+    network_.stop();
+}
+
+void NetherCraftServer::run() {
+    auto tickDuration = std::chrono::milliseconds(50);
+    auto nextTick = std::chrono::steady_clock::now();
+
+    while (network_.isRunning()) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= nextTick) {
+            tick();
+            nextTick = now + tickDuration;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+// ============================================================
+// Сетевые события
+// ============================================================
+
+void NetherCraftServer::onPlayerConnect(std::shared_ptr<net::Connection> conn) {
+    u64 eid = nextEntityId_++;
+    auto player = std::make_shared<entity::Player>(eid, conn);
+    conn->setData<entity::Player>(player);
+
+    std::lock_guard lock(playersMutex_);
+    players_[conn->getId()] = player;
+}
+
+void NetherCraftServer::onPlayerDisconnect(std::shared_ptr<net::Connection> conn) {
+    auto player = conn->getData<entity::Player>();
+    if (player && !player->getName().empty()) {
+        NC_INFO("Server", "{} disconnected", player->getName());
+        savePlayerData(player); // WORLDSAVE_V1
+    }
+
+    std::lock_guard lock(playersMutex_);
+    players_.erase(conn->getId());
+    network_.removeConnection(conn->getId());
+}
+
+void NetherCraftServer::onPacketReceived(std::shared_ptr<net::Connection> conn, net::Buffer& data, i32 wireId) {
+    auto player = conn->getData<entity::Player>();
+    if (!player) return;
+
+    auto state = conn->getConnectionState();
+    NC_INFO("Server", "[{}] pkt wireId=0x{:02X}, state={}", player->getName(), wireId, static_cast<int>(state));
+
+    switch (state) {
+        case ConnectionState::Handshaking:
+            handleHandshake(player, data);
+            break;
+        case ConnectionState::Status:
+            handleStatus(player, data, wireId);
+            break;
+        case ConnectionState::Login:
+            handleLogin(player, data, wireId);
+            break;
+        case ConnectionState::Configuration:
+            handleConfiguration(player, data, wireId);
+            break;
+        case ConnectionState::Play:
+            handlePlay(player, data, wireId);
+            break;
+    }
+}
+
+// ============================================================
+// Handshake
+// ============================================================
+
+void NetherCraftServer::handleHandshake(std::shared_ptr<entity::Player> player, net::Buffer& data) {
+    i32 protocolVersion = data.readVarInt();
+    std::string serverAddress = data.readString();
+    u16 serverPort = data.readU16();
+    i32 nextState = data.readVarInt();
+
+    // nextState: 1=Status, 2=Login — показываем только Login
+    if (nextState == 2) {
+        NC_INFO("Server", "Handshake: protocol={}, login", protocolVersion);
+    }
+
+    if (protocolVersion != 767) {
+        NC_WARN("Server", "Неподдерживаемая версия: {}", protocolVersion);
+        net::Buffer discBuf;
+        nlohmann::json discJson;
+        discJson["text"] = std::format("Поддерживается только 1.21.1 (767). Версия: {}", protocolVersion);
+        discBuf.writeString(discJson.dump());
+        player->getConnection()->sendPacket(0x00, std::vector<u8>(discBuf.writtenSpan().begin(), discBuf.writtenSpan().end()));
+        return;
+    }
+
+    if (nextState == 1) {
+        player->getConnection()->setConnectionState(ConnectionState::Status);
+    } else if (nextState == 2) {
+        player->getConnection()->setConnectionState(ConnectionState::Login);
+    }
+}
+
+// ============================================================
+// Status (Server List Ping)
+// ============================================================
+
+void NetherCraftServer::handleStatus(std::shared_ptr<entity::Player> player, net::Buffer& data, i32 wireId) {
+    if (wireId == 0x00) {
+        // Status Request — отправляем JSON ответ
+        sendStatusResponse(player);
+    } else if (wireId == 0x01) {
+        // Ping — эхо обратно
+        if (data.readableBytes() >= 8) {
+            i64 payload = data.readI64();
+            net::Buffer pongBuf;
+            pongBuf.writeI64(payload);
+            player->getConnection()->sendPacket(0x01, std::vector<u8>(pongBuf.writtenSpan().begin(), pongBuf.writtenSpan().end()));
+        } else {
+            // Пустой ping — отправляем 0
+            net::Buffer pongBuf;
+            pongBuf.writeI64(0);
+            player->getConnection()->sendPacket(0x01, std::vector<u8>(pongBuf.writtenSpan().begin(), pongBuf.writtenSpan().end()));
+        }
+    }
+}
+
+void NetherCraftServer::sendStatusResponse(std::shared_ptr<entity::Player> player) {
+    // Считаем только реальных игроков (в Play), а не все соединения
+    int onlineCount = 0;
+    {
+        std::lock_guard lock(playersMutex_);
+        for (auto& [id, p] : players_) {
+            if (p->isAlive() && p->getState() == entity::PlayerState::Play) {
+                onlineCount++;
+            }
+        }
+    }
+
+    nlohmann::json response;
+    response["version"]["name"] = "1.21.1";
+    response["version"]["protocol"] = 767;
+    response["players"]["max"] = config_.maxPlayers;
+    response["players"]["online"] = onlineCount;
+    response["players"]["sample"] = nlohmann::json::array();
+    response["description"]["text"] = config_.motd;
+
+    net::Buffer buf;
+    buf.writeString(response.dump());
+    player->getConnection()->sendPacket(0x00, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+}
+
+// ============================================================
+// Login
+// ============================================================
+
+void NetherCraftServer::handleLogin(std::shared_ptr<entity::Player> player, net::Buffer& data, i32 wireId) {
+    NC_INFO("Server", "Login packet: wireId=0x{:02X}, readable={}", wireId, data.readableBytes());
+    if (wireId == 0x00) {
+        // Login Start: string name + UUID
+        std::string name = data.readString();
+        UUID uuid = data.readUUID();
+
+        player->setName(name);
+        player->setUuid(uuid);
+        player->setState(entity::PlayerState::Login);
+        NC_INFO("Server", "Login: {}", name);
+
+        sendLoginSuccess(player);
+    } else if (wireId == 0x03) {
+        // Login Acknowledged — клиент переключился в Configuration
+        NC_INFO("Server", "{} acknowledged login, switching to Configuration", player->getName());
+        player->getConnection()->setConnectionState(ConnectionState::Configuration);
+        player->setState(entity::PlayerState::Configuration);
+
+        // Send feature flags + select_known_packs (client responds, then we send registries)
+        sendInitialConfig(player);
+    }
+}
+
+void NetherCraftServer::sendLoginSuccess(std::shared_ptr<entity::Player> player) {
+    net::Buffer buf;
+    buf.writeUUID(player->getUuid());
+    buf.writeString(player->getName());
+
+    // Properties count (0 — offline, без скинов)
+    buf.writeVarInt(0);
+
+    // 1.20.2+: Strict Error Handling (boolean) — ОБЯЗАТЕЛЕН
+    buf.writeBool(true); // strict: ошибки протокола видны сразу, а не вечный Joining world
+
+    // 0x02 = Login Success
+    player->getConnection()->sendPacket(0x02, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+}
+
+// ============================================================
+// Configuration (1.21.1)
+// ============================================================
+
+void NetherCraftServer::handleConfiguration(std::shared_ptr<entity::Player> player, net::Buffer& data, i32 wireId) {
+    auto remaining = data.readableBytes();
+    NC_INFO("Server", "Config recv: wireId=0x{:02X}, {}B", wireId, remaining);
+
+    if (wireId == 0x03) {
+        // Finish Configuration Acknowledged → Play
+        NC_INFO("Server", "Игрок {} → Play", player->getName());
+        player->getConnection()->setConnectionState(ConnectionState::Play);
+        player->setState(entity::PlayerState::Play);
+        NC_INFO("Server", "{} -> Play", player->getName());
+
+        loadPlayerData(player); // WORLDSAVE_V1: восстановить позицию игрока с диска
+
+        sendJoinPlay(player);
+        NC_INFO("Server", "  SendJoinPlay done");
+        sendSpawnPosition(player);
+        NC_INFO("Server", "  SendSpawnPosition done");
+        sendPlayerAbilities(player);
+        NC_INFO("Server", "  SendPlayerAbilities done");
+        sendPlayerPositionAndLook(player);
+        NC_INFO("Server", "  SendPositionAndLook done");
+        sendTimeUpdate(player);
+        NC_INFO("Server", "  SendTimeUpdate done");
+
+        // PlayerInfoUpdate (0x3E) — add player to tab list
+        {
+            net::Buffer infoBuf;
+            // Action bitmask: ADD_PLAYER(0x01) | UPDATE_GAME_MODE(0x04) | UPDATE_LISTED(0x08) | UPDATE_LATENCY(0x10) = 0x1D
+            infoBuf.writeVarInt(0x1D);
+            // Player count
+            infoBuf.writeVarInt(1);
+            // UUID
+            infoBuf.writeUUID(player->getUuid());
+            // game_profile: name
+            infoBuf.writeString(player->getName());
+            // game_profile: 0 properties
+            infoBuf.writeVarInt(0);
+            // gamemode: creative = 1
+            infoBuf.writeVarInt(1);
+            // listed: true
+            infoBuf.writeVarInt(1);
+            // latency: 0
+            infoBuf.writeVarInt(0);
+            player->getConnection()->sendPacket(0x3E,
+                std::vector<u8>(infoBuf.writtenSpan().begin(), infoBuf.writtenSpan().end()));
+        }
+        NC_INFO("Server", "  SendPlayerInfo done");
+
+        // UpdateViewPosition (0x54) — tell client chunk center
+        {
+            net::Buffer viewBuf;
+            viewBuf.writeVarInt(0); // chunk X
+            viewBuf.writeVarInt(0); // chunk Z
+            player->getConnection()->sendPacket(0x54,
+                std::vector<u8>(viewBuf.writtenSpan().begin(), viewBuf.writtenSpan().end()));
+        }
+
+        // UpdateViewDistance (0x55) — tell client view distance
+        {
+            net::Buffer vdBuf;
+            vdBuf.writeVarInt(2); // view distance = 2 (matches our world size)
+            player->getConnection()->sendPacket(0x55,
+                std::vector<u8>(vdBuf.writtenSpan().begin(), vdBuf.writtenSpan().end()));
+        }
+
+        sendChunksAround(player, 0, 0, 2); // Send 5x5 chunks (radius=2, enough for our 3x3 world)
+    } else if (wireId == 0x07) {
+        // select_known_packs from client → NOW send registries + tags + finish
+        NC_INFO("Server", "Client sent select_known_packs (0x07), sending registries...");
+        sendRegistryData(player);
+        sendConfigurationFinish(player);
+    } else if (wireId == 0x00) {
+        // ClientInformation (Configuration) — locale, view distance, chat mode, etc.
+        data.readString();      // locale (e.g. "ru_ru")
+        data.readVarInt();      // view distance
+        data.readVarInt();      // chat mode
+        data.readBool();        // chat colors
+        data.readByte();        // skin parts (bitmask)
+        data.readByte();        // main hand (0=left, 1=right)
+        data.readBool();        // enable text filtering
+        data.readBool();        // allow server listings
+        NC_INFO("Server", "ClientInformation received from {}", player->getName());
+    } else if (wireId == 0x02) {
+        // PluginMessage (Configuration) — channel + data
+        data.readString();      // channel (e.g. "minecraft:brand")
+        size_t rem = data.readableBytes();
+        if (rem > 0) data.readBytes(rem);
+        NC_INFO("Server", "PluginMessage (config) from {}", player->getName());
+    } else {
+        NC_INFO("Server", "UNHANDLED Config wireId=0x{:02X}", wireId);
+    }
+}
+
+void NetherCraftServer::sendInitialConfig(std::shared_ptr<entity::Player> player) {
+    // Minestom order: brand → select_known_packs → [wait client] → registries → tags → finish
+    // We skip brand (client already sent it).
+
+    // 1. Feature Flags (0x0C)
+    {
+        net::Buffer buf;
+        buf.writeVarInt(1);
+        buf.writeString("minecraft:vanilla");
+        player->getConnection()->sendPacket(0x0C,
+            std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+        NC_INFO("Server", "Sent Feature Flags to {}", player->getName());
+    }
+
+    // 2. Select Known Packs (0x0E) — "minecraft:core:1.21.1"
+    {
+        net::Buffer buf;
+        buf.writeVarInt(1); // 1 pack
+        buf.writeString("minecraft");   // namespace
+        buf.writeString("core");        // id
+        buf.writeString("1.21.1");      // version
+        player->getConnection()->sendPacket(0x0E,
+            std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+        NC_INFO("Server", "Sent Select Known Packs (minecraft:core:1.21.1) to {}", player->getName());
+    }
+    // Client will respond with wireId=0x07 → handleConfiguration sends registries + finish
+}
+
+void NetherCraftServer::sendRegistryData(std::shared_ptr<entity::Player> player) {
+    // REGISTRY_FULL_V2: полные ванильные списки записей 1.21.1.
+    // Все записи с has_data=0 - клиент грузит данные из known pack
+    // minecraft:core:1.21.1, который он подтвердил через select_known_packs.
+    // Частичные реестры ломают Fabric-клиенты (Failed to load registries).
+    auto sendRegistry = [&](const char* registryName,
+                            std::initializer_list<const char*> entries) {
+        net::Buffer p;
+        p.writeString(registryName);
+        p.writeVarInt(static_cast<i32>(entries.size()));
+        for (const char* e : entries) {
+            std::string full = std::string("minecraft:") + e;
+            p.writeString(full);
+            p.writeByte(0); // has_data = false (данные из known pack)
+        }
+        player->getConnection()->sendPacket(0x07,
+            std::vector<u8>(p.writtenSpan().begin(), p.writtenSpan().end()));
+        NC_INFO("Server", "Registry {} sent ({} entries, known-pack)",
+            registryName, entries.size());
+    };
+
+    sendRegistry("minecraft:dimension_type", {
+        "overworld", "overworld_caves", "the_end", "the_nether"
+    });
+
+    sendRegistry("minecraft:worldgen/biome", {
+        "badlands", "bamboo_jungle", "basalt_deltas", "beach", "birch_forest", "cherry_grove",
+        "cold_ocean", "crimson_forest", "dark_forest", "deep_cold_ocean", "deep_dark",
+        "deep_frozen_ocean", "deep_lukewarm_ocean", "deep_ocean", "desert", "dripstone_caves",
+        "end_barrens", "end_highlands", "end_midlands", "eroded_badlands", "flower_forest",
+        "forest", "frozen_ocean", "frozen_peaks", "frozen_river", "grove", "ice_spikes",
+        "jagged_peaks", "jungle", "lukewarm_ocean", "lush_caves", "mangrove_swamp", "meadow",
+        "mushroom_fields", "nether_wastes", "ocean", "old_growth_birch_forest",
+        "old_growth_pine_taiga", "old_growth_spruce_taiga", "plains", "river", "savanna",
+        "savanna_plateau", "small_end_islands", "snowy_beach", "snowy_plains", "snowy_slopes",
+        "snowy_taiga", "soul_sand_valley", "sparse_jungle", "stony_peaks", "stony_shore",
+        "sunflower_plains", "swamp", "taiga", "the_end", "the_void", "warm_ocean",
+        "warped_forest", "windswept_forest", "windswept_gravelly_hills", "windswept_hills",
+        "windswept_savanna", "wooded_badlands"
+    });
+
+    sendRegistry("minecraft:chat_type", {
+        "chat", "emote_command", "msg_command_incoming", "msg_command_outgoing", "say_command",
+        "team_msg_command_incoming", "team_msg_command_outgoing"
+    });
+
+    sendRegistry("minecraft:damage_type", {
+        "arrow", "bad_respawn_point", "cactus", "campfire", "cramming", "dragon_breath",
+        "drown", "dry_out", "explosion", "fall", "falling_anvil", "falling_block",
+        "falling_stalactite", "fireball", "fireworks", "fly_into_wall", "freeze", "generic",
+        "generic_kill", "hot_floor", "in_fire", "in_wall", "indirect_magic", "lava",
+        "lightning_bolt", "magic", "mob_attack", "mob_attack_no_aggro", "mob_projectile",
+        "on_fire", "out_of_world", "outside_border", "player_attack", "player_explosion",
+        "sonic_boom", "spit", "stalagmite", "starve", "sting", "sweet_berry_bush", "thorns",
+        "thrown", "trident", "unattributed_fireball", "wind_charge", "wither", "wither_skull"
+    });
+
+    sendRegistry("minecraft:trim_pattern", {
+        "bolt", "coast", "dune", "eye", "flow", "host", "raiser", "rib", "sentry", "shaper",
+        "silence", "snout", "spire", "tide", "vex", "ward", "wayfinder", "wild"
+    });
+
+    sendRegistry("minecraft:trim_material", {
+        "amethyst", "copper", "diamond", "emerald", "gold", "iron", "lapis", "netherite",
+        "quartz", "redstone"
+    });
+
+    sendRegistry("minecraft:banner_pattern", {
+        "base", "border", "bricks", "circle", "creeper", "cross", "curly_border",
+        "diagonal_left", "diagonal_right", "diagonal_up_left", "diagonal_up_right", "flow",
+        "flower", "globe", "gradient", "gradient_up", "guster", "half_horizontal",
+        "half_horizontal_bottom", "half_vertical", "half_vertical_right", "mojang", "piglin",
+        "rhombus", "skull", "small_stripes", "square_bottom_left", "square_bottom_right",
+        "square_top_left", "square_top_right", "straight_cross", "stripe_bottom",
+        "stripe_center", "stripe_downleft", "stripe_downright", "stripe_left", "stripe_middle",
+        "stripe_right", "stripe_top", "triangle_bottom", "triangle_top", "triangles_bottom",
+        "triangles_top"
+    });
+
+    sendRegistry("minecraft:enchantment", {
+        "aqua_affinity", "bane_of_arthropods", "binding_curse", "blast_protection", "breach",
+        "channeling", "density", "depth_strider", "efficiency", "feather_falling",
+        "fire_aspect", "fire_protection", "flame", "fortune", "frost_walker", "impaling",
+        "infinity", "knockback", "looting", "loyalty", "luck_of_the_sea", "lure", "mending",
+        "multishot", "piercing", "power", "projectile_protection", "protection", "punch",
+        "quick_charge", "respiration", "riptide", "sharpness", "silk_touch", "smite",
+        "soul_speed", "sweeping_edge", "swift_sneak", "thorns", "unbreaking",
+        "vanishing_curse", "wind_burst"
+    });
+
+    sendRegistry("minecraft:jukebox_song", {
+        "11", "13", "5", "blocks", "cat", "chirp", "creator", "creator_music_box", "far",
+        "mall", "mellohi", "otherside", "pigstep", "precipice", "relic", "stal", "strad",
+        "wait", "ward"
+    });
+
+    sendRegistry("minecraft:painting_variant", {
+        "alban", "aztec", "aztec2", "backyard", "baroque", "bomb", "bouquet", "burning_skull",
+        "bust", "cavebird", "changing", "cotan", "courbet", "creebet", "donkey_kong", "earth",
+        "endboss", "fern", "fighters", "finding", "fire", "graham", "humble", "kebab",
+        "lowmist", "match", "meditative", "orb", "owlemons", "passage", "pigscene", "plant",
+        "pointer", "pond", "pool", "prairie_ride", "sea", "skeleton", "skull_and_roses",
+        "stage", "sunflowers", "sunset", "tides", "unpacked", "void", "wanderer", "wasteland",
+        "water", "wind", "wither"
+    });
+
+    sendRegistry("minecraft:wolf_variant", {
+        "ashen", "black", "chestnut", "pale", "rusty", "snowy", "spotted", "striped", "woods"
+    });
+
+    // Tags (0x0D) - пусто (валидно)
+    {
+        net::Buffer buf;
+        buf.writeVarInt(0); // 0 tag types
+        player->getConnection()->sendPacket(0x0D,
+            std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+        NC_INFO("Server", "Sent Tags to {}", player->getName());
+    }
+
+    NC_INFO("Server", "Sent all registries to {}", player->getName());
+}
+
+void NetherCraftServer::sendConfigurationFinish(std::shared_ptr<entity::Player> player) {
+    NC_INFO("Server", ">>> Sending Finish Configuration (0x03) to {}", player->getName());
+    player->getConnection()->sendPacket(0x03, std::vector<u8>{});
+    NC_INFO("Server", ">>> Finish Configuration sent OK");
+}
+
+// ============================================================
+// Play — Join Game (1.21.1)
+// ============================================================
+
+void NetherCraftServer::sendJoinPlay(std::shared_ptr<entity::Player> player) {
+    net::Buffer buf;
+
+    // Entity ID
+    buf.writeI32(static_cast<i32>(player->getEntityId()));
+
+    // Is Hardcore
+    buf.writeBool(false);
+
+    // World Names count + names
+    buf.writeVarInt(1);
+    buf.writeString("minecraft:overworld");
+
+    // Max players
+    buf.writeVarInt(config_.maxPlayers);
+
+    // View distance — must match actual world size
+    buf.writeVarInt(2);
+
+    // Simulation distance
+    buf.writeVarInt(2);
+
+    // Reduced debug info
+    buf.writeBool(false);
+
+    // Enable respawn screen
+    buf.writeBool(false);
+
+    // Do limited crafting
+    buf.writeBool(false);
+
+    // === CommonPlayerSpawnInfo ===
+
+    // Dimension type: Holder via holderRegistry = VarInt(registry index)
+    // Index 0 = overworld (order matches registry data we sent)
+    buf.writeVarInt(0);
+
+    // Dimension name
+    buf.writeString("minecraft:overworld");
+
+    // Hashed seed
+    buf.writeI64(config_.levelSeed);
+
+    // GameType: byte (i8), 1=creative
+    buf.writeByte(1);
+
+    // PreviousGameType: byte (i8), -1=none
+    buf.writeByte(-1);
+
+    // Is debug
+    buf.writeBool(false);
+
+    // Is flat
+    buf.writeBool(true);
+
+    // Death location: optional (VarInt 0=absent)
+    buf.writeVarInt(0);
+
+    // Portal cooldown: VarInt (STANDALONE)
+    buf.writeVarInt(0);
+
+    // Enforces secure chat
+    buf.writeBool(false);
+
+    auto payload = std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end());
+
+    // Hex dump Login packet
+    std::string hex;
+    for (size_t i = 0; i < payload.size(); ++i) {
+        hex += std::format("{:02X} ", payload[i]);
+    }
+    NC_INFO("Server", "JoinPlay (0x2B) payload: {}B", payload.size());
+    NC_INFO("Server", "  hex: {}", hex);
+
+    player->getConnection()->sendPacket(0x2B, payload);
+}
+
+// ============================================================
+// Play — Spawn Position
+// ============================================================
+
+void NetherCraftServer::sendSpawnPosition(std::shared_ptr<entity::Player> player) {
+    net::Buffer buf;
+    buf.writePosition(BlockPos{0, -60, 0});
+    buf.writeF32(0.0f); // angle = f32, НЕ u8!
+    player->getConnection()->sendPacket(0x56, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+}
+
+// ============================================================
+// Play — Player Abilities
+// ============================================================
+
+void NetherCraftServer::sendPlayerAbilities(std::shared_ptr<entity::Player> player) {
+    net::Buffer buf;
+    buf.writeByte(0x04 | 0x08); // Creative + Invulnerable
+    buf.writeF32(0.05f);
+    buf.writeF32(0.1f);
+    player->getConnection()->sendPacket(0x38, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+}
+
+// ============================================================
+// Play — Position and Look
+// ============================================================
+
+void NetherCraftServer::sendPlayerPositionAndLook(std::shared_ptr<entity::Player> player) {
+    net::Buffer buf;
+    buf.writeF64(player->getX());
+    buf.writeF64(player->getY());
+    buf.writeF64(player->getZ());
+    buf.writeF32(0.0f); // yaw
+    buf.writeF32(0.0f); // pitch
+    buf.writeByte(0x00); // Flags
+    buf.writeVarInt(1);  // Teleport ID
+    player->getConnection()->sendPacket(0x40, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+}
+
+// ============================================================
+// Play — Time Update
+// ============================================================
+
+void NetherCraftServer::sendTimeUpdate(std::shared_ptr<entity::Player> player) {
+    net::Buffer buf;
+    buf.writeI64(6000);
+    buf.writeI64(6000);
+    player->getConnection()->sendPacket(0x64, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+}
+
+// ============================================================
+// Play — Send Chunks
+// ============================================================
+
+void NetherCraftServer::sendChunksAround(std::shared_ptr<entity::Player> player, i32 centerX, i32 centerZ, i32 radius) {
+    // Chunk Batch Start (0x0D, empty)
+    player->getConnection()->sendPacket(0x0D, std::vector<u8>{});
+
+    i32 batchSize = 0;
+    for (i32 cx = centerX - radius; cx <= centerX + radius; ++cx) {
+        for (i32 cz = centerZ - radius; cz <= centerZ + radius; ++cz) {
+            auto chunk = world_.getChunk(cx, cz);
+            if (!chunk) continue;
+
+            net::Buffer packetPayload;
+            packetPayload.writeI32(cx);
+            packetPayload.writeI32(cz);
+
+            // Heightmaps (anonymousNbt — TAG_Compound with NO root name)
+            {
+                nbt::TagWriter heightmaps;
+                heightmaps.beginRootCompound();
+                // 256 entries * 9 bits = 36 longs, using 37 for safety
+                heightmaps.writeLongArray(std::vector<i64>(37, 0), "MOTION_BLOCKING");
+                heightmaps.writeLongArray(std::vector<i64>(37, 0), "WORLD_SURFACE");
+                heightmaps.endCompound();
+                auto hmapNbt = heightmaps.toVector();
+                packetPayload.writeBytes(std::span<const u8>(hmapNbt));
+            }
+
+            // Chunk sections data (length-prefixed)
+            net::Buffer chunkBuf;
+            chunk->writeTo(chunkBuf);
+            packetPayload.writeVarInt(static_cast<i32>(chunkBuf.writtenBytes()));
+            packetPayload.writeBytes(chunkBuf.writtenSpan());
+
+            // Block entities count (empty)
+            packetPayload.writeVarInt(0);
+
+            // Light data (all empty — no light data sent)
+            packetPayload.writeVarInt(0); // sky light mask count
+            packetPayload.writeVarInt(0); // block light mask count
+            packetPayload.writeVarInt(0); // empty sky light mask count
+            packetPayload.writeVarInt(0); // empty block light mask count
+            packetPayload.writeVarInt(0); // sky light array count
+            packetPayload.writeVarInt(0); // block light array count
+
+            player->getConnection()->sendPacket(0x27,
+                std::vector<u8>(packetPayload.writtenSpan().begin(), packetPayload.writtenSpan().end()));
+            batchSize++;
+
+            if (batchSize == 1) {
+                NC_INFO("Server", "  Chunk[{},{}]: {} bytes payload", cx, cz, packetPayload.writtenBytes());
+            }
+        }
+    }
+
+    // Chunk Batch Finished (0x0C, VarInt batchSize)
+    {
+        net::Buffer batchBuf;
+        batchBuf.writeVarInt(batchSize);
+        player->getConnection()->sendPacket(0x0C,
+            std::vector<u8>(batchBuf.writtenSpan().begin(), batchBuf.writtenSpan().end()));
+    }
+
+    player->setViewCenter(centerX, centerZ);
+    NC_INFO("Server", "Отправлено {}x{} чанков игроку {}", radius * 2 + 1, radius * 2 + 1, player->getName());
+
+    // Send KeepAlive immediately after chunks
+    sendKeepAlive(player);
+}
+
+// ============================================================
+// Play — Keep Alive
+// ============================================================
+
+void NetherCraftServer::sendKeepAlive(std::shared_ptr<entity::Player> player) {
+    auto now = std::chrono::steady_clock::now();
+    i64 id = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+
+    net::Buffer buf;
+    buf.writeI64(id);
+    player->getConnection()->sendPacket(0x26, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+    pendingKeepAlives_.push_back(id);
+}
+
+// ============================================================
+// Play — Обработка пакетов от клиента
+// ============================================================
+
+void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::Buffer& data, i32 wireId) {
+    NC_INFO("Server", "Play packet: wireId=0x{:02X}, readable={}", wireId, data.readableBytes());
+    switch (wireId) {
+        case 0x08: { // Chunk Batch Received
+            i32 accepted = data.readVarInt();
+            NC_INFO("Server", "ChunkBatchReceived: accepted={}", accepted);
+            break;
+        }
+        case 0x1A: { // Player Position
+            f64 x = data.readF64();
+            f64 y = data.readF64();
+            f64 z = data.readF64();
+            bool onGround = data.readBool();
+            player->setPosition(x, y, z);
+            player->setOnGround(onGround);
+            if (y < -90.0) { // WORLDSAVE_V1: спасение из бездны -> телепорт на спавн
+                player->setPosition(0.0, -59.0, 0.0);
+                sendPlayerPositionAndLook(player);
+            }
+            break;
+        }
+        case 0x1B: { // Player Position And Rotation
+            f64 x = data.readF64();
+            f64 y = data.readF64();
+            f64 z = data.readF64();
+            f32 yaw = data.readF32();
+            f32 pitch = data.readF32();
+            bool onGround = data.readBool();
+            player->setPosition(x, y, z);
+            player->setRotation(yaw, pitch);
+            player->setOnGround(onGround);
+            if (y < -90.0) { // WORLDSAVE_V1: спасение из бездны -> телепорт на спавн
+                player->setPosition(0.0, -59.0, 0.0);
+                sendPlayerPositionAndLook(player);
+            }
+            break;
+        }
+        case 0x1C: { // Player Rotation
+            f32 yaw = data.readF32();
+            f32 pitch = data.readF32();
+            bool onGround = data.readBool();
+            player->setRotation(yaw, pitch);
+            player->setOnGround(onGround);
+            break;
+        }
+        case 0x1D: { // Player Movement (flying)
+            bool onGround = data.readBool();
+            player->setOnGround(onGround);
+            break;
+        }
+        case 0x18: { // Keep Alive
+            data.readI64(); // ID
+            break;
+        }
+        case 0x06: { // Chat Message
+            std::string message = data.readString();
+            // Пропускаем timestamp, salt, signature, message count, ack
+            NC_INFO("Chat", "<{}> {}", player->getName(), message);
+
+            net::Buffer chatBuf;
+            nlohmann::json chatJson;
+            chatJson["translate"] = "chat.type.text";
+            chatJson["with"] = nlohmann::json::array();
+            chatJson["with"].push_back({{"text", player->getName()}});
+            chatJson["with"].push_back({{"text", message}});
+            chatBuf.writeString(chatJson.dump());
+            chatBuf.writeByte(0);
+
+            auto allPlayers = getAllPlayersCopy();
+            for (auto& p : allPlayers) {
+                if (p->isAlive()) {
+                    p->getConnection()->sendPacket(0x3F,
+                        std::vector<u8>(chatBuf.writtenSpan().begin(), chatBuf.writtenSpan().end()));
+                }
+            }
+            break;
+        }
+        case 0x04: { // Serverbound Command
+            std::string command = data.readString();
+            NC_INFO("Cmd", "/{}", command);
+
+            if (command == "help") {
+                player->sendSystemMessage("§6Команды: /help, /list");
+            } else if (command == "list") {
+                auto allPlayers = getAllPlayersCopy();
+                player->sendSystemMessage(std::format("§6Онлайн: {}", allPlayers.size()));
+            } else {
+                player->sendSystemMessage("§cНеизвестная команда");
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// ============================================================
+// Утилиты
+// ============================================================
+
+std::vector<std::shared_ptr<entity::Player>> NetherCraftServer::getAllPlayersCopy() {
+    std::lock_guard lock(playersMutex_);
+    std::vector<std::shared_ptr<entity::Player>> result;
+    result.reserve(players_.size());
+    for (auto& [id, p] : players_) {
+        result.push_back(p);
+    }
+    return result;
+}
+
+// ============================================================
+// Tick loop
+// ============================================================
+
+// ============================================================
+// WORLDSAVE_V1: данные игроков (world/playerdata/<ник>.txt).
+// Удалить игрока = удалить его файл в этой папке.
+// ============================================================
+
+void NetherCraftServer::savePlayerData(std::shared_ptr<entity::Player> player) {
+    if (!player || player->getName().empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories("world/playerdata", ec);
+    std::ofstream f("world/playerdata/" + player->getName() + ".txt", std::ios::trunc);
+    if (!f) return;
+    f << player->getX() << " " << player->getY() << " " << player->getZ()
+      << " " << player->get_yaw() << " " << player->get_pitch() << "\n";
+}
+
+void NetherCraftServer::loadPlayerData(std::shared_ptr<entity::Player> player) {
+    if (!player || player->getName().empty()) return;
+    std::ifstream f("world/playerdata/" + player->getName() + ".txt");
+    if (!f) return;
+    f64 x = 0, y = 0, z = 0;
+    f32 yaw = 0, pitch = 0;
+    if (f >> x >> y >> z >> yaw >> pitch) {
+        if (y < -80.0) y = -59.0; // не восстанавливать в бездне
+        player->setPosition(x, y, z);
+        player->setRotation(yaw, pitch);
+        NC_INFO("Server", "Позиция игрока {} восстановлена: {:.1f} {:.1f} {:.1f}", player->getName(), x, y, z);
+    }
+}
+
+void NetherCraftServer::tick() {
+    tickCounter_++;
+
+    if (tickCounter_ % 300 == 0) {
+        tickKeepAlive();
+    }
+
+    // WORLDSAVE_V1: автосохранение каждые 5 минут (6000 тиков)
+    if (tickCounter_ % 6000 == 0) {
+        world_.saveToDisk("world/world.dat");
+        for (auto& p : getAllPlayersCopy()) savePlayerData(p);
+        NC_INFO("Server", "Автосохранение: мир + игроки");
+    }
+}
+
+void NetherCraftServer::tickKeepAlive() {
+    auto allPlayers = getAllPlayersCopy();
+    for (auto& p : allPlayers) {
+        if (p->isAlive()) {
+            sendKeepAlive(p);
+        }
+    }
+}
+
+} // namespace nc

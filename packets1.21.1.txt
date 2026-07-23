@@ -1,0 +1,4938 @@
+types
+Table of Contents
+Key	Name
+Type	vec2f
+Type	vec3f
+Type	vec4f
+Type	vec3f64
+Type	SlotComponentType
+Type	SlotComponent
+Type	ItemSoundEvent
+Type	ItemFireworkExplosion
+Type	ItemEffectDetail
+Type	ItemPotionEffect
+Type	ItemBlockProperty
+Type	ItemBlockPredicate
+Type	ItemBookPage
+Type	ItemWrittenBookPage
+Type	ArmorTrimMaterial
+Type	ArmorTrimPattern
+Type	InstrumentData
+Type	JukeboxSongData
+Type	BannerPattern
+Type	BannerPatternLayer
+Type	Slot
+Type	Particle
+Type	ingredient
+Type	soundSource
+Type	packedChunkPos
+Type	previousMessages
+Type	entityMetadataEntry
+Type	EntityMetadataPaintingVariant
+Type	EntityMetadataWolfVariant
+Type	minecraft_simple_recipe_format
+Type	minecraft_smelting_format
+Type	tags
+Type	chunkBlockEntity
+Type	chat_session?
+Type	game_profile
+Type	command_node
+Type	packet_common_settings
+Type	packet_common_cookie_request
+Type	packet_common_store_cookie
+Type	packet_common_transfer
+Type	packet_common_cookie_response
+Type	packet_common_select_known_packs
+Type	packet_common_remove_resource_pack
+Type	packet_common_add_resource_pack
+Type	packet_common_custom_report_details
+Type	ServerLinkType
+Type	packet_common_server_links
+
+Typevec2f
+Datatype
+
+Field Name	Field Type	Notes
+x	f32
+y	f32
+
+
+Typevec3f
+Datatype
+
+Field Name	Field Type	Notes
+x	f32
+y	f32
+z	f32
+
+
+Typevec4f
+Datatype
+
+Field Name	Field Type	Notes
+x	f32
+y	f32
+z	f32
+w	f32
+
+
+Typevec3f64
+Datatype
+
+Field Name	Field Type	Notes
+x	f64
+y	f64
+z	f64
+
+
+TypeSlotComponentType
+Datatype
+
+Field Name	Field Type	Notes
+SlotComponentType	
+varint enum
+0	custom data
+1	max stack size
+2	max damage
+3	damage
+4	unbreakable
+5	custom name
+6	item name
+7	lore
+8	rarity
+9	enchantments
+10	can place on
+11	can break
+12	attribute modifiers
+13	custom model data
+14	hide additional tooltip
+15	hide tooltip
+16	repair cost
+17	creative slot lock
+18	enchantment glint override
+19	intangible projectile
+20	food
+21	fire resistant
+22	tool
+23	stored enchantments
+24	dyed color
+25	map color
+26	map id
+27	map decorations
+28	map post processing
+29	charged projectiles
+30	bundle contents
+31	potion contents
+32	suspicious stew effects
+33	writable book content
+34	written book content
+35	trim
+36	debug stick state
+37	entity data
+38	bucket entity data
+39	block entity data
+40	instrument
+41	ominous bottle amplifier
+42	jukebox playable
+43	recipes
+44	lodestone tracker
+45	firework explosion
+46	fireworks
+47	profile
+48	note block sound
+49	banner patterns
+50	base color
+51	pot decorations
+52	container
+53	block state
+54	bees
+55	lock
+56	container loot
+
+
+TypeSlotComponent
+Datatype
+
+Field Name	Field Type	Notes
+type	SlotComponentType
+data
+
+if type
+is custom data	anonymousNbt
+is max stack size	varint
+is max damage	varint
+is damage	varint
+is unbreakable	bool
+is custom name	anonymousNbt
+is item name	anonymousNbt
+is lore length	varint
+is lore
+array
+anonOptionalNbt
+is rarity	
+varint enum
+0	common
+1	uncommon
+2	rare
+3	epic
+is enchantments	
+enchantments length	varint
+enchantments
+array
+id	varint
+level	varint
+showTooltip	bool
+is can place on or can break	
+predicates length	varint
+predicates
+array
+ItemBlockPredicate
+showTooltip	bool
+is attribute modifiers	
+attributes length	varint
+attributes
+array
+typeId	varint
+name	string
+value	f64
+operation	
+varint enum
+0	add
+1	multiply base
+2	multiply total
+slot	
+varint enum
+0	any
+1	main hand
+2	off hand
+3	hand
+4	feet
+5	legs
+6	chest
+7	head
+8	armor
+9	body
+showTooltip	bool
+is custom model data	varint
+is hide additional tooltip	void
+is hide tooltip	void
+is repair cost	varint
+is creative slot lock	void
+is enchantment glint override	bool
+is intangible projectile	anonymousNbt
+is food	
+nutrition	varint
+saturationModifier	f32	
+How much saturation will be given after consuming the item.
+
+canAlwaysEat	bool	
+Whether the item can always be eaten, even at full hunger.
+
+secondsToEat	f32
+usingConvertsTo	Slot
+effects length	varint
+effects
+array
+effect	varint
+probability	f32
+is fire resistant	void
+is tool	
+rules length	varint
+rules
+array
+blocks	IDSet
+speed
+optional
+f32	
+The speed at which the tool breaks this rules' blocks.
+
+correctDropForBlocks
+optional
+bool	
+Whether items should drop only if this is the correct tool.
+
+defaultMiningSpeed	f32	
+The mining speed in case none of the previous rule were matched.
+
+damagePerBlock	varint
+is stored enchantments	
+enchantments length	varint
+enchantments
+array
+id	varint	
+The ID of the enchantment in the enchantment registry.
+
+level	varint
+showInTooltip	bool	
+Whether the list of enchantments should be shown on the item's tooltip.
+
+is dyed color	
+color	i32
+showTooltip	bool
+is map color	i32
+is map id	varint
+is map decorations	anonymousNbt
+is map post processing	varint
+is charged projectiles	
+projectiles length	varint
+projectiles
+array
+Slot
+is bundle contents	
+contents length	varint
+contents
+array
+Slot
+is potion contents	
+potionId
+optional
+varint	
+True if this potion has an ID in the potion registry--it has the default effects associated with the potion type.
+
+customColor
+optional
+i32	
+The RGB components of the color, encoded as an integer.
+
+customEffects length	varint
+customEffects
+array
+ItemPotionEffect
+customName
+optional
+string
+is suspicious stew effects	
+effects length	varint
+effects
+array
+effect	varint	
+The ID of the effect in the potion effect type registry.
+
+duration	varint	
+The duration of the effect.
+
+is writable book content	
+pages length	varint	
+Max 100 pages
+
+pages
+array
+ItemBookPage
+is written book content	
+rawTitle	string
+filteredTitle
+optional
+string
+author	string
+generation	varint
+pages length	varint
+pages
+array
+ItemWrittenBookPage
+resolved	bool
+is trim	
+showInTooltip	bool
+is debug stick state	anonymousNbt
+is entity data	anonymousNbt
+is bucket entity data	anonymousNbt
+is block entity data	anonymousNbt
+is ominous bottle amplifier	varint
+is jukebox playable	
+hasHolder	bool
+song
+
+if hasHolder
+is false	string
+showInTooltip	bool
+is recipes	anonymousNbt
+is lodestone tracker	
+globalPosition
+optional
+dimension	string	
+Specified if this lodestone points to a position; otherwise it spins randomly.
+
+position	position	
+The position the compass points to. Only present if Has Global Position is true.
+
+tracked	bool	
+Whether the component is removed when the associated lodestone is broken.
+
+is firework explosion	ItemFireworkExplosion
+is fireworks	
+flightDuration	varint
+explosions length	varint
+explosions
+array
+ItemFireworkExplosion
+is profile	
+name
+optional
+string	
+If the profile has a name, max 16 characters.
+
+uuid
+optional
+UUID
+properties length	varint
+properties
+array
+name	string	
+Max 64 characters
+
+value	string
+signature
+optional
+string	
+Max 1024 characters
+
+is note block sound	string
+is banner patterns	
+layers length	varint
+layers
+array
+BannerPatternLayer
+is base color	varint
+is pot decorations	
+decorations length	varint	
+The ID of the items in the item registry.
+
+decorations
+array
+varint
+is container	
+contents length	varint
+contents
+array
+Slot
+is block state	
+properties length	varint
+properties
+array
+property	string
+value	string
+is bees	
+bees length	varint
+bees
+array
+nbtData	anonymousNbt	
+Custom data for the entity, always a Compound Tag. Same structure as the minecraft:custom_data component.
+
+ticksInHive	varint
+minTicksInHive	varint
+is lock	anonymousNbt
+is container loot	anonymousNbt
+
+
+TypeItemSoundEvent
+Datatype
+
+Field Name	Field Type	Notes
+soundName	string
+fixedRange
+optional
+f32
+
+
+TypeItemFireworkExplosion
+Datatype
+
+Field Name	Field Type	Notes
+shape	
+varint enum
+0	small ball
+1	large ball
+2	star
+3	creeper
+4	burst
+colors length	varint	
+The RGB components of the color, encoded as an integer.
+
+colors
+array
+i32
+fadeColors length	varint	
+The RGB components of the color, encoded as an integer.
+
+fadeColors
+array
+i32
+hasTrail	bool	
+Whether the firework has a trail.
+
+hasTwinkle	bool	
+Whether the firework has a twinkle effect.
+
+
+
+TypeItemEffectDetail
+Datatype
+
+Field Name	Field Type	Notes
+amplifier	varint
+duration	varint
+ambient	bool
+showParticles	bool
+showIcon	bool
+hiddenEffect
+optional
+ItemEffectDetail
+
+
+TypeItemPotionEffect
+Datatype
+
+Field Name	Field Type	Notes
+id	varint
+details	ItemEffectDetail
+
+
+TypeItemBlockProperty
+Datatype
+
+Field Name	Field Type	Notes
+name	string
+isExactMatch	bool
+value
+
+if isExactMatch
+is true	
+exactValue	string
+is false	
+minValue	string
+maxValue	string
+
+
+TypeItemBlockPredicate
+Datatype
+
+Field Name	Field Type	Notes
+properties length	varint
+properties
+array
+ItemBlockProperty
+nbt	anonOptionalNbt
+
+
+TypeItemBookPage
+Datatype
+
+Field Name	Field Type	Notes
+content	string	
+The raw text of the page. TextComponent, max 1024 characters.
+
+filteredContent
+optional
+string
+
+
+TypeItemWrittenBookPage
+Datatype
+
+Field Name	Field Type	Notes
+content	anonymousNbt
+filteredContent	anonOptionalNbt
+
+
+TypeArmorTrimMaterial
+Datatype
+
+Field Name	Field Type	Notes
+assetName	string
+ingredientId	varint
+overrideArmorAssets length	varint
+overrideArmorAssets
+array
+key	string
+value	string
+description	anonymousNbt
+
+
+TypeArmorTrimPattern
+Datatype
+
+Field Name	Field Type	Notes
+assetId	string
+templateItemId	varint
+description	anonymousNbt
+decal	bool
+
+
+TypeInstrumentData
+Datatype
+
+Field Name	Field Type	Notes
+soundEvent	ItemSoundHolder
+useDuration	f32
+range	f32
+description	anonymousNbt
+
+
+TypeJukeboxSongData
+Datatype
+
+Field Name	Field Type	Notes
+soundEvent	ItemSoundHolder
+description	anonymousNbt
+lengthInSeconds	f32
+comparatorOutput	varint
+
+
+TypeBannerPattern
+Datatype
+
+Field Name	Field Type	Notes
+assetId	string
+translationKey	string
+
+
+TypeBannerPatternLayer
+Datatype
+
+Field Name	Field Type	Notes
+colorId	varint
+
+
+TypeSlot
+Datatype
+
+Field Name	Field Type	Notes
+itemCount	varint
+🔁
+
+if itemCount
+is 0	void
+default	
+itemId	varint
+addedComponentCount	varint	
+https://wiki.vg/SlotData#Structuredcomponents
+
+removedComponentCount	varint
+Length for components below is addedComponentCount from above
+components
+array
+SlotComponent
+Length for removeComponents below is removedComponentCount from above
+removeComponents
+array
+type	SlotComponentType
+
+
+TypeParticle
+Datatype
+
+Field Name	Field Type	Notes
+type	
+varint enum
+0	angry villager	
+See client/net/minecraft/core/particles/ParticleTypes.java
+
+1	block
+2	block marker
+3	bubble
+4	cloud
+5	crit
+6	damage indicator
+7	dragon breath
+8	dripping lava
+9	falling lava
+10	landing lava
+11	dripping water
+12	falling water
+13	dust
+14	dust color transition
+15	effect
+16	elder guardian
+17	enchanted hit
+18	enchant
+19	end rod
+20	entity effect
+21	explosion emitter
+22	explosion
+23	gust
+24	small gust
+25	gust emitter large
+26	gust emitter small
+27	sonic boom
+28	falling dust
+29	firework
+30	fishing
+31	flame
+32	infested
+33	cherry leaves
+34	sculk soul
+35	sculk charge
+36	sculk charge pop
+37	soul fire flame
+38	soul
+39	flash
+40	happy villager
+41	composter
+42	heart
+43	instant effect
+44	item
+45	vibration
+46	item slime
+47	item cobweb
+48	item snowball
+49	large smoke
+50	lava
+51	mycelium
+52	note
+53	poof
+54	portal
+55	rain
+56	smoke
+57	white smoke
+58	sneeze
+59	spit
+60	squid ink
+61	sweep attack
+62	totem of undying
+63	underwater
+64	splash
+65	witch
+66	bubble pop
+67	current down
+68	bubble column up
+69	nautilus
+70	dolphin
+71	campfire cosy smoke
+72	campfire signal smoke
+73	dripping honey
+74	falling honey
+75	landing honey
+76	falling nectar
+77	falling spore blossom
+78	ash
+79	crimson spore
+80	warped spore
+81	spore blossom air
+82	dripping obsidian tear
+83	falling obsidian tear
+84	landing obsidian tear
+85	reverse portal
+86	white ash
+87	small flame
+88	snowflake
+89	dripping dripstone lava
+90	falling dripstone lava
+91	dripping dripstone water
+92	falling dripstone water
+93	glow squid ink
+94	glow
+95	wax on
+96	wax off
+97	electric spark
+98	scrape
+99	shriek
+100	egg crack
+101	dust plume
+102	trial spawner detected player
+103	trial spawner detected player ominous
+104	vault connection
+105	dust pillar
+106	ominous spawning
+107	raid omen
+108	trial omen
+data
+
+if type
+is block or block marker or falling dust or dust pillar	varint
+is dust	
+red	f32
+green	f32
+blue	f32
+scale	f32
+is dust color transition	
+fromRed	f32
+fromGreen	f32
+fromBlue	f32
+scale	f32
+toRed	f32
+toGreen	f32
+toBlue	f32
+is entity effect	i32
+is item	Slot
+is sculk charge	f32
+is shriek	varint
+is vibration	
+positionType	
+varint enum
+0	block
+1	entity
+position
+
+if positionType
+is block	position
+is entity	
+entityId	varint
+entityEyeHeight	f32
+ticks	varint
+
+
+TypesoundSource
+Datatype
+
+Field Name	Field Type	Notes
+soundSource	
+varint enum
+0	master
+1	music
+2	record
+3	weather
+4	block
+5	hostile
+6	neutral
+7	player
+8	ambient
+9	voice
+
+
+TypepackedChunkPos
+Datatype
+
+Field Name	Field Type	Notes
+z	i32
+x	i32
+
+
+TypepreviousMessages
+Datatype
+
+Field Name	Field Type	Notes
+previousMessages length	varint
+previousMessages
+array
+id	varint
+signature
+
+if id
+default	void
+
+
+TypeentityMetadataEntry
+Datatype
+
+Field Name	Field Type	Notes
+key	u8
+type	
+varint enum
+0	byte
+1	int
+2	long
+3	float
+4	string
+5	component
+6	optional component
+7	item stack
+8	boolean
+9	rotations
+10	block pos
+11	optional block pos
+12	direction
+13	optional uuid
+14	block state
+15	optional block state
+16	compound tag
+17	particle
+18	particles
+19	villager data
+20	optional unsigned int
+21	pose
+22	cat variant
+23	wolf variant
+24	frog variant
+25	optional global pos
+26	painting variant
+27	sniffer state
+28	armadillo state
+29	vector3
+30	quaternion
+value
+
+if type
+is byte	i8
+is int	varint
+is long	varlong
+is float	f32
+is string	string
+is component	anonymousNbt
+is item stack	Slot
+is boolean	bool
+is rotations	
+pitch	f32
+yaw	f32
+roll	f32
+is block pos	position
+is direction	varint
+is block state	varint
+is optional block state	optvarint
+is compound tag	anonymousNbt
+is particle	Particle
+is particles length	varint
+is particles
+array
+Particle
+is villager data	
+villagerType	varint
+villagerProfession	varint
+level	varint
+is optional unsigned int	optvarint
+is pose	varint
+is cat variant	varint
+is frog variant	varint
+is sniffer state	varint
+is armadillo state	varint
+is vector3	vec3f
+is quaternion	vec4f
+
+
+TypeEntityMetadataPaintingVariant
+Datatype
+
+Field Name	Field Type	Notes
+width	i32
+height	i32
+assetId	string
+title
+optional
+anonymousNbt
+author
+optional
+anonymousNbt
+
+
+TypeEntityMetadataWolfVariant
+Datatype
+
+Field Name	Field Type	Notes
+wildTexture	string
+tameTexture	string
+angryTexture	string
+biome	IDSet
+
+
+Typeminecraft simple recipe format
+Datatype
+
+Field Name	Field Type	Notes
+category	varint
+
+
+Typeminecraft smelting format
+Datatype
+
+Field Name	Field Type	Notes
+group	string
+category	varint
+ingredient	ingredient
+result	Slot
+experience	f32
+cookTime	varint
+
+
+Typetags
+Datatype
+
+Field Name	Field Type	Notes
+tags length	varint
+tags
+array
+tagName	string
+entries length	varint
+entries
+array
+varint
+
+
+TypechunkBlockEntity
+Datatype
+
+Field Name	Field Type	Notes
+y	i16
+type	varint
+nbtData	anonOptionalNbt
+
+
+Typechat session
+Datatype
+
+Field Name	Field Type	Notes
+uuid	UUID
+publicKey	
+expireTime	i64
+
+
+Typegame profile
+Datatype
+
+Field Name	Field Type	Notes
+name	string
+properties length	varint
+properties
+array
+name	string
+value	string
+signature
+optional
+string
+
+
+Typecommand node
+Datatype
+
+Field Name	Field Type	Notes
+children length	varint
+children
+array
+varint
+redirectNode
+
+if flags/has redirect node
+is 1	varint
+default	void
+extraNodeData
+
+if flags/command node type
+is 0	void
+is 1	
+name	string
+is 2	
+name	string
+parser	
+varint enum
+0	brigadier:bool
+1	brigadier:float
+2	brigadier:double
+3	brigadier:integer
+4	brigadier:long
+5	brigadier:string
+6	minecraft:entity
+7	minecraft:game profile
+8	minecraft:block pos
+9	minecraft:column pos
+10	minecraft:vec3
+11	minecraft:vec2
+12	minecraft:block state
+13	minecraft:block predicate
+14	minecraft:item stack
+15	minecraft:item predicate
+16	minecraft:color
+17	minecraft:component
+18	minecraft:style
+19	minecraft:message
+20	minecraft:nbt
+21	minecraft:nbt tag
+22	minecraft:nbt path
+23	minecraft:objective
+24	minecraft:objective criteria
+25	minecraft:operation
+26	minecraft:particle
+27	minecraft:angle
+28	minecraft:rotation
+29	minecraft:scoreboard slot
+30	minecraft:score holder
+31	minecraft:swizzle
+32	minecraft:team
+33	minecraft:item slot
+34	minecraft:item slots
+35	minecraft:resource location
+36	minecraft:function
+37	minecraft:entity anchor
+38	minecraft:int range
+39	minecraft:float range
+40	minecraft:dimension
+41	minecraft:gamemode
+42	minecraft:time
+43	minecraft:resource or tag
+44	minecraft:resource or tag key
+45	minecraft:resource
+46	minecraft:resource key
+47	minecraft:template mirror
+48	minecraft:template rotation
+49	minecraft:heightmap
+50	minecraft:loot table
+51	minecraft:loot predicate
+52	minecraft:loot modifier
+53	minecraft:uuid
+properties
+
+if parser
+is brigadier:bool	void
+is brigadier:float	
+min
+
+if flags/min present
+is 1	f32
+default	void
+max
+
+if flags/max present
+is 1	f32
+default	void
+is brigadier:double	
+min
+
+if flags/min present
+is 1	f64
+default	void
+max
+
+if flags/max present
+is 1	f64
+default	void
+is brigadier:integer	
+min
+
+if flags/min present
+is 1	i32
+default	void
+max
+
+if flags/max present
+is 1	i32
+default	void
+is brigadier:long	
+min
+
+if flags/min present
+is 1	i64
+default	void
+max
+
+if flags/max present
+is 1	i64
+default	void
+is brigadier:string	
+varint enum
+0	SINGLE WORD
+1	QUOTABLE PHRASE
+2	GREEDY PHRASE
+is minecraft:game profile	void
+is minecraft:block pos	void
+is minecraft:column pos	void
+is minecraft:vec3	void
+is minecraft:vec2	void
+is minecraft:block state	void
+is minecraft:block predicate	void
+is minecraft:item stack	void
+is minecraft:item predicate	void
+is minecraft:color	void
+is minecraft:component	void
+is minecraft:message	void
+is minecraft:nbt	void
+is minecraft:nbt path	void
+is minecraft:objective	void
+is minecraft:objective criteria	void
+is minecraft:operation	void
+is minecraft:particle	void
+is minecraft:angle	void
+is minecraft:rotation	void
+is minecraft:scoreboard slot	void
+is minecraft:swizzle	void
+is minecraft:team	void
+is minecraft:item slot	void
+is minecraft:resource location	void
+is minecraft:function	void
+is minecraft:entity anchor	void
+is minecraft:int range	void
+is minecraft:float range	void
+is minecraft:dimension	void
+is minecraft:gamemode	void
+is minecraft:time	
+min	i32
+is minecraft:resource or tag	
+registry	string
+is minecraft:resource or tag key	
+registry	string
+is minecraft:resource	
+registry	string
+is minecraft:resource key	
+registry	string
+is minecraft:template mirror	void
+is minecraft:template rotation	void
+is minecraft:heightmap	void
+is minecraft:uuid	void
+suggestionType
+
+if ../flags/has custom suggestions
+is 1	string
+default	void
+
+
+Shared Packets
+These are packets that are shared between multiple states. They are defined here to avoid duplication.
+
+Typepacket common settings
+Datatype
+
+MC: ServerboundClientInformationPacket
+
+Field Name	Field Type	Notes
+locale	string
+viewDistance	i8
+chatFlags	varint
+chatColors	bool
+skinParts	u8
+mainHand	varint
+enableTextFiltering	bool
+enableServerListing	bool
+
+
+Typepacket common cookie request
+Datatype
+
+MC: ClientboundCookieRequestPacket
+
+Field Name	Field Type	Notes
+cookie	string
+
+
+Typepacket common store cookie
+Datatype
+
+MC: ClientboundStoreCookiePacket
+
+Field Name	Field Type	Notes
+key	string
+value	ByteArray
+
+
+Typepacket common transfer
+Datatype
+
+MC: ClientboundTransferPacket
+
+Field Name	Field Type	Notes
+host	string
+port	varint
+
+
+Typepacket common cookie response
+Datatype
+
+MC: ServerboundCookieResponsePacket
+
+Field Name	Field Type	Notes
+key	string
+value
+optional
+ByteArray
+
+
+Typepacket common select known packs
+Datatype
+
+MC: ServerboundSelectKnownPacks MC: ClientboundSelectKnownPacks
+
+Field Name	Field Type	Notes
+packs length	varint
+packs
+array
+namespace	string
+id	string
+version	string
+
+
+Typepacket common remove resource pack
+Datatype
+
+MC: ClientboundResourcePackPopPacket
+
+Field Name	Field Type	Notes
+uuid
+optional
+UUID
+
+
+Typepacket common add resource pack
+Datatype
+
+MC: ClientboundResourcePackPushPacket
+
+Field Name	Field Type	Notes
+uuid	UUID
+url	string
+hash	string
+forced	bool
+promptMessage
+optional
+anonymousNbt
+
+
+Typepacket common custom report details
+Datatype
+
+MC: ClientboundCustomReportDetailsPacket
+
+Field Name	Field Type	Notes
+details length	varint
+details
+array
+key	string
+value	string
+
+
+TypeServerLinkType
+Datatype
+
+Field Name	Field Type	Notes
+ServerLinkType	
+varint enum
+0	bug report
+1	community guidelines
+2	support
+3	status
+4	feedback
+5	community
+6	website
+7	forums
+8	news
+9	announcements
+
+
+Typepacket common server links
+Datatype
+
+MC: ClientboundServerLinksPacket This packet contains a list of links that the Notchian client will display in the menu available from the pause menu. Link labels can be built-in or custom (i.e., any text).
+
+Field Name	Field Type	Notes
+links length	varint
+links
+array
+hasKnownType	bool
+knownType
+
+if hasKnownType
+is true	ServerLinkType
+unknownType
+
+if hasKnownType
+is false	anonymousNbt
+link	string
+
+
+handshaking / toClient / types
+Table of Contents
+Key	Name
+Type	packet
+
+Typepacket
+Datatype
+
+Field Name	Field Type	Notes
+name	
+varint enum
+
+
+handshaking / toServer / types
+Table of Contents
+Key	Name
+Type	packet_set_protocol
+0xfe	packet_legacy_server_list_ping
+Type	packet
+
+0packet set protocol
+handshaking / toServer / packet_set_protocol (0x00)
+
+Field Name	Field Type	Notes
+protocolVersion	varint
+serverHost	string
+serverPort	u16
+nextState	varint
+
+
+254packet legacy server list ping
+handshaking / toServer / packet_legacy_server_list_ping (0xfe)
+
+Field Name	Field Type	Notes
+payload	u8
+
+
+Typepacket
+handshaking / toServer / packet
+
+Field Name	Field Type	Notes
+name	
+varint enum
+0	set protocol
+254	legacy server list ping
+params
+
+if name
+is set protocol	packet_set_protocol
+is legacy server list ping	packet_legacy_server_list_ping
+
+
+status / toClient / types
+Table of Contents
+Key	Name
+Type	packet_server_info
+0x1	packet_ping
+Type	packet
+
+0packet server info
+status / toClient / packet_server_info (0x00)
+
+MC: ClientboundStatusResponsePacket
+
+Field Name	Field Type	Notes
+response	string
+
+
+1packet ping
+status / toClient / packet_ping (0x01)
+
+MC: ClientboundPongResponsePacket
+
+Field Name	Field Type	Notes
+time	i64
+
+
+Typepacket
+status / toClient / packet
+
+Field Name	Field Type	Notes
+name	
+varint enum
+0	server info
+1	ping
+params
+
+if name
+is server info	packet_server_info
+is ping	packet_ping
+
+
+status / toServer / types
+Table of Contents
+Key	Name
+Type	packet_ping_start
+0x1	packet_ping
+Type	packet
+
+0packet ping start
+status / toServer / packet_ping_start (0x00)
+
+MC: ServerboundStatusRequestPacket
+
+Field Name	Field Type	Notes
+
+
+1packet ping
+status / toServer / packet_ping (0x01)
+
+Empty MC: ServerboundPingRequestPacket
+
+Field Name	Field Type	Notes
+time	i64
+
+
+Typepacket
+status / toServer / packet
+
+Field Name	Field Type	Notes
+name	
+varint enum
+0	ping start
+1	ping
+params
+
+if name
+is ping start	packet_ping_start
+is ping	packet_ping
+
+
+login / toClient / types
+Table of Contents
+Key	Name
+Type	packet_disconnect
+0x1	packet_encryption_begin
+0x2	packet_success
+0x3	packet_compress
+0x4	packet_login_plugin_request
+Type	packet
+
+0packet disconnect
+login / toClient / packet_disconnect (0x00)
+
+MC: ClientboundLoginDisconnectPacket
+
+Field Name	Field Type	Notes
+reason	string
+
+
+1packet encryption begin
+login / toClient / packet_encryption_begin (0x01)
+
+MC: ClientboundHelloPacket
+
+Field Name	Field Type	Notes
+serverId	string
+shouldAuthenticate	bool
+
+
+2packet success
+login / toClient / packet_success (0x02)
+
+MC: ClientboundGameProfilePacket
+
+Field Name	Field Type	Notes
+uuid	UUID
+username	string
+properties length	varint
+properties
+array
+name	string
+value	string
+signature
+optional
+string
+strictErrorHandling	bool
+
+
+3packet compress
+login / toClient / packet_compress (0x03)
+
+MC: ClientboundLoginCompressionPacket
+
+Field Name	Field Type	Notes
+threshold	varint
+
+
+4packet login plugin request
+login / toClient / packet_login_plugin_request (0x04)
+
+MC: ClientboundCustomQueryPacket
+
+Field Name	Field Type	Notes
+messageId	varint
+channel	string
+data	restBuffer
+
+
+Typepacket
+login / toClient / packet
+
+Field Name	Field Type	Notes
+name	
+varint enum
+0	disconnect
+1	encryption begin
+2	success
+3	compress
+4	login plugin request
+5	cookie request
+params
+
+if name
+is disconnect	packet_disconnect
+is encryption begin	packet_encryption_begin
+is success	packet_success
+is compress	packet_compress
+is login plugin request	packet_login_plugin_request
+is cookie request	packet_common_cookie_request
+
+
+login / toServer / types
+Table of Contents
+Key	Name
+Type	packet_login_start
+0x1	packet_encryption_begin
+0x2	packet_login_plugin_response
+0x3	packet_login_acknowledged
+Type	packet
+
+0packet login start
+login / toServer / packet_login_start (0x00)
+
+MC: ServerboundHelloPacket
+
+Field Name	Field Type	Notes
+username	string
+playerUUID	UUID
+
+
+1packet encryption begin
+login / toServer / packet_encryption_begin (0x01)
+
+MC: ServerboundKeyPacket
+
+Field Name	Field Type	Notes
+
+
+2packet login plugin response
+login / toServer / packet_login_plugin_response (0x02)
+
+MC: ServerboundCustomQueryAnswerPacket
+
+Field Name	Field Type	Notes
+messageId	varint
+data
+optional
+restBuffer
+
+
+3packet login acknowledged
+login / toServer / packet_login_acknowledged (0x03)
+
+MC: ServerboundLoginAcknowledgedPacket
+
+Field Name	Field Type	Notes
+
+
+Typepacket
+login / toServer / packet
+
+Empty
+
+Field Name	Field Type	Notes
+name	
+varint enum
+0	login start
+1	encryption begin
+2	login plugin response
+3	login acknowledged
+4	cookie response
+params
+
+if name
+is login start	packet_login_start
+is encryption begin	packet_encryption_begin
+is login plugin response	packet_login_plugin_response
+is login acknowledged	packet_login_acknowledged
+is cookie response	packet_common_cookie_response
+
+
+configuration / toClient / types
+Table of Contents
+Key	Name
+0x1	packet_custom_payload
+0x2	packet_disconnect
+0x3	packet_finish_configuration
+0x4	packet_keep_alive
+0x5	packet_ping
+0x6	packet_reset_chat
+0x7	packet_registry_data
+0xc	packet_feature_flags
+0xd	packet_tags
+Type	packet
+
+1packet custom payload
+configuration / toClient / packet_custom_payload (0x01)
+
+MC: ClientboundCustomPayloadPacket
+
+Field Name	Field Type	Notes
+channel	string
+data	restBuffer
+
+
+2packet disconnect
+configuration / toClient / packet_disconnect (0x02)
+
+MC: ClientboundDisconnectPacket
+
+Field Name	Field Type	Notes
+reason	anonymousNbt
+
+
+3packet finish configuration
+configuration / toClient / packet_finish_configuration (0x03)
+
+MC: ClientboundFinishConfigurationPacket
+
+Field Name	Field Type	Notes
+
+
+4packet keep alive
+configuration / toClient / packet_keep_alive (0x04)
+
+Empty MC: ClientboundKeepAlivePacket
+
+Field Name	Field Type	Notes
+keepAliveId	i64
+
+
+5packet ping
+configuration / toClient / packet_ping (0x05)
+
+MC: ClientboundPingPacket
+
+Field Name	Field Type	Notes
+id	i32
+
+
+6packet reset chat
+configuration / toClient / packet_reset_chat (0x06)
+
+MC: ClientboundResetChatPacket
+
+Field Name	Field Type	Notes
+
+
+7packet registry data
+configuration / toClient / packet_registry_data (0x07)
+
+Empty MC: ClientboundRegistryDataPacket
+
+Field Name	Field Type	Notes
+id	string	
+The server can send multiple registries
+
+entries length	varint
+entries
+array
+key	string
+value
+optional
+anonymousNbt
+
+
+12packet feature flags
+configuration / toClient / packet_feature_flags (0x0c)
+
+MC: ClientboundUpdateEnabledFeaturesPacket
+
+Field Name	Field Type	Notes
+features length	varint
+features
+array
+string
+
+
+13packet tags
+configuration / toClient / packet_tags (0x0d)
+
+MC: ClientboundUpdateTagsPacket
+
+Field Name	Field Type	Notes
+tags length	varint
+tags
+array
+tagType	string
+tags	tags
+
+
+Typepacket
+configuration / toClient / packet
+
+Field Name	Field Type	Notes
+name	
+varint enum
+0	cookie request
+1	custom payload
+2	disconnect
+3	finish configuration
+4	keep alive
+5	ping
+6	reset chat
+7	registry data
+8	remove resource pack
+9	add resource pack
+10	store cookie
+11	transfer
+12	feature flags
+13	tags
+14	select known packs
+15	custom report details
+16	server links
+params
+
+if name
+is cookie request	packet_common_cookie_request
+is custom payload	packet_custom_payload
+is disconnect	packet_disconnect
+is finish configuration	packet_finish_configuration
+is keep alive	packet_keep_alive
+is ping	packet_ping
+is reset chat	packet_reset_chat
+is registry data	packet_registry_data
+is remove resource pack	packet_common_remove_resource_pack
+is add resource pack	packet_common_add_resource_pack
+is store cookie	packet_common_store_cookie
+is transfer	packet_common_transfer
+is feature flags	packet_feature_flags
+is tags	packet_tags
+is select known packs	packet_common_select_known_packs
+is custom report details	packet_common_custom_report_details
+is server links	packet_common_server_links
+
+
+configuration / toServer / types
+Table of Contents
+Key	Name
+0x2	packet_custom_payload
+0x3	packet_finish_configuration
+0x4	packet_keep_alive
+0x5	packet_pong
+0x6	packet_resource_pack_receive
+Type	packet
+
+2packet custom payload
+configuration / toServer / packet_custom_payload (0x02)
+
+MC: ServerboundCustomPayloadPacket
+
+Field Name	Field Type	Notes
+channel	string
+data	restBuffer
+
+
+3packet finish configuration
+configuration / toServer / packet_finish_configuration (0x03)
+
+MC: ServerboundFinishConfigurationPacket
+
+Field Name	Field Type	Notes
+
+
+4packet keep alive
+configuration / toServer / packet_keep_alive (0x04)
+
+Empty MC: ServerboundKeepAlivePacket
+
+Field Name	Field Type	Notes
+keepAliveId	i64
+
+
+5packet pong
+configuration / toServer / packet_pong (0x05)
+
+MC: ServerboundPongPacket
+
+Field Name	Field Type	Notes
+id	i32
+
+
+6packet resource pack receive
+configuration / toServer / packet_resource_pack_receive (0x06)
+
+MC: ServerboundResourcePackPacket
+
+Field Name	Field Type	Notes
+uuid	UUID
+result	varint
+
+
+Typepacket
+configuration / toServer / packet
+
+Field Name	Field Type	Notes
+name	
+varint enum
+0	settings
+1	cookie response
+2	custom payload
+3	finish configuration
+4	keep alive
+5	pong
+6	resource pack receive
+7	select known packs
+8	custom report details
+9	server links
+params
+
+if name
+is settings	packet_common_settings
+is cookie response	packet_common_cookie_response
+is custom payload	packet_custom_payload
+is finish configuration	packet_finish_configuration
+is keep alive	packet_keep_alive
+is pong	packet_pong
+is resource pack receive	packet_resource_pack_receive
+is select known packs	packet_common_select_known_packs
+is custom report details	packet_common_custom_report_details
+is server links	packet_common_server_links
+
+
+play / toClient / types
+Table of Contents
+Key	Name
+Type	SpawnInfo
+0x1	packet_spawn_entity
+0x2	packet_spawn_entity_experience_orb
+0x3	packet_animation
+0x4	packet_statistics
+0x5	packet_acknowledge_player_digging
+0x6	packet_block_break_animation
+0x7	packet_tile_entity_data
+0x8	packet_block_action
+0x9	packet_block_change
+0xa	packet_boss_bar
+0xb	packet_difficulty
+0xc	packet_chunk_batch_finished
+0xd	packet_chunk_batch_start
+0xe	packet_chunk_biomes
+0xf	packet_clear_titles
+0x10	packet_tab_complete
+0x11	packet_declare_commands
+0x12	packet_close_window
+0x13	packet_window_items
+0x14	packet_craft_progress_bar
+0x15	packet_set_slot
+0x17	packet_set_cooldown
+0x18	packet_chat_suggestions
+0x19	packet_custom_payload
+0x1a	packet_damage_event
+0x1b	packet_debug_sample
+0x1c	packet_hide_message
+0x1d	packet_kick_disconnect
+Type	ChatTypeParameterType
+Type	ChatType
+Type	ChatTypes
+0x1e	packet_profileless_chat
+0x1f	packet_entity_status
+0x20	packet_explosion
+0x21	packet_unload_chunk
+0x22	packet_game_state_change
+0x23	packet_open_horse_window
+0x24	packet_hurt_animation
+0x25	packet_initialize_world_border
+0x26	packet_keep_alive
+0x27	packet_map_chunk
+0x28	packet_world_event
+0x29	packet_world_particles
+0x2a	packet_update_light
+0x2b	packet_login
+0x2c	packet_map
+0x2d	packet_trade_list
+0x2e	packet_rel_entity_move
+0x2f	packet_entity_move_look
+0x30	packet_entity_look
+0x31	packet_vehicle_move
+0x32	packet_open_book
+0x33	packet_open_window
+0x34	packet_open_sign_entity
+0x35	packet_ping
+0x36	packet_ping_response
+0x37	packet_craft_recipe_response
+0x38	packet_abilities
+0x39	packet_player_chat
+0x3a	packet_end_combat_event
+0x3b	packet_enter_combat_event
+0x3c	packet_death_combat_event
+0x3d	packet_player_remove
+0x3e	packet_player_info
+0x3f	packet_face_player
+0x40	packet_position
+0x41	packet_unlock_recipes
+0x42	packet_entity_destroy
+0x43	packet_remove_entity_effect
+0x44	packet_reset_score
+0x47	packet_respawn
+0x48	packet_entity_head_rotation
+0x49	packet_multi_block_change
+0x4a	packet_select_advancement_tab
+0x4b	packet_server_data
+0x4c	packet_action_bar
+0x4d	packet_world_border_center
+0x4e	packet_world_border_lerp_size
+0x4f	packet_world_border_size
+0x50	packet_world_border_warning_delay
+0x51	packet_world_border_warning_reach
+0x52	packet_camera
+0x53	packet_held_item_slot
+0x54	packet_update_view_position
+0x55	packet_update_view_distance
+0x56	packet_spawn_position
+0x57	packet_scoreboard_display_objective
+0x58	packet_entity_metadata
+0x59	packet_attach_entity
+0x5a	packet_entity_velocity
+0x5b	packet_entity_equipment
+0x5c	packet_experience
+0x5d	packet_update_health
+0x5e	packet_scoreboard_objective
+0x5f	packet_set_passengers
+0x60	packet_teams
+0x61	packet_scoreboard_score
+0x62	packet_simulation_distance
+0x63	packet_set_title_subtitle
+0x64	packet_update_time
+0x65	packet_set_title_text
+0x66	packet_set_title_time
+0x67	packet_entity_sound_effect
+0x68	packet_sound_effect
+0x69	packet_start_configuration
+0x6a	packet_stop_sound
+0x6c	packet_system_chat
+0x6d	packet_playerlist_header
+0x6e	packet_nbt_query_response
+0x6f	packet_collect
+0x70	packet_entity_teleport
+0x71	packet_set_ticking_state
+0x72	packet_step_tick
+0x74	packet_advancements
+0x75	packet_entity_update_attributes
+0x76	packet_entity_effect
+0x77	packet_declare_recipes
+0x78	packet_tags
+0x79	packet_set_projectile_power
+Type	packet
+
+TypeSpawnInfo
+play / toClient / SpawnInfo
+
+World state information for spawn and respawn packets
+
+Field Name	Field Type	Notes
+dimension	varint
+name	string
+hashedSeed	i64
+gamemode	
+i8 enum
+0	survival
+1	creative
+2	adventure
+3	spectator
+previousGamemode	u8
+isDebug	bool
+isFlat	bool
+death
+optional
+dimensionName	string
+location	position
+portalCooldown	varint
+
+
+1packet spawn entity
+play / toClient / packet_spawn_entity (0x01)
+
+MC: ClientboundAddEntityPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+objectUUID	UUID
+type	varint
+x	f64
+y	f64
+z	f64
+pitch	i8
+yaw	i8
+headPitch	i8
+objectData	varint
+velocityX	i16
+velocityY	i16
+velocityZ	i16
+
+
+2packet spawn entity experience orb
+play / toClient / packet_spawn_entity_experience_orb (0x02)
+
+MC: ClientboundAddExperienceOrbPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+x	f64
+y	f64
+z	f64
+count	i16
+
+
+3packet animation
+play / toClient / packet_animation (0x03)
+
+MC: ClientboundAnimatePacket
+
+Field Name	Field Type	Notes
+entityId	varint
+animation	u8
+
+
+4packet statistics
+play / toClient / packet_statistics (0x04)
+
+MC: ClientboundAwardStatsPacket
+
+Field Name	Field Type	Notes
+entries length	varint
+entries
+array
+categoryId	varint
+statisticId	varint
+value	varint
+
+
+5packet acknowledge player digging
+play / toClient / packet_acknowledge_player_digging (0x05)
+
+MC: ClientboundBlockChangedAckPacket
+
+Field Name	Field Type	Notes
+sequenceId	varint
+
+
+6packet block break animation
+play / toClient / packet_block_break_animation (0x06)
+
+MC: ClientboundBlockDestructionPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+location	position
+destroyStage	i8
+
+
+7packet tile entity data
+play / toClient / packet_tile_entity_data (0x07)
+
+MC: ClientboundBlockEntityDataPacket
+
+Field Name	Field Type	Notes
+location	position
+action	varint
+nbtData	anonOptionalNbt
+
+
+8packet block action
+play / toClient / packet_block_action (0x08)
+
+MC: ClientboundBlockEventPacket
+
+Field Name	Field Type	Notes
+location	position
+byte1	u8
+byte2	u8
+blockId	varint
+
+
+9packet block change
+play / toClient / packet_block_change (0x09)
+
+MC: ClientboundBlockUpdatePacket
+
+Field Name	Field Type	Notes
+location	position
+type	varint
+
+
+10packet boss bar
+play / toClient / packet_boss_bar (0x0a)
+
+MC: ClientboundBossEventPacket
+
+Field Name	Field Type	Notes
+entityUUID	UUID
+action	varint
+title
+
+if action
+is 0	anonymousNbt
+is 3	anonymousNbt
+default	void
+health
+
+if action
+is 0	f32
+is 2	f32
+default	void
+color
+
+if action
+is 0	varint
+is 4	varint
+default	void
+dividers
+
+if action
+is 0	varint
+is 4	varint
+default	void
+flags
+
+if action
+is 0	u8
+is 5	u8
+default	void
+
+
+11packet difficulty
+play / toClient / packet_difficulty (0x0b)
+
+MC: ClientboundChangeDifficultyPacket
+
+Field Name	Field Type	Notes
+difficulty	u8
+difficultyLocked	bool
+
+
+12packet chunk batch finished
+play / toClient / packet_chunk_batch_finished (0x0c)
+
+MC: ClientboundChunkBatchFinishedPacket
+
+Field Name	Field Type	Notes
+batchSize	varint
+
+
+13packet chunk batch start
+play / toClient / packet_chunk_batch_start (0x0d)
+
+MC: ClientboundChunkBatchStartPacket
+
+Field Name	Field Type	Notes
+
+
+14packet chunk biomes
+play / toClient / packet_chunk_biomes (0x0e)
+
+Empty MC: ClientboundChunksBiomesPacket
+
+Field Name	Field Type	Notes
+biomes length	varint
+biomes
+array
+position	packedChunkPos
+data	ByteArray
+
+
+15packet clear titles
+play / toClient / packet_clear_titles (0x0f)
+
+MC: ClientboundClearTitlesPacket
+
+Field Name	Field Type	Notes
+reset	bool
+
+
+16packet tab complete
+play / toClient / packet_tab_complete (0x10)
+
+MC: ClientboundCommandSuggestionsPacket
+
+Field Name	Field Type	Notes
+transactionId	varint
+start	varint
+length	varint
+matches length	varint
+matches
+array
+match	string
+tooltip
+optional
+anonymousNbt
+
+
+17packet declare commands
+play / toClient / packet_declare_commands (0x11)
+
+MC: ClientboundCommandsPacket
+
+Field Name	Field Type	Notes
+nodes length	varint
+nodes
+array
+command_node
+rootIndex	varint
+
+
+18packet close window
+play / toClient / packet_close_window (0x12)
+
+MC: ClientboundContainerClosePacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+
+
+19packet window items
+play / toClient / packet_window_items (0x13)
+
+MC: ClientboundContainerSetContentPacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+stateId	varint
+items length	varint
+items
+array
+Slot
+carriedItem	Slot
+
+
+20packet craft progress bar
+play / toClient / packet_craft_progress_bar (0x14)
+
+MC: ClientboundContainerSetDataPacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+property	i16
+value	i16
+
+
+21packet set slot
+play / toClient / packet_set_slot (0x15)
+
+MC: ClientboundContainerSetSlotPacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+stateId	varint
+slot	i16
+item	Slot
+
+
+23packet set cooldown
+play / toClient / packet_set_cooldown (0x17)
+
+MC: ClientboundCooldownPacket
+
+Field Name	Field Type	Notes
+itemID	varint
+cooldownTicks	varint
+
+
+24packet chat suggestions
+play / toClient / packet_chat_suggestions (0x18)
+
+MC: ClientboundCustomChatCompletionsPacket
+
+Field Name	Field Type	Notes
+action	varint
+entries length	varint
+entries
+array
+string
+
+
+25packet custom payload
+play / toClient / packet_custom_payload (0x19)
+
+MC: ClientboundCustomPayloadPacket
+
+Field Name	Field Type	Notes
+channel	string
+data	restBuffer
+
+
+26packet damage event
+play / toClient / packet_damage_event (0x1a)
+
+MC: ClientboundDamageEventPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+sourceTypeId	varint
+sourceCauseId	varint
+sourceDirectId	varint
+sourcePosition
+optional
+vec3f64
+
+
+27packet debug sample
+play / toClient / packet_debug_sample (0x1b)
+
+MC: ClientboundDebugSamplePacket
+
+Field Name	Field Type	Notes
+sample length	varint
+sample
+array
+i64
+type	varint
+
+
+28packet hide message
+play / toClient / packet_hide_message (0x1c)
+
+MC: ClientboundDeleteChatPacket
+
+Field Name	Field Type	Notes
+id	varint
+signature
+
+if id
+default	void
+
+
+29packet kick disconnect
+play / toClient / packet_kick_disconnect (0x1d)
+
+MC: ClientboundDisconnectPacket
+
+Field Name	Field Type	Notes
+reason	anonymousNbt
+
+
+TypeChatTypeParameterType
+Datatype
+
+Field Name	Field Type	Notes
+ChatTypeParameterType	
+varint enum
+0	content
+1	sender
+2	target
+
+
+TypeChatType
+play / toClient / ChatType
+
+Field Name	Field Type	Notes
+translationKey	string
+parameters length	varint
+parameters
+array
+ChatTypeParameterType
+style	anonymousNbt
+
+
+TypeChatTypes
+play / toClient / ChatTypes
+
+Field Name	Field Type	Notes
+chat	ChatType
+narration	ChatType
+
+
+30packet profileless chat
+play / toClient / packet_profileless_chat (0x1e)
+
+MC: ClientboundDisguisedChatPacket
+
+Field Name	Field Type	Notes
+message	anonymousNbt
+type	ChatTypesHolder
+name	anonymousNbt
+target
+optional
+anonymousNbt
+
+
+31packet entity status
+play / toClient / packet_entity_status (0x1f)
+
+MC: ClientboundEntityEventPacket
+
+Field Name	Field Type	Notes
+entityId	i32
+entityStatus	i8
+
+
+32packet explosion
+play / toClient / packet_explosion (0x20)
+
+MC: ClientboundExplodePacket
+
+Field Name	Field Type	Notes
+x	f64
+y	f64
+z	f64
+radius	f32
+affectedBlockOffsets length	varint
+affectedBlockOffsets
+array
+x	i8
+y	i8
+z	i8
+playerMotionX	f32
+playerMotionY	f32
+playerMotionZ	f32
+block interaction type	varint
+small explosion particle	Particle
+large explosion particle	Particle
+sound	ItemSoundHolder
+
+
+33packet unload chunk
+play / toClient / packet_unload_chunk (0x21)
+
+MC: ClientboundForgetLevelChunkPacket
+
+Field Name	Field Type	Notes
+chunkZ	i32
+chunkX	i32
+
+
+34packet game state change
+play / toClient / packet_game_state_change (0x22)
+
+MC: ClientboundGameEventPacket
+
+Field Name	Field Type	Notes
+reason	u8
+gameMode	f32
+
+
+35packet open horse window
+play / toClient / packet_open_horse_window (0x23)
+
+MC: ClientboundHorseScreenOpenPacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+nbSlots	varint
+entityId	i32
+
+
+36packet hurt animation
+play / toClient / packet_hurt_animation (0x24)
+
+MC: ClientboundHurtAnimationPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+yaw	f32
+
+
+37packet initialize world border
+play / toClient / packet_initialize_world_border (0x25)
+
+MC: ClientboundInitializeBorderPacket
+
+Field Name	Field Type	Notes
+x	f64
+z	f64
+oldDiameter	f64
+newDiameter	f64
+speed	varint
+portalTeleportBoundary	varint
+warningBlocks	varint
+warningTime	varint
+
+
+38packet keep alive
+play / toClient / packet_keep_alive (0x26)
+
+MC: ClientboundKeepAlivePacket
+
+Field Name	Field Type	Notes
+keepAliveId	i64
+
+
+39packet map chunk
+play / toClient / packet_map_chunk (0x27)
+
+MC: ClientboundLevelChunkWithLightPacket
+
+Field Name	Field Type	Notes
+x	i32
+z	i32
+heightmaps	anonymousNbt
+blockEntities length	varint
+blockEntities
+array
+chunkBlockEntity
+skyLightMask length	varint
+skyLightMask
+array
+i64
+blockLightMask length	varint
+blockLightMask
+array
+i64
+emptySkyLightMask length	varint
+emptySkyLightMask
+array
+i64
+emptyBlockLightMask length	varint
+emptyBlockLightMask
+array
+i64
+skyLight length	varint
+skyLight
+array
+__1650 length	varint
+__1650
+array
+u8
+blockLight length	varint
+blockLight
+array
+__1652 length	varint
+__1652
+array
+u8
+
+
+40packet world event
+play / toClient / packet_world_event (0x28)
+
+MC: ClientboundLevelEventPacket
+
+Field Name	Field Type	Notes
+effectId	i32
+location	position
+data	i32
+global	bool
+
+
+41packet world particles
+play / toClient / packet_world_particles (0x29)
+
+MC: ClientboundLevelParticlesPacket
+
+Field Name	Field Type	Notes
+longDistance	bool
+x	f64
+y	f64
+z	f64
+offsetX	f32
+offsetY	f32
+offsetZ	f32
+velocityOffset	f32
+amount	i32
+particle	Particle
+
+
+42packet update light
+play / toClient / packet_update_light (0x2a)
+
+MC: ClientboundLightUpdatePacket
+
+Field Name	Field Type	Notes
+chunkX	varint
+chunkZ	varint
+skyLightMask length	varint
+skyLightMask
+array
+i64
+blockLightMask length	varint
+blockLightMask
+array
+i64
+emptySkyLightMask length	varint
+emptySkyLightMask
+array
+i64
+emptyBlockLightMask length	varint
+emptyBlockLightMask
+array
+i64
+skyLight length	varint
+skyLight
+array
+__1680 length	varint
+__1680
+array
+u8
+blockLight length	varint
+blockLight
+array
+__1682 length	varint
+__1682
+array
+u8
+
+
+43packet login
+play / toClient / packet_login (0x2b)
+
+MC: ClientboundLoginPacket
+
+Field Name	Field Type	Notes
+entityId	i32
+isHardcore	bool
+worldNames length	varint
+worldNames
+array
+string
+maxPlayers	varint
+viewDistance	varint
+simulationDistance	varint
+reducedDebugInfo	bool
+enableRespawnScreen	bool
+doLimitedCrafting	bool
+worldState	SpawnInfo
+enforcesSecureChat	bool
+
+
+44packet map
+play / toClient / packet_map (0x2c)
+
+MC: ClientboundMapItemDataPacket
+
+Field Name	Field Type	Notes
+itemDamage	varint
+scale	i8
+locked	bool
+icons length	varint
+icons
+array
+type	varint
+x	i8
+z	i8
+direction	u8
+displayName
+optional
+anonymousNbt
+columns	u8
+rows
+
+if columns
+is 0	void
+default	u8
+x
+
+if columns
+is 0	void
+default	u8
+y
+
+if columns
+is 0	void
+default	u8
+data
+
+if columns
+is 0	void
+
+
+45packet trade list
+play / toClient / packet_trade_list (0x2d)
+
+MC: ClientboundMerchantOffersPacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+trades length	varint
+trades
+array
+inputItem1	
+itemId	varint
+itemCount	varint
+addedComponentCount	varint
+Length for components below is addedComponentCount from above
+components
+array
+SlotComponent
+outputItem	Slot
+inputItem2
+optional
+itemId	varint
+itemCount	varint
+addedComponentCount	varint
+Length for components below is addedComponentCount from above
+components
+array
+SlotComponent
+tradeDisabled	bool
+nbTradeUses	i32
+maximumNbTradeUses	i32
+xp	i32
+specialPrice	i32
+priceMultiplier	f32
+demand	i32
+villagerLevel	varint
+experience	varint
+isRegularVillager	bool
+canRestock	bool
+
+
+46packet rel entity move
+play / toClient / packet_rel_entity_move (0x2e)
+
+MC: ClientboundMoveEntityPacket.Pos
+
+Field Name	Field Type	Notes
+entityId	varint
+dX	i16
+dY	i16
+dZ	i16
+onGround	bool
+
+
+47packet entity move look
+play / toClient / packet_entity_move_look (0x2f)
+
+MC: ClientboundMoveEntityPacket.PosRot
+
+Field Name	Field Type	Notes
+entityId	varint
+dX	i16
+dY	i16
+dZ	i16
+yaw	i8
+pitch	i8
+onGround	bool
+
+
+48packet entity look
+play / toClient / packet_entity_look (0x30)
+
+MC: ClientboundMoveEntityPacket.Rot
+
+Field Name	Field Type	Notes
+entityId	varint
+yaw	i8
+pitch	i8
+onGround	bool
+
+
+49packet vehicle move
+play / toClient / packet_vehicle_move (0x31)
+
+MC: ClientboundMoveVehiclePacket
+
+Field Name	Field Type	Notes
+x	f64
+y	f64
+z	f64
+yaw	f32
+pitch	f32
+
+
+50packet open book
+play / toClient / packet_open_book (0x32)
+
+MC: ClientboundOpenBookPacket
+
+Field Name	Field Type	Notes
+hand	varint
+
+
+51packet open window
+play / toClient / packet_open_window (0x33)
+
+MC: ClientboundOpenScreenPacket
+
+Field Name	Field Type	Notes
+windowId	varint
+inventoryType	varint
+windowTitle	anonymousNbt
+
+
+52packet open sign entity
+play / toClient / packet_open_sign_entity (0x34)
+
+MC: ClientboundOpenSignEditorPacket
+
+Field Name	Field Type	Notes
+location	position
+isFrontText	bool
+
+
+53packet ping
+play / toClient / packet_ping (0x35)
+
+MC: ClientboundPingPacket
+
+Field Name	Field Type	Notes
+id	i32
+
+
+54packet ping response
+play / toClient / packet_ping_response (0x36)
+
+MC: ClientboundPongResponsePacket
+
+Field Name	Field Type	Notes
+id	i64
+
+
+55packet craft recipe response
+play / toClient / packet_craft_recipe_response (0x37)
+
+MC: ClientboundPlaceGhostRecipePacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+recipe	string
+
+
+56packet abilities
+play / toClient / packet_abilities (0x38)
+
+MC: ClientboundPlayerAbilitiesPacket
+
+Field Name	Field Type	Notes
+flags	i8
+flyingSpeed	f32
+walkingSpeed	f32
+
+
+57packet player chat
+play / toClient / packet_player_chat (0x39)
+
+MC: ClientboundPlayerChatPacket
+
+Field Name	Field Type	Notes
+senderUuid	UUID
+index	varint
+plainMessage	string
+timestamp	i64
+salt	i64
+previousMessages	previousMessages
+unsignedChatContent
+optional
+anonymousNbt
+filterType	varint
+filterTypeMask
+
+if filterType
+is 2 length	varint
+is 2
+array
+i64
+default	void
+type	ChatTypesHolder
+networkName	anonymousNbt
+networkTargetName
+optional
+anonymousNbt
+
+
+58packet end combat event
+play / toClient / packet_end_combat_event (0x3a)
+
+MC: ClientboundPlayerCombatEndPacket
+
+Field Name	Field Type	Notes
+duration	varint
+
+
+59packet enter combat event
+play / toClient / packet_enter_combat_event (0x3b)
+
+MC: ClientboundPlayerCombatEnterPacket
+
+Field Name	Field Type	Notes
+
+
+60packet death combat event
+play / toClient / packet_death_combat_event (0x3c)
+
+Empty MC: ClientboundPlayerCombatKillPacket
+
+Field Name	Field Type	Notes
+playerId	varint
+message	anonymousNbt
+
+
+61packet player remove
+play / toClient / packet_player_remove (0x3d)
+
+MC: ClientboundPlayerInfoRemovePacket
+
+Field Name	Field Type	Notes
+players length	varint
+players
+array
+UUID
+
+
+62packet player info
+play / toClient / packet_player_info (0x3e)
+
+MC: ClientboundPlayerInfoUpdatePacket
+
+Field Name	Field Type	Notes
+data length	varint
+data
+array
+uuid	UUID
+player
+
+if ../action/add player
+is true	game_profile
+default	void
+chatSession
+
+if ../action/initialize chat
+is true	chat_session
+default	void
+gamemode
+
+if ../action/update game mode
+is true	varint
+default	void
+listed
+
+if ../action/update listed
+is true	varint
+default	void
+latency
+
+if ../action/update latency
+is true	varint
+default	void
+displayName
+
+if ../action/update display name
+default	void
+
+
+63packet face player
+play / toClient / packet_face_player (0x3f)
+
+MC: ClientboundPlayerLookAtPacket
+
+Field Name	Field Type	Notes
+feet eyes	varint
+x	f64
+y	f64
+z	f64
+isEntity	bool
+entityId
+
+if isEntity
+is true	varint
+default	void
+entity feet eyes
+
+if isEntity
+is true	varint
+default	void
+
+
+64packet position
+play / toClient / packet_position (0x40)
+
+Relative.java MC: ClientboundPlayerPositionPacket
+
+Field Name	Field Type	Notes
+x	f64
+y	f64
+z	f64
+yaw	f32
+pitch	f32
+flags	PositionUpdateRelatives
+teleportId	varint
+
+
+65packet unlock recipes
+play / toClient / packet_unlock_recipes (0x41)
+
+MC: ClientboundRecipePacket
+
+Field Name	Field Type	Notes
+action	varint
+craftingBookOpen	bool
+filteringCraftable	bool
+smeltingBookOpen	bool
+filteringSmeltable	bool
+blastFurnaceOpen	bool
+filteringBlastFurnace	bool
+smokerBookOpen	bool
+filteringSmoker	bool
+recipes1 length	varint
+recipes1
+array
+string
+recipes2
+
+if action
+is 0 length	varint
+is 0
+array
+string
+default	void
+
+
+66packet entity destroy
+play / toClient / packet_entity_destroy (0x42)
+
+MC: ClientboundRemoveEntitiesPacket
+
+Field Name	Field Type	Notes
+entityIds length	varint
+entityIds
+array
+varint
+
+
+67packet remove entity effect
+play / toClient / packet_remove_entity_effect (0x43)
+
+MC: ClientboundRemoveMobEffectPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+effectId	varint
+
+
+68packet reset score
+play / toClient / packet_reset_score (0x44)
+
+MC: ClientboundResetScorePacket
+
+Field Name	Field Type	Notes
+entity name	string
+objective name
+optional
+string
+
+
+71packet respawn
+play / toClient / packet_respawn (0x47)
+
+MC: ClientboundRespawnPacket
+
+Field Name	Field Type	Notes
+worldState	SpawnInfo
+copyMetadata	u8	
+Bit field: 0b1 - KEEPATTRIBUTEMODIFIERS, 0b10 - KEEPENTITYDATA
+
+
+
+72packet entity head rotation
+play / toClient / packet_entity_head_rotation (0x48)
+
+MC: ClientboundRotateHeadPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+headYaw	i8
+
+
+73packet multi block change
+play / toClient / packet_multi_block_change (0x49)
+
+MC: ClientboundSectionBlocksUpdatePacket
+
+Field Name	Field Type	Notes
+records length	varint
+records
+array
+varint
+
+
+74packet select advancement tab
+play / toClient / packet_select_advancement_tab (0x4a)
+
+MC: ClientboundSelectAdvancementsTabPacket
+
+Field Name	Field Type	Notes
+id
+optional
+string
+
+
+75packet server data
+play / toClient / packet_server_data (0x4b)
+
+MC: ClientboundServerDataPacket
+
+Field Name	Field Type	Notes
+motd	anonymousNbt
+iconBytes
+optional
+ByteArray
+
+
+76packet action bar
+play / toClient / packet_action_bar (0x4c)
+
+MC: ClientboundSetActionBarTextPacket
+
+Field Name	Field Type	Notes
+text	anonymousNbt
+
+
+77packet world border center
+play / toClient / packet_world_border_center (0x4d)
+
+MC: ClientboundSetBorderCenterPacket
+
+Field Name	Field Type	Notes
+x	f64
+z	f64
+
+
+78packet world border lerp size
+play / toClient / packet_world_border_lerp_size (0x4e)
+
+MC: ClientboundSetBorderLerpSizePacket
+
+Field Name	Field Type	Notes
+oldDiameter	f64
+newDiameter	f64
+speed	varint
+
+
+79packet world border size
+play / toClient / packet_world_border_size (0x4f)
+
+MC: ClientboundSetBorderSizePacket
+
+Field Name	Field Type	Notes
+diameter	f64
+
+
+80packet world border warning delay
+play / toClient / packet_world_border_warning_delay (0x50)
+
+MC: ClientboundSetBorderWarningDelayPacket
+
+Field Name	Field Type	Notes
+warningTime	varint
+
+
+81packet world border warning reach
+play / toClient / packet_world_border_warning_reach (0x51)
+
+MC: ClientboundSetBorderWarningDistancePacket
+
+Field Name	Field Type	Notes
+warningBlocks	varint
+
+
+82packet camera
+play / toClient / packet_camera (0x52)
+
+MC: ClientboundSetCameraPacket
+
+Field Name	Field Type	Notes
+cameraId	varint
+
+
+83packet held item slot
+play / toClient / packet_held_item_slot (0x53)
+
+MC: ClientboundSetCarriedItemPacket
+
+Field Name	Field Type	Notes
+slot	i8
+
+
+84packet update view position
+play / toClient / packet_update_view_position (0x54)
+
+MC: ClientboundSetChunkCacheCenterPacket
+
+Field Name	Field Type	Notes
+chunkX	varint
+chunkZ	varint
+
+
+85packet update view distance
+play / toClient / packet_update_view_distance (0x55)
+
+MC: ClientboundSetChunkCacheRadiusPacket
+
+Field Name	Field Type	Notes
+viewDistance	varint
+
+
+86packet spawn position
+play / toClient / packet_spawn_position (0x56)
+
+MC: ClientboundSetDefaultSpawnPositionPacket
+
+Field Name	Field Type	Notes
+location	position
+angle	f32
+
+
+87packet scoreboard display objective
+play / toClient / packet_scoreboard_display_objective (0x57)
+
+MC: ClientboundSetDisplayObjectivePacket
+
+Field Name	Field Type	Notes
+position	varint
+name	string
+
+
+88packet entity metadata
+play / toClient / packet_entity_metadata (0x58)
+
+MC: ClientboundSetEntityDataPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+metadata	entityMetadata
+
+
+89packet attach entity
+play / toClient / packet_attach_entity (0x59)
+
+MC: ClientboundSetEntityLinkPacket
+
+Field Name	Field Type	Notes
+entityId	i32
+vehicleId	i32
+
+
+90packet entity velocity
+play / toClient / packet_entity_velocity (0x5a)
+
+MC: ClientboundSetEntityMotionPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+velocityX	i16
+velocityY	i16
+velocityZ	i16
+
+
+91packet entity equipment
+play / toClient / packet_entity_equipment (0x5b)
+
+MC: ClientboundSetEquipmentPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+
+
+92packet experience
+play / toClient / packet_experience (0x5c)
+
+MC: ClientboundSetExperiencePacket
+
+Field Name	Field Type	Notes
+experienceBar	f32
+level	varint
+totalExperience	varint
+
+
+93packet update health
+play / toClient / packet_update_health (0x5d)
+
+MC: ClientboundSetHealthPacket
+
+Field Name	Field Type	Notes
+health	f32
+food	varint
+foodSaturation	f32
+
+
+94packet scoreboard objective
+play / toClient / packet_scoreboard_objective (0x5e)
+
+MC: ClientboundSetObjectivePacket
+
+Field Name	Field Type	Notes
+name	string
+action	i8
+displayText
+
+if action
+is 0	anonymousNbt
+is 2	anonymousNbt
+default	void
+type
+
+if action
+is 0	varint
+is 2	varint
+default	void
+number format
+
+if action
+default	void
+styling
+
+if action
+if 0
+
+if number format
+is 1	anonymousNbt
+is 2	anonymousNbt
+default	void
+if 2
+
+if number format
+is 1	anonymousNbt
+is 2	anonymousNbt
+default	void
+default	void
+
+
+95packet set passengers
+play / toClient / packet_set_passengers (0x5f)
+
+MC: ClientboundSetPassengersPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+passengers length	varint
+passengers
+array
+varint
+
+
+96packet teams
+play / toClient / packet_teams (0x60)
+
+MC: ClientboundSetPlayerTeamPacket
+
+Field Name	Field Type	Notes
+team	string
+mode	i8
+name
+
+if mode
+is 0	anonymousNbt
+is 2	anonymousNbt
+default	void
+friendlyFire
+
+if mode
+is 0	i8
+is 2	i8
+default	void
+nameTagVisibility
+
+if mode
+is 0	string
+is 2	string
+default	void
+collisionRule
+
+if mode
+is 0	string
+is 2	string
+default	void
+formatting
+
+if mode
+is 0	varint
+is 2	varint
+default	void
+prefix
+
+if mode
+is 0	anonymousNbt
+is 2	anonymousNbt
+default	void
+suffix
+
+if mode
+is 0	anonymousNbt
+is 2	anonymousNbt
+default	void
+players
+
+if mode
+is 0 length	varint
+is 0
+array
+string
+is 3 length	varint
+is 3
+array
+string
+is 4 length	varint
+is 4
+array
+string
+default	void
+
+
+97packet scoreboard score
+play / toClient / packet_scoreboard_score (0x61)
+
+MC: ClientboundSetScorePacket
+
+Field Name	Field Type	Notes
+itemName	string
+scoreName	string
+value	varint
+display name
+optional
+anonymousNbt
+number format
+optional
+varint
+styling
+
+if number format
+is 1	anonymousNbt
+is 2	anonymousNbt
+default	void
+
+
+98packet simulation distance
+play / toClient / packet_simulation_distance (0x62)
+
+MC: ClientboundSetSimulationDistancePacket
+
+Field Name	Field Type	Notes
+distance	varint
+
+
+99packet set title subtitle
+play / toClient / packet_set_title_subtitle (0x63)
+
+MC: ClientboundSetSubtitleTextPacket
+
+Field Name	Field Type	Notes
+text	anonymousNbt
+
+
+100packet update time
+play / toClient / packet_update_time (0x64)
+
+MC: ClientboundSetTimePacket
+
+Field Name	Field Type	Notes
+age	i64
+time	i64
+
+
+101packet set title text
+play / toClient / packet_set_title_text (0x65)
+
+MC: ClientboundSetTitleTextPacket
+
+Field Name	Field Type	Notes
+text	anonymousNbt
+
+
+102packet set title time
+play / toClient / packet_set_title_time (0x66)
+
+MC: ClientboundSetTitlesAnimationPacket
+
+Field Name	Field Type	Notes
+fadeIn	i32
+stay	i32
+fadeOut	i32
+
+
+103packet entity sound effect
+play / toClient / packet_entity_sound_effect (0x67)
+
+MC: ClientboundSoundEntityPacket
+
+Field Name	Field Type	Notes
+sound	ItemSoundHolder
+soundCategory	soundSource
+entityId	varint
+volume	f32
+pitch	f32
+seed	i64
+
+
+104packet sound effect
+play / toClient / packet_sound_effect (0x68)
+
+MC: ClientboundSoundPacket
+
+Field Name	Field Type	Notes
+sound	ItemSoundHolder
+soundCategory	soundSource
+x	i32
+y	i32
+z	i32
+volume	f32
+pitch	f32
+seed	i64
+
+
+105packet start configuration
+play / toClient / packet_start_configuration (0x69)
+
+MC: ClientboundStartConfigurationPacket
+
+Field Name	Field Type	Notes
+
+
+106packet stop sound
+play / toClient / packet_stop_sound (0x6a)
+
+Empty MC: ClientboundStopSoundPacket
+
+Field Name	Field Type	Notes
+flags	i8
+source
+
+if flags
+is 1	varint
+is 3	varint
+default	void
+sound
+
+if flags
+is 2	string
+is 3	string
+default	void
+
+
+108packet system chat
+play / toClient / packet_system_chat (0x6c)
+
+MC: ClientboundSystemChatPacket
+
+Field Name	Field Type	Notes
+content	anonymousNbt
+isActionBar	bool
+
+
+109packet playerlist header
+play / toClient / packet_playerlist_header (0x6d)
+
+MC: ClientboundTabListPacket
+
+Field Name	Field Type	Notes
+header	anonymousNbt
+footer	anonymousNbt
+
+
+110packet nbt query response
+play / toClient / packet_nbt_query_response (0x6e)
+
+MC: ClientboundTagQueryPacket
+
+Field Name	Field Type	Notes
+transactionId	varint
+nbt	anonOptionalNbt
+
+
+111packet collect
+play / toClient / packet_collect (0x6f)
+
+MC: ClientboundTakeItemEntityPacket
+
+Field Name	Field Type	Notes
+collectedEntityId	varint
+collectorEntityId	varint
+pickupItemCount	varint
+
+
+112packet entity teleport
+play / toClient / packet_entity_teleport (0x70)
+
+MC: ClientboundTeleportEntityPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+x	f64
+y	f64
+z	f64
+yaw	i8
+pitch	i8
+onGround	bool
+
+
+113packet set ticking state
+play / toClient / packet_set_ticking_state (0x71)
+
+MC: ClientboundTickingStatePacket
+
+Field Name	Field Type	Notes
+tick rate	f32
+is frozen	bool
+
+
+114packet step tick
+play / toClient / packet_step_tick (0x72)
+
+MC: ClientboundTickingStepPacket
+
+Field Name	Field Type	Notes
+tick steps	varint
+
+
+116packet advancements
+play / toClient / packet_advancements (0x74)
+
+MC: ClientboundUpdateAdvancementsPacket
+
+Field Name	Field Type	Notes
+reset	bool
+advancementMapping length	varint
+advancementMapping
+array
+key	string
+value	
+parentId
+optional
+string
+displayData
+optional
+title	anonymousNbt
+description	anonymousNbt
+icon	Slot
+frameType	varint
+backgroundTexture
+
+if flags/has background texture
+is 1	string
+default	void
+xCord	f32
+yCord	f32
+requirements length	varint
+requirements
+array
+__2235 length	varint
+__2235
+array
+string
+sendsTelemtryData	bool
+identifiers length	varint
+identifiers
+array
+string
+progressMapping length	varint
+progressMapping
+array
+key	string
+value length	varint
+value
+array
+criterionIdentifier	string
+criterionProgress
+optional
+i64
+
+
+117packet entity update attributes
+play / toClient / packet_entity_update_attributes (0x75)
+
+MC: ClientboundUpdateAttributesPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+properties length	varint
+properties
+array
+key	
+varint enum
+0	generic.armor
+1	generic.armor toughness
+2	generic.attack damage
+3	generic.attack knockback
+4	generic.attack speed
+5	player.block break speed
+6	player.block interaction range
+7	player.entity interaction range
+8	generic.fall damage multiplier
+9	generic.flying speed
+10	generic.follow range
+11	generic.gravity
+12	generic.jump strength
+13	generic.knockback resistance
+14	generic.luck
+15	generic.max absorption
+16	generic.max health
+17	generic.movement speed
+18	generic.safe fall distance
+19	generic.scale
+20	zombie.spawn reinforcements
+21	generic.step height
+value	f64
+modifiers length	varint
+modifiers
+array
+uuid	string
+amount	f64
+operation	i8
+
+
+118packet entity effect
+play / toClient / packet_entity_effect (0x76)
+
+MC: ClientboundUpdateMobEffectPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+effectId	varint
+amplifier	varint
+duration	varint
+flags	u8	
+a bitfield of 0x01 for ambient, 0x02 for show particles flags: ["bitfield", [ { "name": "unused", "size": 4 }, { "name": "ambient", "size": 1 }, { "name": "showParticles", "size": 1 }, { "name": "showIcon", "size": 1 }, { "name": "blend", "size": 1 } ]]
+
+
+
+119packet declare recipes
+play / toClient / packet_declare_recipes (0x77)
+
+MC: ClientboundUpdateRecipesPacket
+
+Field Name	Field Type	Notes
+recipes length	varint
+recipes
+array
+name	string
+type	
+varint enum
+0	minecraft:crafting shaped
+1	minecraft:crafting shapeless
+2	minecraft:crafting special armordye
+3	minecraft:crafting special bookcloning
+4	minecraft:crafting special mapcloning
+5	minecraft:crafting special mapextending
+6	minecraft:crafting special firework rocket
+7	minecraft:crafting special firework star
+8	minecraft:crafting special firework star fade
+9	minecraft:crafting special tippedarrow
+10	minecraft:crafting special bannerduplicate
+11	minecraft:crafting special shielddecoration
+12	minecraft:crafting special shulkerboxcoloring
+13	minecraft:crafting special suspiciousstew
+14	minecraft:crafting special repairitem
+15	minecraft:smelting
+16	minecraft:blasting
+17	minecraft:smoking
+18	minecraft:campfire cooking
+19	minecraft:stonecutting
+20	minecraft:smithing transform
+21	minecraft:smithing trim
+22	minecraft:crafting decorated pot
+data
+
+if type
+is minecraft:crafting shapeless	
+group	string
+category	varint
+ingredients length	varint
+ingredients
+array
+ingredient
+result	Slot
+is minecraft:crafting shaped	
+group	string
+category	varint
+gridWidth	varint
+gridHeight	varint
+Length for ingredients below is gridWidth from above
+ingredients
+array
+Length for __2330 below is gridHeight from above
+__2330
+array
+ingredient
+result	Slot
+showNotification	bool
+is minecraft:crafting special armordye	minecraft_simple_recipe_format
+is minecraft:crafting special bookcloning	minecraft_simple_recipe_format
+is minecraft:crafting special mapcloning	minecraft_simple_recipe_format
+is minecraft:crafting special mapextending	minecraft_simple_recipe_format
+is minecraft:crafting special firework rocket	minecraft_simple_recipe_format
+is minecraft:crafting special firework star	minecraft_simple_recipe_format
+is minecraft:crafting special firework star fade	minecraft_simple_recipe_format
+is minecraft:crafting special repairitem	minecraft_simple_recipe_format
+is minecraft:crafting special tippedarrow	minecraft_simple_recipe_format
+is minecraft:crafting special bannerduplicate	minecraft_simple_recipe_format
+is minecraft:crafting special banneraddpattern	minecraft_simple_recipe_format
+is minecraft:crafting special shielddecoration	minecraft_simple_recipe_format
+is minecraft:crafting special shulkerboxcoloring	minecraft_simple_recipe_format
+is minecraft:crafting special suspiciousstew	minecraft_simple_recipe_format
+is minecraft:smelting	minecraft_smelting_format
+is minecraft:blasting	minecraft_smelting_format
+is minecraft:smoking	minecraft_smelting_format
+is minecraft:campfire cooking	minecraft_smelting_format
+is minecraft:stonecutting	
+group	string
+ingredient	ingredient
+result	Slot
+is minecraft:smithing transform	
+template	ingredient
+base	ingredient
+addition	ingredient
+result	Slot
+is minecraft:smithing trim	
+template	ingredient
+base	ingredient
+addition	ingredient
+is minecraft:crafting decorated pot	minecraft_simple_recipe_format
+
+
+120packet tags
+play / toClient / packet_tags (0x78)
+
+MC: ClientboundUpdateTagsPacket
+
+Field Name	Field Type	Notes
+tags length	varint
+tags
+array
+tagType	string
+tags	tags
+
+
+121packet set projectile power
+play / toClient / packet_set_projectile_power (0x79)
+
+MC: ClientboundProjectilePowerPacket
+
+Field Name	Field Type	Notes
+id	varint
+accelerationPower	f64
+
+
+Typepacket
+play / toClient / packet
+
+Field Name	Field Type	Notes
+name	
+varint enum
+0	bundle delimiter
+1	spawn entity
+2	spawn entity experience orb
+3	animation
+4	statistics
+5	acknowledge player digging
+6	block break animation
+7	tile entity data
+8	block action
+9	block change
+10	boss bar
+11	difficulty
+12	chunk batch finished
+13	chunk batch start
+14	chunk biomes
+15	clear titles
+16	tab complete
+17	declare commands
+18	close window
+19	window items
+20	craft progress bar
+21	set slot
+22	cookie request
+23	set cooldown
+24	chat suggestions
+25	custom payload
+26	damage event
+27	debug sample
+28	hide message
+29	kick disconnect
+30	profileless chat
+31	entity status
+32	explosion
+33	unload chunk
+34	game state change
+35	open horse window
+36	hurt animation
+37	initialize world border
+38	keep alive
+39	map chunk
+40	world event
+41	world particles
+42	update light
+43	login
+44	map
+45	trade list
+46	rel entity move
+47	entity move look
+48	entity look
+49	vehicle move
+50	open book
+51	open window
+52	open sign entity
+53	ping
+54	ping response
+55	craft recipe response
+56	abilities
+57	player chat
+58	end combat event
+59	enter combat event
+60	death combat event
+61	player remove
+62	player info
+63	face player
+64	position
+65	unlock recipes
+66	entity destroy
+67	remove entity effect
+68	reset score
+69	remove resource pack
+70	add resource pack
+71	respawn
+72	entity head rotation
+73	multi block change
+74	select advancement tab
+75	server data
+76	action bar
+77	world border center
+78	world border lerp size
+79	world border size
+80	world border warning delay
+81	world border warning reach
+82	camera
+83	held item slot
+84	update view position
+85	update view distance
+86	spawn position
+87	scoreboard display objective
+88	entity metadata
+89	attach entity
+90	entity velocity
+91	entity equipment
+92	experience
+93	update health
+94	scoreboard objective
+95	set passengers
+96	teams
+97	scoreboard score
+98	simulation distance
+99	set title subtitle
+100	update time
+101	set title text
+102	set title time
+103	entity sound effect
+104	sound effect
+105	start configuration
+106	stop sound
+107	store cookie
+108	system chat
+109	playerlist header
+110	nbt query response
+111	collect
+112	entity teleport
+113	set ticking state
+114	step tick
+115	transfer
+116	advancements
+117	entity update attributes
+118	entity effect
+119	declare recipes
+120	tags
+121	set projectile power
+122	custom report details
+123	server links
+params
+
+if name
+is bundle delimiter	void
+is spawn entity	packet_spawn_entity
+is spawn entity experience orb	packet_spawn_entity_experience_orb
+is animation	packet_animation
+is statistics	packet_statistics
+is acknowledge player digging	packet_acknowledge_player_digging
+is block break animation	packet_block_break_animation
+is tile entity data	packet_tile_entity_data
+is block action	packet_block_action
+is block change	packet_block_change
+is boss bar	packet_boss_bar
+is difficulty	packet_difficulty
+is chunk batch finished	packet_chunk_batch_finished
+is chunk batch start	packet_chunk_batch_start
+is chunk biomes	packet_chunk_biomes
+is clear titles	packet_clear_titles
+is tab complete	packet_tab_complete
+is declare commands	packet_declare_commands
+is close window	packet_close_window
+is window items	packet_window_items
+is craft progress bar	packet_craft_progress_bar
+is set slot	packet_set_slot
+is cookie request	packet_common_cookie_request
+is set cooldown	packet_set_cooldown
+is chat suggestions	packet_chat_suggestions
+is custom payload	packet_custom_payload
+is damage event	packet_damage_event
+is debug sample	packet_debug_sample
+is hide message	packet_hide_message
+is kick disconnect	packet_kick_disconnect
+is profileless chat	packet_profileless_chat
+is entity status	packet_entity_status
+is explosion	packet_explosion
+is unload chunk	packet_unload_chunk
+is game state change	packet_game_state_change
+is open horse window	packet_open_horse_window
+is hurt animation	packet_hurt_animation
+is initialize world border	packet_initialize_world_border
+is keep alive	packet_keep_alive
+is map chunk	packet_map_chunk
+is world event	packet_world_event
+is world particles	packet_world_particles
+is update light	packet_update_light
+is login	packet_login
+is map	packet_map
+is trade list	packet_trade_list
+is rel entity move	packet_rel_entity_move
+is entity move look	packet_entity_move_look
+is entity look	packet_entity_look
+is vehicle move	packet_vehicle_move
+is open book	packet_open_book
+is open window	packet_open_window
+is open sign entity	packet_open_sign_entity
+is ping	packet_ping
+is ping response	packet_ping_response
+is craft recipe response	packet_craft_recipe_response
+is abilities	packet_abilities
+is player chat	packet_player_chat
+is end combat event	packet_end_combat_event
+is enter combat event	packet_enter_combat_event
+is death combat event	packet_death_combat_event
+is player remove	packet_player_remove
+is player info	packet_player_info
+is face player	packet_face_player
+is position	packet_position
+is unlock recipes	packet_unlock_recipes
+is entity destroy	packet_entity_destroy
+is remove entity effect	packet_remove_entity_effect
+is reset score	packet_reset_score
+is remove resource pack	packet_common_remove_resource_pack
+is add resource pack	packet_common_add_resource_pack
+is respawn	packet_respawn
+is entity head rotation	packet_entity_head_rotation
+is multi block change	packet_multi_block_change
+is select advancement tab	packet_select_advancement_tab
+is server data	packet_server_data
+is action bar	packet_action_bar
+is world border center	packet_world_border_center
+is world border lerp size	packet_world_border_lerp_size
+is world border size	packet_world_border_size
+is world border warning delay	packet_world_border_warning_delay
+is world border warning reach	packet_world_border_warning_reach
+is camera	packet_camera
+is held item slot	packet_held_item_slot
+is update view position	packet_update_view_position
+is update view distance	packet_update_view_distance
+is spawn position	packet_spawn_position
+is scoreboard display objective	packet_scoreboard_display_objective
+is entity metadata	packet_entity_metadata
+is attach entity	packet_attach_entity
+is entity velocity	packet_entity_velocity
+is entity equipment	packet_entity_equipment
+is experience	packet_experience
+is update health	packet_update_health
+is scoreboard objective	packet_scoreboard_objective
+is set passengers	packet_set_passengers
+is teams	packet_teams
+is scoreboard score	packet_scoreboard_score
+is simulation distance	packet_simulation_distance
+is set title subtitle	packet_set_title_subtitle
+is update time	packet_update_time
+is set title text	packet_set_title_text
+is set title time	packet_set_title_time
+is entity sound effect	packet_entity_sound_effect
+is sound effect	packet_sound_effect
+is start configuration	packet_start_configuration
+is stop sound	packet_stop_sound
+is store cookie	packet_common_store_cookie
+is system chat	packet_system_chat
+is playerlist header	packet_playerlist_header
+is nbt query response	packet_nbt_query_response
+is collect	packet_collect
+is entity teleport	packet_entity_teleport
+is set ticking state	packet_set_ticking_state
+is step tick	packet_step_tick
+is transfer	packet_common_transfer
+is advancements	packet_advancements
+is entity update attributes	packet_entity_update_attributes
+is entity effect	packet_entity_effect
+is declare recipes	packet_declare_recipes
+is tags	packet_tags
+is set projectile power	packet_set_projectile_power
+is custom report details	packet_common_custom_report_details
+is server links	packet_common_server_links
+
+
+play / toServer / types
+Table of Contents
+Key	Name
+Type	packet_teleport_confirm
+0x1	packet_query_block_nbt
+0x2	packet_set_difficulty
+0x3	packet_message_acknowledgement
+0x4	packet_chat_command
+0x5	packet_chat_command_signed
+0x6	packet_chat_message
+0x7	packet_chat_session_update
+0x8	packet_chunk_batch_received
+0x9	packet_client_command
+0xb	packet_tab_complete
+0xc	packet_configuration_acknowledged
+0xd	packet_enchant_item
+0xe	packet_window_click
+0xf	packet_close_window
+0x10	packet_set_slot_state
+0x12	packet_custom_payload
+0x13	packet_debug_sample_subscription
+0x14	packet_edit_book
+0x15	packet_query_entity_nbt
+0x16	packet_use_entity
+0x17	packet_generate_structure
+0x18	packet_keep_alive
+0x19	packet_lock_difficulty
+0x1a	packet_position
+0x1b	packet_position_look
+0x1c	packet_look
+0x1d	packet_flying
+0x1e	packet_vehicle_move
+0x1f	packet_steer_boat
+0x20	packet_pick_item
+0x21	packet_ping_request
+0x22	packet_craft_recipe_request
+0x23	packet_abilities
+0x24	packet_block_dig
+0x25	packet_entity_action
+0x26	packet_steer_vehicle
+0x27	packet_pong
+0x28	packet_recipe_book
+0x29	packet_displayed_recipe
+0x2a	packet_name_item
+0x2b	packet_resource_pack_receive
+0x2c	packet_advancement_tab
+0x2d	packet_select_trade
+0x2e	packet_set_beacon_effect
+0x2f	packet_held_item_slot
+0x30	packet_update_command_block
+0x31	packet_update_command_block_minecart
+0x32	packet_set_creative_slot
+0x33	packet_update_jigsaw_block
+0x34	packet_update_structure_block
+0x35	packet_update_sign
+0x36	packet_arm_animation
+0x37	packet_spectate
+0x38	packet_block_place
+0x39	packet_use_item
+Type	packet
+
+0packet teleport confirm
+play / toServer / packet_teleport_confirm (0x00)
+
+MC: ServerboundAcceptTeleportationPacket
+
+Field Name	Field Type	Notes
+teleportId	varint
+
+
+1packet query block nbt
+play / toServer / packet_query_block_nbt (0x01)
+
+MC: ServerboundBlockEntityTagQueryPacket
+
+Field Name	Field Type	Notes
+transactionId	varint
+location	position
+
+
+2packet set difficulty
+play / toServer / packet_set_difficulty (0x02)
+
+MC: ServerboundChangeDifficultyPacket
+
+Field Name	Field Type	Notes
+newDifficulty	u8
+
+
+3packet message acknowledgement
+play / toServer / packet_message_acknowledgement (0x03)
+
+MC: ServerboundChatAckPacket
+
+Field Name	Field Type	Notes
+count	varint
+
+
+4packet chat command
+play / toServer / packet_chat_command (0x04)
+
+MC: ServerboundChatCommandPacket
+
+Field Name	Field Type	Notes
+command	string
+
+
+5packet chat command signed
+play / toServer / packet_chat_command_signed (0x05)
+
+MC: ServerboundChatCommandSignedPacket
+
+Field Name	Field Type	Notes
+command	string
+timestamp	i64
+salt	i64
+argumentSignatures length	varint
+argumentSignatures
+array
+argumentName	string
+messageCount	varint
+
+
+6packet chat message
+play / toServer / packet_chat_message (0x06)
+
+MC: ServerboundChatPacket
+
+Field Name	Field Type	Notes
+message	string
+timestamp	i64
+salt	i64
+offset	varint
+
+
+7packet chat session update
+play / toServer / packet_chat_session_update (0x07)
+
+MC: ServerboundChatSessionUpdatePacket
+
+Field Name	Field Type	Notes
+sessionUUID	UUID
+expireTime	i64
+publicKey	ByteArray
+signature	ByteArray
+
+
+8packet chunk batch received
+play / toServer / packet_chunk_batch_received (0x08)
+
+MC: ServerboundChunkBatchReceivedPacket
+
+Field Name	Field Type	Notes
+chunksPerTick	f32
+
+
+9packet client command
+play / toServer / packet_client_command (0x09)
+
+MC: ServerboundClientCommandPacket
+
+Field Name	Field Type	Notes
+actionId	varint
+
+
+11packet tab complete
+play / toServer / packet_tab_complete (0x0b)
+
+MC: ServerboundCommandSuggestionPacket
+
+Field Name	Field Type	Notes
+transactionId	varint
+text	string
+
+
+12packet configuration acknowledged
+play / toServer / packet_configuration_acknowledged (0x0c)
+
+MC: ServerboundConfigurationAcknowledgedPacket
+
+Field Name	Field Type	Notes
+
+
+13packet enchant item
+play / toServer / packet_enchant_item (0x0d)
+
+Empty MC: ServerboundContainerButtonClickPacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+enchantment	i8
+
+
+14packet window click
+play / toServer / packet_window_click (0x0e)
+
+MC: ServerboundContainerClickPacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+stateId	varint
+slot	i16
+mouseButton	i8
+mode	varint
+changedSlots length	varint
+changedSlots
+array
+location	i16
+item	Slot
+cursorItem	Slot
+
+
+15packet close window
+play / toServer / packet_close_window (0x0f)
+
+MC: ServerboundContainerClosePacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+
+
+16packet set slot state
+play / toServer / packet_set_slot_state (0x10)
+
+MC: ServerboundContainerSlotStateChangedPacket
+
+Field Name	Field Type	Notes
+slot id	varint
+window id	varint
+state	bool
+
+
+18packet custom payload
+play / toServer / packet_custom_payload (0x12)
+
+MC: ServerboundCustomPayloadPacket
+
+Field Name	Field Type	Notes
+channel	string
+data	restBuffer
+
+
+19packet debug sample subscription
+play / toServer / packet_debug_sample_subscription (0x13)
+
+MC: ServerboundDebugSampleSubscriptionPacket
+
+Field Name	Field Type	Notes
+type	varint
+
+
+20packet edit book
+play / toServer / packet_edit_book (0x14)
+
+MC: ServerboundEditBookPacket
+
+Field Name	Field Type	Notes
+hand	varint
+pages length	varint
+pages
+array
+string
+title
+optional
+string
+
+
+21packet query entity nbt
+play / toServer / packet_query_entity_nbt (0x15)
+
+MC: ServerboundEntityTagQuery
+
+Field Name	Field Type	Notes
+transactionId	varint
+entityId	varint
+
+
+22packet use entity
+play / toServer / packet_use_entity (0x16)
+
+MC: ServerboundInteractPacket
+
+Field Name	Field Type	Notes
+target	varint
+mouse	varint
+x
+
+if mouse
+is 2	f32
+default	void
+y
+
+if mouse
+is 2	f32
+default	void
+z
+
+if mouse
+is 2	f32
+default	void
+hand
+
+if mouse
+is 0	varint
+is 2	varint
+default	void
+sneaking	bool
+
+
+23packet generate structure
+play / toServer / packet_generate_structure (0x17)
+
+MC: ServerboundJigsawGeneratePacket
+
+Field Name	Field Type	Notes
+location	position
+levels	varint
+keepJigsaws	bool
+
+
+24packet keep alive
+play / toServer / packet_keep_alive (0x18)
+
+MC: ServerboundKeepAlivePacket
+
+Field Name	Field Type	Notes
+keepAliveId	i64
+
+
+25packet lock difficulty
+play / toServer / packet_lock_difficulty (0x19)
+
+MC: ServerboundLockDifficultyPacket
+
+Field Name	Field Type	Notes
+locked	bool
+
+
+26packet position
+play / toServer / packet_position (0x1a)
+
+MC: ServerboundMovePlayerPacket.Pos
+
+Field Name	Field Type	Notes
+x	f64
+y	f64
+z	f64
+onGround	bool
+
+
+27packet position look
+play / toServer / packet_position_look (0x1b)
+
+MC: ServerboundMovePlayerPacket.PosRot
+
+Field Name	Field Type	Notes
+x	f64
+y	f64
+z	f64
+yaw	f32
+pitch	f32
+onGround	bool
+
+
+28packet look
+play / toServer / packet_look (0x1c)
+
+MC: ServerboundMovePlayerPacket.Rot
+
+Field Name	Field Type	Notes
+yaw	f32
+pitch	f32
+onGround	bool
+
+
+29packet flying
+play / toServer / packet_flying (0x1d)
+
+MC: ServerboundMovePlayerPacket.StatusOnly
+
+Field Name	Field Type	Notes
+onGround	bool
+
+
+30packet vehicle move
+play / toServer / packet_vehicle_move (0x1e)
+
+MC: ServerboundMoveVehiclePacket
+
+Field Name	Field Type	Notes
+x	f64
+y	f64
+z	f64
+yaw	f32
+pitch	f32
+
+
+31packet steer boat
+play / toServer / packet_steer_boat (0x1f)
+
+MC: ServerboundPaddleBoatPacket
+
+Field Name	Field Type	Notes
+leftPaddle	bool
+rightPaddle	bool
+
+
+32packet pick item
+play / toServer / packet_pick_item (0x20)
+
+MC: ServerboundPickItemPacket
+
+Field Name	Field Type	Notes
+slot	varint
+
+
+33packet ping request
+play / toServer / packet_ping_request (0x21)
+
+MC: ServerboundPingRequestPacket
+
+Field Name	Field Type	Notes
+id	i64
+
+
+34packet craft recipe request
+play / toServer / packet_craft_recipe_request (0x22)
+
+MC: ServerboundPlaceRecipePacket
+
+Field Name	Field Type	Notes
+windowId	ContainerID
+recipe	string
+makeAll	bool
+
+
+35packet abilities
+play / toServer / packet_abilities (0x23)
+
+MC: ServerboundPlayerAbilitiesPacket
+
+Field Name	Field Type	Notes
+flags	i8
+
+
+36packet block dig
+play / toServer / packet_block_dig (0x24)
+
+MC: ServerboundPlayerActionPacket
+
+Field Name	Field Type	Notes
+status	varint
+location	position
+face	i8
+sequence	varint
+
+
+37packet entity action
+play / toServer / packet_entity_action (0x25)
+
+MC: ServerboundPlayerCommandPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+actionId	varint
+jumpBoost	varint
+
+
+38packet steer vehicle
+play / toServer / packet_steer_vehicle (0x26)
+
+MC: ServerboundPlayerInputPacket
+
+Field Name	Field Type	Notes
+sideways	f32
+forward	f32
+jump	u8
+
+
+39packet pong
+play / toServer / packet_pong (0x27)
+
+MC: ServerboundPongPacket
+
+Field Name	Field Type	Notes
+id	i32
+
+
+40packet recipe book
+play / toServer / packet_recipe_book (0x28)
+
+MC: ServerboundRecipeBookChangeSettingsPacket
+
+Field Name	Field Type	Notes
+bookId	varint
+bookOpen	bool
+filterActive	bool
+
+
+41packet displayed recipe
+play / toServer / packet_displayed_recipe (0x29)
+
+MC: ServerboundRecipeBookSeenRecipePacket
+
+Field Name	Field Type	Notes
+recipeId	string
+
+
+42packet name item
+play / toServer / packet_name_item (0x2a)
+
+MC: ServerboundRenameItemPacket
+
+Field Name	Field Type	Notes
+name	string
+
+
+43packet resource pack receive
+play / toServer / packet_resource_pack_receive (0x2b)
+
+MC: ServerboundResourcePackPacket
+
+Field Name	Field Type	Notes
+uuid	UUID
+result	varint
+
+
+44packet advancement tab
+play / toServer / packet_advancement_tab (0x2c)
+
+MC: ServerboundSeenAdvancementsPacket
+
+Field Name	Field Type	Notes
+action	varint
+tabId
+
+if action
+is 0	string
+is 1	void
+
+
+45packet select trade
+play / toServer / packet_select_trade (0x2d)
+
+MC: ServerboundSelectTradePacket
+
+Field Name	Field Type	Notes
+slot	varint
+
+
+46packet set beacon effect
+play / toServer / packet_set_beacon_effect (0x2e)
+
+MC: ServerboundSetBeaconPacket
+
+Field Name	Field Type	Notes
+primary effect
+optional
+varint
+secondary effect
+optional
+varint
+
+
+47packet held item slot
+play / toServer / packet_held_item_slot (0x2f)
+
+MC: ServerboundSetCarriedItemPacket
+
+Field Name	Field Type	Notes
+slotId	i16
+
+
+48packet update command block
+play / toServer / packet_update_command_block (0x30)
+
+MC: ServerboundSetCommandBlockPacket
+
+Field Name	Field Type	Notes
+location	position
+command	string
+mode	varint
+flags	u8
+
+
+49packet update command block minecart
+play / toServer / packet_update_command_block_minecart (0x31)
+
+MC: ServerboundSetCommandMinecartPacket
+
+Field Name	Field Type	Notes
+entityId	varint
+command	string
+track output	bool
+
+
+50packet set creative slot
+play / toServer / packet_set_creative_slot (0x32)
+
+MC: ServerboundSetCreativeModeSlotPacket
+
+Field Name	Field Type	Notes
+slot	i16
+item	Slot
+
+
+51packet update jigsaw block
+play / toServer / packet_update_jigsaw_block (0x33)
+
+MC: ServerboundSetJigsawBlockPacket
+
+Field Name	Field Type	Notes
+location	position
+name	string
+target	string
+pool	string
+finalState	string
+jointType	string
+selection priority	varint
+placement priority	varint
+
+
+52packet update structure block
+play / toServer / packet_update_structure_block (0x34)
+
+MC: ServerboundSetStructureBlockPacket
+
+Field Name	Field Type	Notes
+location	position
+action	varint
+mode	varint
+name	string
+offset x	i8
+offset y	i8
+offset z	i8
+size x	i8
+size y	i8
+size z	i8
+mirror	varint
+rotation	varint
+metadata	string
+integrity	f32
+seed	varint
+flags	u8
+
+
+53packet update sign
+play / toServer / packet_update_sign (0x35)
+
+MC: ServerboundSignUpdatePacket
+
+Field Name	Field Type	Notes
+location	position
+isFrontText	bool
+text1	string
+text2	string
+text3	string
+text4	string
+
+
+54packet arm animation
+play / toServer / packet_arm_animation (0x36)
+
+MC: ServerboundSwingPacket
+
+Field Name	Field Type	Notes
+hand	varint
+
+
+55packet spectate
+play / toServer / packet_spectate (0x37)
+
+MC: ServerboundTeleportToEntityPacket
+
+Field Name	Field Type	Notes
+target	UUID
+
+
+56packet block place
+play / toServer / packet_block_place (0x38)
+
+MC: ServerboundUseItemOnPacket
+
+Field Name	Field Type	Notes
+hand	varint
+location	position
+direction	varint
+cursorX	f32
+cursorY	f32
+cursorZ	f32
+insideBlock	bool
+sequence	varint
+
+
+57packet use item
+play / toServer / packet_use_item (0x39)
+
+MC: ServerboundUseItemPacket
+
+Field Name	Field Type	Notes
+hand	varint
+sequence	varint
+rotation	vec2f
+
+
+Typepacket
+play / toServer / packet
+
+Field Name	Field Type	Notes
+name	
+varint enum
+0	teleport confirm
+1	query block nbt
+2	set difficulty
+3	message acknowledgement
+4	chat command
+5	chat command signed
+6	chat message
+7	chat session update
+8	chunk batch received
+9	client command
+10	settings
+11	tab complete
+12	configuration acknowledged
+13	enchant item
+14	window click
+15	close window
+16	set slot state
+17	cookie response
+18	custom payload
+19	debug sample subscription
+20	edit book
+21	query entity nbt
+22	use entity
+23	generate structure
+24	keep alive
+25	lock difficulty
+26	position
+27	position look
+28	look
+29	flying
+30	vehicle move
+31	steer boat
+32	pick item
+33	ping request
+34	craft recipe request
+35	abilities
+36	block dig
+37	entity action
+38	steer vehicle
+39	pong
+40	recipe book
+41	displayed recipe
+42	name item
+43	resource pack receive
+44	advancement tab
+45	select trade
+46	set beacon effect
+47	held item slot
+48	update command block
+49	update command block minecart
+50	set creative slot
+51	update jigsaw block
+52	update structure block
+53	update sign
+54	arm animation
+55	spectate
+56	block place
+57	use item
+params
+
+if name
+is teleport confirm	packet_teleport_confirm
+is query block nbt	packet_query_block_nbt
+is set difficulty	packet_set_difficulty
+is message acknowledgement	packet_message_acknowledgement
+is chat command	packet_chat_command
+is chat command signed	packet_chat_command_signed
+is chat message	packet_chat_message
+is chat session update	packet_chat_session_update
+is chunk batch received	packet_chunk_batch_received
+is client command	packet_client_command
+is settings	packet_common_settings
+is tab complete	packet_tab_complete
+is configuration acknowledged	packet_configuration_acknowledged
+is enchant item	packet_enchant_item
+is window click	packet_window_click
+is close window	packet_close_window
+is set slot state	packet_set_slot_state
+is cookie response	packet_common_cookie_response
+is custom payload	packet_custom_payload
+is debug sample subscription	packet_debug_sample_subscription
+is edit book	packet_edit_book
+is query entity nbt	packet_query_entity_nbt
+is use entity	packet_use_entity
+is generate structure	packet_generate_structure
+is keep alive	packet_keep_alive
+is lock difficulty	packet_lock_difficulty
+is position	packet_position
+is position look	packet_position_look
+is look	packet_look
+is flying	packet_flying
+is vehicle move	packet_vehicle_move
+is steer boat	packet_steer_boat
+is pick item	packet_pick_item
+is ping request	packet_ping_request
+is craft recipe request	packet_craft_recipe_request
+is abilities	packet_abilities
+is block dig	packet_block_dig
+is entity action	packet_entity_action
+is steer vehicle	packet_steer_vehicle
+is pong	packet_pong
+is recipe book	packet_recipe_book
+is displayed recipe	packet_displayed_recipe
+is name item	packet_name_item
+is resource pack receive	packet_resource_pack_receive
+is advancement tab	packet_advancement_tab
+is select trade	packet_select_trade
+is set beacon effect	packet_set_beacon_effect
+is held item slot	packet_held_item_slot
+is update command block	packet_update_command_block
+is update command block minecart	packet_update_command_block_minecart
+is set creative slot	packet_set_creative_slot
+is update jigsaw block	packet_update_jigsaw_block
+is update structure block	packet_update_structure_block
+is update sign	packet_update_sign
+is arm animation	packet_arm_animation
+is spectate	packet_spectate
+is block place	packet_block_place
+is use item	packet_use_item
+

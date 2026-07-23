@@ -1,0 +1,153 @@
+#pragma once
+
+#include <format>
+#include <iostream>
+#include <mutex>
+#include <source_location>
+#include <chrono>
+#include <string>
+#include <ctime>
+#include <fstream>
+#include <filesystem>
+#include <atomic>
+
+namespace nc::log {
+
+enum class Level : u8 {
+    Trace, Debug, Info, Warn, Error, Fatal
+};
+
+inline std::atomic<Level> g_level{Level::Info};
+
+namespace detail {
+
+inline std::mutex g_mutex;
+inline std::ofstream g_file; // WORLDSAVE_V1: файл текущего лога
+
+// ── ANSI цвета ──
+constexpr const char* RESET   = "\033[0m";
+constexpr const char* CYAN    = "\033[36m";    // время
+constexpr const char* GREEN   = "\033[32m";    // INFO
+constexpr const char* YELLOW  = "\033[33m";    // WARN
+constexpr const char* RED     = "\033[31m";    // ERROR
+constexpr const char* MAGENTA = "\033[35m";    // FATAL
+constexpr const char* GRAY    = "\033[90m";    // DEBUG / TRACE
+constexpr const char* WHITE   = "\033[37m";    // обычный текст
+constexpr const char* BRIGHT  = "\033[1m";     // жирный
+
+constexpr const char* levelTag(Level lv) {
+    switch (lv) {
+        case Level::Trace: return "TRACE";
+        case Level::Debug: return "DEBUG";
+        case Level::Info:  return "INFO";
+        case Level::Warn:  return "WARN";
+        case Level::Error: return "ERROR";
+        case Level::Fatal: return "FATAL";
+    }
+    return "?????";
+}
+
+constexpr const char* levelColor(Level lv) {
+    switch (lv) {
+        case Level::Trace: return GRAY;
+        case Level::Debug: return GRAY;
+        case Level::Info:  return GREEN;
+        case Level::Warn:  return YELLOW;
+        case Level::Error: return RED;
+        case Level::Fatal: return MAGENTA;
+    }
+    return WHITE;
+}
+
+// Реальное время (_wall clock_)
+inline std::string wallTime() {
+    auto now = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+
+    std::tm tm_buf{};
+#ifdef _WIN32
+    localtime_s(&tm_buf, &time);
+#else
+    localtime_r(&time, &tm_buf);
+#endif
+
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
+        tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+
+    return std::format("{}.{}",
+        std::string(buf),
+        std::format("{:03d}", ms.count()));
+}
+
+inline void doLog(Level lv, std::string_view tag, const std::string& msg)
+{
+    const char* color = levelColor(lv);
+
+    std::lock_guard lock(g_mutex);
+
+    // Формат как PMMP:
+    // [HH:mm:ss.ms] [Server thread/LEVEL]: сообщение
+    std::cout << CYAN
+        << "[" << wallTime() << "]"
+        << RESET << " "
+        << color << BRIGHT
+        << "[Server thread/" << levelTag(lv) << "]"
+        << RESET << " "
+        << WHITE << msg << RESET
+        << "\n";
+
+    // Принудительно сбрасываем буфер
+    std::cout.flush();
+
+    // WORLDSAVE_V1: дублируем в файл (без ANSI-цветов)
+    if (g_file.is_open()) {
+        g_file << "[" << wallTime() << "] [Server thread/" << levelTag(lv) << "] " << msg << "\n";
+        g_file.flush();
+    }
+}
+
+} // namespace detail
+
+// WORLDSAVE_V1: логи в файл logs/logdatadatadata.log, храним 15 последних.
+// Текущий = logdatadatadata.log, старые = logdatadatadata-1.log ... -14.log
+inline void initFileLog() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories("logs", ec);
+    const std::string base = "logs/logdatadatadata";
+    constexpr int MAX_LOGS = 15;
+    fs::remove(base + "-" + std::to_string(MAX_LOGS - 1) + ".log", ec);
+    for (int i = MAX_LOGS - 2; i >= 1; --i) {
+        fs::rename(base + "-" + std::to_string(i) + ".log",
+                   base + "-" + std::to_string(i + 1) + ".log", ec);
+    }
+    fs::rename(base + ".log", base + "-1.log", ec);
+    detail::g_file.open(base + ".log", std::ios::out | std::ios::trunc);
+}
+
+template<typename... Args>
+void log(Level lv, std::string_view tag,
+         std::format_string<Args...> fmt, Args&&... args)
+{
+    if (lv < g_level.load(std::memory_order_relaxed)) return;
+    auto msg = std::format(fmt, std::forward<Args>(args)...);
+    detail::doLog(lv, tag, msg);
+}
+
+inline void log(Level lv, std::string_view tag, std::string msg) {
+    if (lv < g_level.load(std::memory_order_relaxed)) return;
+    detail::doLog(lv, tag, msg);
+}
+
+} // namespace nc::log
+
+// ── Макросы ──
+#define NC_TRACE(tag, ...) ::nc::log::log(::nc::log::Level::Trace, tag, __VA_ARGS__)
+#define NC_DEBUG(tag, ...) ::nc::log::log(::nc::log::Level::Debug, tag, __VA_ARGS__)
+#define NC_INFO(tag, ...)  ::nc::log::log(::nc::log::Level::Info,  tag, __VA_ARGS__)
+#define NC_WARN(tag, ...)  ::nc::log::log(::nc::log::Level::Warn,  tag, __VA_ARGS__)
+#define NC_ERROR(tag, ...) ::nc::log::log(::nc::log::Level::Error, tag, __VA_ARGS__)
+#define NC_FATAL(tag, ...) ::nc::log::log(::nc::log::Level::Fatal, tag, __VA_ARGS__)

@@ -1,0 +1,84 @@
+#pragma once
+
+#include "../core/types.hpp"
+#include "../network/connection.hpp"
+#include "../world/chunk.hpp"
+#include <string>
+#include <memory>
+
+namespace nc::protocol { enum class PacketId : u32; }
+
+namespace nc::entity {
+
+// ============================================================
+// Игрок — хранит состояние конкретного подключённого игрока.
+// ============================================================
+
+enum class PlayerState : u8 {
+    Handshaking,
+    Status,
+    Login,
+    Configuration,
+    Play,
+    Disconnected,
+};
+
+class Player : public std::enable_shared_from_this<Player> {
+public:
+    Player(u64 entityId, std::shared_ptr<net::Connection> connection)
+        : entityId_(entityId), connection_(std::move(connection)) {}
+
+    u64 getEntityId() const { return entityId_; }
+    const std::string& getName() const { return name_; }
+    const UUID& getUuid() const { return uuid_; }
+    PlayerState getState() const { return state_; }
+
+    void setName(std::string_view name) { name_ = name; }
+    void setUuid(const UUID& uuid) { uuid_ = uuid; }
+    void setState(PlayerState state) { state_ = state; }
+
+    // Позиция в мире
+    f64 getX() const { return posX_; }
+    f64 getY() const { return posY_; }
+    f64 getZ() const { return posZ_; }
+    f32 get_yaw() const { return yaw_; }
+    f32 get_pitch() const { return pitch_; }
+    bool isOnGround() const { return onGround_; }
+
+    void setPosition(f64 x, f64 y, f64 z) { posX_ = x; posY_ = y; posZ_ = z; }
+    void setRotation(f32 yaw, f32 pitch) { yaw_ = yaw; pitch_ = pitch; }
+    void setOnGround(bool onGround) { onGround_ = onGround; }
+
+    // Просматриваемый чанк
+    i32 getViewCenterX() const { return viewCenterChunkX_; }
+    i32 getViewCenterZ() const { return viewCenterChunkZ_; }
+    void setViewCenter(i32 cx, i32 cz) { viewCenterChunkX_ = cx; viewCenterChunkZ_ = cz; }
+
+    // Отправка пакетов
+    void sendPacket(protocol::PacketId id, const std::vector<u8>& data);
+    void sendSystemMessage(std::string_view message);
+
+    std::shared_ptr<net::Connection> getConnection() { return connection_; }
+
+    // Статистика
+    bool isAlive() const { return connection_ && connection_->isConnected(); }
+
+private:
+    u64 entityId_;
+    std::string name_;
+    UUID uuid_{};
+    PlayerState state_ = PlayerState::Handshaking;
+    std::shared_ptr<net::Connection> connection_;
+
+    f64 posX_ = 0.0;
+    f64 posY_ = -60.0; // Спавн в flat-мире
+    f64 posZ_ = 0.0;
+    f32 yaw_ = 0.0f;
+    f32 pitch_ = 0.0f;
+    bool onGround_ = true;
+
+    i32 viewCenterChunkX_ = 0;
+    i32 viewCenterChunkZ_ = 0;
+};
+
+} // namespace nc::entity
