@@ -48,6 +48,11 @@ file(GLOB_RECURSE ALL_SOURCES CONFIGURE_DEPENDS
 add_executable(zevvoryn
     src/main.cpp
     ${ALL_SOURCES}
+    icon/app.rc
+)
+
+set_target_properties(zevvoryn PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
 
 target_include_directories(zevvoryn PRIVATE src)
@@ -63,4 +68,5 @@ endif()
 
 if(WIN32)
     target_link_libraries(zevvoryn PRIVATE ws2_32 crypt32)
+    set(CMAKE_RC_FLAGS "/I\"${CMAKE_SOURCE_DIR}/icon\"")
 endif()
