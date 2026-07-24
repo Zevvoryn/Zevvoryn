@@ -6,6 +6,7 @@
 #include <string>
 #include <memory>
 #include <unordered_set> // LIGHT_V1
+#include <mutex>         // CHUNKVIS_V1
 
 namespace nc::protocol { enum class PacketId : u32; }
 
@@ -55,6 +56,12 @@ public:
     i32 getViewCenterZ() const { return viewCenterChunkZ_; }
     void setViewCenter(i32 cx, i32 cz) { viewCenterChunkX_ = cx; viewCenterChunkZ_ = cz; }
 
+    // KEEPALIVE_TIMEOUT_V1: ждём ли мы ответ на последний Keep Alive (чтобы рвать соединения
+    // призраков, которые не отвечают серверу — раньше эти сокеты/буферы висели в памяти вечно)
+    i64 pendingKeepAliveId = 0;
+    bool awaitingKeepAlive = false;
+    i64 keepAliveSentAtMs = 0;
+
     // LIGHT_V1: какие чанки уже отправлены игроку (чтобы не слать их повторно)
     static u64 chunkKey(i32 cx, i32 cz) {
         return (static_cast<u64>(static_cast<u32>(cx)) << 32) | static_cast<u64>(static_cast<u32>(cz));
@@ -63,9 +70,17 @@ public:
     void markChunkSeen(i32 cx, i32 cz) { sentChunks_.insert(chunkKey(cx, cz)); }
     void clearSeenChunks() { sentChunks_.clear(); } // RESPAWN_V2: клиент сбрасывает все чанки после Respawn — шлём заново
 
+    // CHUNKVIS_V1: какие сущности-игроки сейчас ЗАСПАВНЕНЫ у этого игрока (для видимости по чанкам).
+    // Под мьютексом: сет трогают read-потоки РАЗНЫХ игроков одновременно (в отличие от sentChunks_).
+    bool hasVisibleEntity(u64 eid) const { std::lock_guard<std::mutex> lk(visMutex_); return visibleEntities_.count(eid) != 0; }
+    bool addVisibleEntity(u64 eid) { std::lock_guard<std::mutex> lk(visMutex_); return visibleEntities_.insert(eid).second; }
+    bool removeVisibleEntity(u64 eid) { std::lock_guard<std::mutex> lk(visMutex_); return visibleEntities_.erase(eid) != 0; }
+    void clearVisibleEntities() { std::lock_guard<std::mutex> lk(visMutex_); visibleEntities_.clear(); }
+
     // Отправка пакетов
     void sendPacket(protocol::PacketId id, const std::vector<u8>& data);
     void sendSystemMessage(std::string_view message);
+    void kick(std::string_view reason); // KICKFIX_V1: proper Disconnect (0x1D) + close, not a raw drop
 
     std::shared_ptr<net::Connection> getConnection() { return connection_; }
 
@@ -90,6 +105,7 @@ public:
     bool tpsBossbarEnabled = true; // TPS_BOSS_V2: TPS check visible on join (/tps toggles it)
     std::vector<u8> encVerifyToken; // ONLINE_V1: verify token sent in EncryptionRequest
     bool tpsBossbarShown = false;
+    i32 tpsBossbarColor = -1; // BOSSCOLOR_V1: последний отправленный цвет бара (при смене шлём UPDATE_STYLE)
 
     // SKIN_V1: game-profile "textures" property (skin + cape). Forwarded to other
     // players in Player Info Update so skins/capes render in multiplayer. Filled
@@ -120,6 +136,8 @@ public:
     i64 lastAttackMs = 0;      // COMBAT_V2: время предыдущего удара (для кулдауна атаки)
     bool usingShield = false;  // SHIELD_V1: щит поднят (активная фаза Use Item)
     i32 usingShieldHand = 0;   // SHIELD_V1: 0 = основная рука, 1 = оффхенд
+    i64 shieldRaisedMs = 0;        // SHIELD_V2: когда щит поднят (ванильный прогрев 5 тиков)
+    i64 shieldDisabledUntilMs = 0; // SHIELD_V2: щит отключён топором до этого момента
     bool openIsDouble = false; // CHEST_V3: открыт двойной сундук (54 слота)
     u64 openContainerKey2 = 0; // CHEST_V3: ключ второй половины двойного сундука
     i32 enderItemId[27] = {};  // содержимое эндер-сундука
@@ -128,6 +146,7 @@ public:
     // FALLDMG_V1: вершина текущего падения и предыдущее состояние земли.
     f64 fallPeakY = 4.0;
     i64 lastHurtMs = 0;       // IFRAME_V1: когда игрок последний раз получил урон (мс, steady clock)
+    f32 lastDamageTaken = 0.0f; // IFRAME_V2: полный урон последнего удара в окне i-frames (для досчёта разницы)
     bool eggDeepTold = false; // EGG_V1: пасхалка на Y<-1000 уже показана в этом погружении
     bool fallWasOnGround = true;
 
@@ -135,6 +154,9 @@ public:
     f64 mpLastX = 0.0;
     f64 mpLastY = 4.0;
     f64 mpLastZ = 0.0;
+    // CHUNKVIS_V2: чанк, в котором последний раз пересчитывали видимость (только read-поток игрока)
+    i32 mpVisChunkX = 2147483647;
+    i32 mpVisChunkZ = 2147483647;
 
 private:
     u64 entityId_;
@@ -153,6 +175,8 @@ private:
     i32 viewCenterChunkX_ = 0;
     i32 viewCenterChunkZ_ = 0;
     std::unordered_set<u64> sentChunks_; // LIGHT_V1
+    std::unordered_set<u64> visibleEntities_; // CHUNKVIS_V1: заспавненные у меня сущности-игроки
+    mutable std::mutex visMutex_;             // CHUNKVIS_V1
 };
 
 } // namespace nc::entity

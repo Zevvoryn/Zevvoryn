@@ -24,9 +24,16 @@ public:
     Server& operator=(const Server&) = delete;
 
     // Запуск на порту. Блокирующий!
-    bool start(u16 port, i32 backlog = 128);
+    bool start(u16 port, i32 backlog = 512); // STRESS_V2: очередь accept под штурм 300 ботов (было 128 — WinError 10054 у клиентов)
     void stop();
     void run(); // Основной цикл
+
+    // CRASHNET_V1: аварийное отключение сети из обработчика краша.
+    // Вызывается прямо из crashNote() (main.cpp) ДО 180-секундного окна ожидания.
+    // Мгновенно уводит сервер оффлайн: закрывает listen-сокет (новые игроки уже
+    // не зайдут) и рвёт все текущие соединения. Не джойнит потоки и берёт
+    // connectionsMutex_ через try_lock — безопасно звать из любого падающего потока.
+    void crashShutdown();
 
     // Обработчики событий
     void onConnection(ConnectionHandler handler) { onConnect_ = std::move(handler); }

@@ -45,7 +45,7 @@ struct ServerConfig {
 
     // ── Мир ──
     std::string levelName       = "world";
-    std::string generator       = "FLAT";   // DEFAULT, FLAT, VOID
+    std::string generator       = "DEFAULT";   // DEFAULT, FLAT, VOID // WORLDTYPE_DEFAULT_V1: стандартный мир теперь дефолт
     i64 levelSeed               = 0;
 
     // ── Геймплей ──
@@ -466,10 +466,10 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
         case 3: {
             // ── Шаг 3: Мир ──
             printStep(3, 5, ru ? "\xd0\x9c\xd0\xb8\xd1\x80" : "World");
-            std::cout << "    1) FLAT   " << (ru ? "(\xd0\xbf\xd0\xbb\xd0\xbe\xd1\x81\xd0\xba\xd0\xb8\xd0\xb9 \xd0\xbc\xd0\xb8\xd1\x80)" : "(superflat)") << "\n";
-            std::cout << "    2) DEFAULT" << (ru ? " (\xd0\xbe\xd0\xb1\xd1\x8b\xd1\x87\xd0\xbd\xd1\x8b\xd0\xb9 \xe2\x80\x94 \xd0\xb1\xd0\xb8\xd0\xbe\xd0\xbc\xd1\x8b, \xd1\x80\xd0\xb5\xd0\xbb\xd1\x8c\xd0\xb5\xd1\x84)" : " (normal - biomes & terrain)") << "\n";
+            std::cout << "    1) DEFAULT" << (ru ? " (\xd0\xbe\xd0\xb1\xd1\x8b\xd1\x87\xd0\xbd\xd1\x8b\xd0\xb9 \xe2\x80\x94 \xd0\xb1\xd0\xb8\xd0\xbe\xd0\xbc\xd1\x8b, \xd1\x80\xd0\xb5\xd0\xbb\xd1\x8c\xd0\xb5\xd1\x84, \xd1\x80\xd0\xb5\xd0\xba\xd0\xbe\xd0\xbc\xd0\xb5\xd0\xbd\xd0\xb4\xd1\x83\xd0\xb5\xd1\x82\xd1\x81\xd1\x8f)" : " (normal - biomes & terrain, recommended)") << "\n";
+            std::cout << "    2) FLAT   " << (ru ? "(\xd0\xbf\xd0\xbb\xd0\xbe\xd1\x81\xd0\xba\xd0\xb8\xd0\xb9 \xd0\xbc\xd0\xb8\xd1\x80)" : "(superflat)") << "\n";
             std::string genChoice = readLine(ru ? "  \xd0\x93\xd0\xb5\xd0\xbd\xd0\xb5\xd1\x80\xd0\xb0\xd1\x82\xd0\xbe\xd1\x80" : "  Generator", "1");
-            cfg.generator = (genChoice == "2") ? "DEFAULT" : "FLAT"; // WIZARD_WORLDTYPE_V1
+            cfg.generator = (genChoice == "2") ? "FLAT" : "DEFAULT"; // WIZARD_WORLDTYPE_V1: DEFAULT теперь выбор по умолчанию (Enter)
             cfg.levelSeed = readInt64(ru ? "  \xd0\xa1\xd0\xb8\xd0\xb4 (0 = \xd1\x81\xd0\xbb\xd1\x83\xd1\x87\xd0\xb0\xd0\xb9\xd0\xbd\xd0\xbe\xd0\xb5)" : "  Seed (0 = random)", cfg.levelSeed);
             std::cout << "\n";
             break;

@@ -10,7 +10,10 @@
 #include <unordered_map>
 #include <string>
 #include <mutex>
+#include <atomic>
 #include <deque>
+#include <thread>              // CHATASYNC_V1
+#include <condition_variable>  // CHATASYNC_V1
 
 namespace nc {
 
@@ -27,6 +30,7 @@ public:
     bool start(const std::string& configPath = "settings.properties");
     bool startWithConfig(const ServerConfig& cfg);
     void stop();
+    void softReload(); // SOFTRELOAD_V1: мягкий рестарт без завершения процесса (только tick-поток)
     void run();
 
     // CONSOLE_V2: main thread queues console input; it is executed safely on server tick.
@@ -69,13 +73,16 @@ private:
     void sendKeepAlive(std::shared_ptr<entity::Player> player);
 
     // MP_V1: мультиплеер — видимость и синхронизация игроков между собой
-    void broadcastToOthers(const std::shared_ptr<entity::Player>& except, i32 packetId, const std::vector<u8>& payload);
+    void broadcastToOthers(const std::shared_ptr<entity::Player>& except, i32 packetId, const std::vector<u8>& payload, bool droppable = false);
     void spawnPlayerFor(const std::shared_ptr<entity::Player>& viewer, const std::shared_ptr<entity::Player>& target);
     void sendPlayerEquipment(const std::shared_ptr<entity::Player>& viewer, const std::shared_ptr<entity::Player>& target); // EQUIP_V1
     void broadcastHeldEquipment(const std::shared_ptr<entity::Player>& player); // EQUIP_V1
     void broadcastEntityMeta(const std::shared_ptr<entity::Player>& player); // PLAYER_VIS_V1
     void despawnPlayerFor(const std::shared_ptr<entity::Player>& viewer, const std::shared_ptr<entity::Player>& target); // PLAYER_VIS_V2
+    void spawnItemDrop(f64 x, f64 y, f64 z, i32 itemId, i32 count, f64 vx, f64 vy, f64 vz, i32 pickupDelay = 10); // ITEMDROP_V1
+    void tickItemDrops(); // ITEMDROP_V1
     void refreshSpectatorVisibility(const std::shared_ptr<entity::Player>& player, bool wasSpectator, bool isSpectator); // PLAYER_VIS_V2
+    void applyGameMode(const std::shared_ptr<entity::Player>& target, i32 mode); // CONSOLE_V3: единая смена режима (команда + консоль)
     void onPlayerEnterPlay(const std::shared_ptr<entity::Player>& player);
     void applyEnvironmentalDamage(const std::shared_ptr<entity::Player>& player,
                                   f32 damage, i32 damageTypeId,
@@ -84,6 +91,7 @@ private:
                          f64 newY, bool newOnGround);
     void broadcastPlayerMovement(const std::shared_ptr<entity::Player>& player, bool posChanged, bool rotChanged);
     void broadcastPlayerRemove(const std::shared_ptr<entity::Player>& player);
+    void broadcastTabListHeaderFooter(); // TABLIST_COUNT_V1: header/footer таб-листа с числом игроков (RU/EN)
 
     // Тик
     void tick();
@@ -115,32 +123,69 @@ private:
     protocol::v1_21_1::Codec_1_21_1 codec_;
     world::World world_;
     ServerConfig config_;
+    std::string configPath_; // SOFTRELOAD_V1: чтобы /reload мог перечитать конфиг
     std::string iconFavicon_; // ICON_V1: data:image/png;base64,... для Status Response
 
     // Игроки по socket ID
     std::unordered_map<u64, std::shared_ptr<entity::Player>> players_;
     std::mutex playersMutex_;
 
-    u64 nextEntityId_ = 1;
+    std::atomic<u64> nextEntityId_{1}; // STRESS_FIX_V1: было plain u64 — гонка при параллельных onPlayerConnect
+    std::atomic<bool> tabListDirty_{false}; // STRESS_FIX_V1: копим join/leave за тик, рассылаем раз в тик пачкой
     // ENTITIES_V1: не-игроковые сущности (демо-пайплайн spawn/despawn + резюме для новых игроков)
     struct SpawnedEntity { i32 eid; i32 typeId; f64 x; f64 y; f64 z; };
     std::vector<SpawnedEntity> entities_;
     std::mutex entitiesMutex_;
+    // ITEMDROP_V1: выпавшие предметы — физика (гравитация/пол/стены), подбор игроками, деспавн через 5 минут
+    struct ItemDrop { i32 eid; i32 itemId; i32 count; f64 x; f64 y; f64 z; f64 vx; f64 vy; f64 vz; i32 age; i32 pickupDelay; };
+    std::vector<ItemDrop> itemDrops_;
+    std::mutex itemDropsMutex_;
     i32 tickCounter_ = 0;
     std::chrono::steady_clock::time_point tpsSampleStart_{};
     i32 tpsSampleTicks_ = 0;
     f32 tps_ = 20.0f;
+    std::chrono::steady_clock::time_point lastLowTpsWarn_{}; // TPSCHAT_V1: троттлинг алерта о лагах в чат
+
+    // HUD_V1: real OS-reported RAM/CPU for this process, sampled once per second
+    // alongside the TPS boss bar, so the in-game bar shows actual numbers instead
+    // of only a tick-rate estimate. See sampleProcessStats() in server.cpp.
+    f32 ramMb_ = 0.0f;
+    f32 cpuPercent_ = 0.0f;
+    u64 lastCpuTotal100ns_ = 0;
+    std::chrono::steady_clock::time_point lastCpuSampleTime_{};
+    void sampleProcessStats();
 
     // Все игроки (копия)
     std::vector<std::shared_ptr<entity::Player>> getAllPlayersCopy();
 
     // Keep alive
+    // KEEPALIVE_TIMEOUT_V1: был мёртвый общий вектор pendingKeepAlives_, который никто не читал и не чистил
+    // (чистая утечка) — теперь состояние keep-alive хранится на самом Player.
     i64 lastKeepAliveTime_ = 0;
-    std::vector<u64> pendingKeepAlives_;
 
     // CONSOLE_V2: only queue access happens across threads; world/player work runs in tick().
     std::deque<std::string> consoleCommands_;
     std::mutex consoleMutex_;
+
+    // CHATASYNC_V1: chat broadcast used to run inline on the tick thread — for
+    // every chat line it looped over all players doing a blocking ::send() each,
+    // so on a full server a single message could stall the whole tick loop
+    // (visible lag / TPS dip). Now the tick/packet thread just drops the fully
+    // formatted line into this queue and returns instantly; a dedicated worker
+    // thread does the actual per-player sends off the hot path.
+    void chatWorkerLoop();
+    void enqueueChatBroadcast(std::string line);
+    std::thread chatThread_;
+    std::deque<std::string> chatQueue_;
+    std::mutex chatMutex_;
+    std::condition_variable chatCv_;
+    std::atomic<bool> chatRunning_{false};
+
+    // ASYNCSAVE_V1: автосейв уехал в фоновый поток — тик #6000 больше не стоит ~280мс
+    // на сериализации мира и записи на диск.
+    std::thread saveThread_;
+    std::atomic<bool> saveBusy_{false};
+    std::atomic<bool> stoppedOnce_{false}; // STOPONCE_V1: stop() выполняется только один раз
 };
 
 } // namespace nc

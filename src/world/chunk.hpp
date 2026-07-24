@@ -110,7 +110,11 @@ public:
     ~World(); // WORLDGEN_V1
 
     std::shared_ptr<ChunkColumn> getChunk(i32 x, i32 z);
-    std::shared_ptr<ChunkColumn> getChunkOrCreate(i32 x, i32 z);
+    // RACE_FIX_V1: optional out-param reports whether this call created a brand-new
+    // (empty) column vs returned an already-live one, so callers like
+    // getOrGenerateChunk() can decide whether to fill it in — all in one atomic
+    // lock instead of a separate find() + getChunkOrCreate() race.
+    std::shared_ptr<ChunkColumn> getChunkOrCreate(i32 x, i32 z, bool* wasCreated = nullptr);
 
     void setBlock(i32 x, i32 y, i32 z, i32 stateId);
     i32 getBlock(i32 x, i32 y, i32 z) const;
@@ -120,7 +124,11 @@ public:
     // without bound as players roam. keepRadius is in chunks. Centers are (cx,cz).
     void pruneChunks(const std::vector<std::pair<i32, i32>>& keepCenters, i32 keepRadius);
 
-    size_t getLoadedChunkCount() const { return chunks_.size(); }
+    size_t getLoadedChunkCount() const { std::lock_guard<std::mutex> lk(chunksMutex_); return chunks_.size(); }
+
+    // ANVIL_CONVERT_V1: read-only iteration over all currently loaded chunks,
+    // used by the vanilla Anvil world exporter/importer.
+    const std::unordered_map<ChunkPos, std::shared_ptr<ChunkColumn>>& getAllChunks() const { return chunks_; }
 
     // PERF_TUNE_V1: override worldgen worker-thread count (0 = auto). Set from the
     // config max-cores value before the pool lazily starts.
@@ -131,6 +139,9 @@ public:
 
     // WORLDSAVE_V1: сохранение/загрузка мира на диск
     bool saveToDisk(const std::string& path) const;
+    // SOFTRELOAD_V1: выгрузить ВСЕ чанки и очереди генерации/загрузки.
+    // Потоки пула генерации не останавливаются — они без состояния и ждут новую работу.
+    void reset();
     bool loadFromDisk(const std::string& path);
 
     // FASTBOOT_V1: read the save header on the calling (main) thread and return
@@ -174,6 +185,16 @@ public:
     void fillDefaultChunk(ChunkColumn& chunk, i32 cx, i32 cz);
 
 private:
+    // RACE_FIX_V1: handlePlay() runs on each connection's OWN thread (one thread
+    // per player, see network::Server accept loop), NOT the main tick thread.
+    // sendChunksAround() therefore calls getOrGenerateChunk()/takeReadyChunk()
+    // concurrently from many player threads at once. Both mutate chunks_, so
+    // without a lock this was a data race on a std::unordered_map (concurrent
+    // insert/rehash from multiple threads = undefined behavior: corruption,
+    // infinite loops in a broken bucket chain, or crashes) — exactly what a
+    // mass join/churn burst with 300 bots would trigger. All access to chunks_
+    // now goes through chunksMutex_.
+    mutable std::mutex chunksMutex_;
     std::unordered_map<ChunkPos, std::shared_ptr<ChunkColumn>> chunks_;
 
     // PERF_ASYNC_V1: background generation pool state.

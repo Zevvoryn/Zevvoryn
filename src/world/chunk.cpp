@@ -13,6 +13,8 @@
 #include <string_view>
 #include <thread>   // PERF_ASYNC_V1
 #include <chrono>   // PERF_ASYNC_V1
+#include <cstring>  // WORLDCOMPRESS_V1
+#include "../network/zlib_codec.hpp" // WORLDCOMPRESS_V1
 
 namespace nc::world {
 
@@ -22,7 +24,7 @@ namespace nc::world {
 
 ChunkSection::ChunkSection() {
     blocks_.fill(0); // air = state ID 0
-    biomes_.fill(0); // plains = biome ID 0
+    biomes_.fill(39); // BIOMEGREEN_V1: plains = сетевой id 39 (0 был badlands — поэтому трава была жухлая!)
     nonAirCount_ = 0;
 }
 
@@ -100,7 +102,7 @@ void ChunkSection::writeEmpty(net::Buffer& buf) {
     buf.writeVarInt(0); // value = air (state 0)
     buf.writeVarInt(0); // data array length = 0
     buf.writeByte(0);   // biomes: single-value palette
-    buf.writeVarInt(0); // biome = plains (0)
+    buf.writeVarInt(39); // BIOMEGREEN_V1: plains = сетевой id 39
     buf.writeVarInt(0); // data array length = 0
 }
 
@@ -165,17 +167,23 @@ void ChunkColumn::writeTo(net::Buffer& buf, bool includeBiomes) const {
 
 std::shared_ptr<ChunkColumn> World::getChunk(i32 x, i32 z) {
     ChunkPos pos{x, z};
+    std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
     auto it = chunks_.find(pos);
     return it != chunks_.end() ? it->second : nullptr;
 }
 
-std::shared_ptr<ChunkColumn> World::getChunkOrCreate(i32 x, i32 z) {
+std::shared_ptr<ChunkColumn> World::getChunkOrCreate(i32 x, i32 z, bool* wasCreated) {
     ChunkPos pos{x, z};
+    std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1: atomic find-or-create
     auto it = chunks_.find(pos);
-    if (it != chunks_.end()) return it->second;
+    if (it != chunks_.end()) {
+        if (wasCreated) *wasCreated = false;
+        return it->second;
+    }
 
     auto chunk = std::make_shared<ChunkColumn>(x, z);
     chunks_[pos] = chunk;
+    if (wasCreated) *wasCreated = true;
     return chunk;
 }
 
@@ -190,36 +198,41 @@ i32 World::getBlock(i32 x, i32 y, i32 z) const {
     i32 cx = x >> 4;
     i32 cz = z >> 4;
     ChunkPos pos{cx, cz};
+    std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
     auto it = chunks_.find(pos);
     if (it == chunks_.end()) return 0;
     return it->second->getBlock(x, y, z);
 }
 
 void World::unloadChunk(i32 x, i32 z) {
+    std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
     chunks_.erase(ChunkPos{x, z});
 }
 
 void World::pruneChunks(const std::vector<std::pair<i32, i32>>& keepCenters, i32 keepRadius) {
     if (keepCenters.empty()) return; // never unload everything
     std::vector<ChunkPos> toErase;
-    for (const auto& kv : chunks_) {
-        const ChunkPos& p = kv.first;
-        bool keep = false;
-        for (const auto& c : keepCenters) {
-            i32 dx = p.x - c.first;  if (dx < 0) dx = -dx;
-            i32 dz = p.z - c.second; if (dz < 0) dz = -dz;
-            if (dx <= keepRadius && dz <= keepRadius) { keep = true; break; }
+    {
+        std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
+        for (const auto& kv : chunks_) {
+            const ChunkPos& p = kv.first;
+            bool keep = false;
+            for (const auto& c : keepCenters) {
+                i32 dx = p.x - c.first;  if (dx < 0) dx = -dx;
+                i32 dz = p.z - c.second; if (dz < 0) dz = -dz;
+                if (dx <= keepRadius && dz <= keepRadius) { keep = true; break; }
+            }
+            if (!keep) toErase.push_back(p);
         }
-        if (!keep) toErase.push_back(p);
+        for (const auto& p : toErase) chunks_.erase(p);
     }
-    for (const auto& p : toErase) chunks_.erase(p);
     if (!toErase.empty()) {
         std::lock_guard<std::mutex> lk(genMutex_);
         for (const auto& p : toErase) { genInFlight_.erase(p); genReady_.erase(p); }
     }
 }
 
-// FLATWORLD_V1: классический суперфлэт: Y=0 бедрок, Y=1-2 з��мля, Y=3 трава.
+// FLATWORLD_V1: классический суперфлэт: Y=0 бедрок, Y=1-2 земля, Y=3 трава.
 // Чанки генерятся НА ЛЕТУ в getOrGenerateChunk -> мир бесконечный.
 
 // ============================================================
@@ -339,7 +352,7 @@ void World::initDefaultGenerator(i64 seed, bool ru) {
     S.podzol     = mgr.getBlockStateId("minecraft:podzol", {{"snowy", "false"}}).value_or(::nc::gen::blockNameToState("podzol"));
     defaultReady_ = true;
     flatReady_ = false;
-    if (ru) NC_INFO("World", "Ванильный ге����ератор готов (сид {})", (long long)seed);
+    if (ru) NC_INFO("World", "Ванильный генератор готов (сид {})", (long long)seed);
     else    NC_INFO("World", "Overworld generator ready (seed {})", (long long)seed);
 }
 
@@ -520,9 +533,12 @@ void World::genWorkerLoop() {
 }
 
 void World::requestChunkAsync(i32 cx, i32 cz) {
-    if (!genStarted_) startGenPool(); // lazy start (main thread only)
+    if (!genStarted_) startGenPool(); // lazily started; startGenPool() itself is guarded by genMutex_
     ChunkPos pos{cx, cz};
-    if (chunks_.find(pos) != chunks_.end()) return; // already live
+    {
+        std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
+        if (chunks_.find(pos) != chunks_.end()) return; // already live
+    }
     {
         std::lock_guard<std::mutex> lk(genMutex_);
         if (genInFlight_.count(pos) || genReady_.count(pos)) return;
@@ -549,7 +565,13 @@ std::shared_ptr<ChunkColumn> World::takeReadyChunk(i32 cx, i32 cz) {
         genReady_.erase(it);
         genInFlight_.erase(pos);
     }
-    chunks_[pos] = col; // install into the live world (main thread only)
+    {
+        // RACE_FIX_V1: this used to say "main thread only", but sendChunksAround()
+        // (and thus takeReadyChunk) actually runs on each player's own connection
+        // thread, so multiple threads could hit this insert at once without a lock.
+        std::lock_guard<std::mutex> lk(chunksMutex_);
+        chunks_[pos] = col;
+    }
     return col;
 }
 
@@ -562,9 +584,13 @@ void World::initFlatGenerator() {
 }
 
 std::shared_ptr<ChunkColumn> World::getOrGenerateChunk(i32 cx, i32 cz) {
-    auto it = chunks_.find(ChunkPos{cx, cz});
-    if (it != chunks_.end()) return it->second;
-    auto chunk = getChunkOrCreate(cx, cz);
+    // RACE_FIX_V1: a separate chunks_.find() here (before getChunkOrCreate()) used
+    // to race with other connection threads inserting into chunks_ concurrently.
+    // getChunkOrCreate() now does the find-or-create atomically under one lock and
+    // reports whether it created a new column, so we only generate content once.
+    bool wasCreated = false;
+    auto chunk = getChunkOrCreate(cx, cz, &wasCreated);
+    if (!wasCreated) return chunk; // already generated by an earlier call
     if (defaultReady_ && wgState_) { // WORLDGEN_V1
         fillDefaultChunk(*chunk, cx, cz);
         return chunk;
@@ -574,10 +600,10 @@ std::shared_ptr<ChunkColumn> World::getOrGenerateChunk(i32 cx, i32 cz) {
         for (i32 lz = 0; lz < 16; ++lz) {
             i32 worldX = cx * 16 + lx;
             i32 worldZ = cz * 16 + lz;
-            chunk->setBlock(worldX, -64, worldZ, flatBedrockId_); // FLATVANILLA_V1: ванильный суперфлэт -64..-61
-            chunk->setBlock(worldX, -63, worldZ, flatDirtId_);
-            chunk->setBlock(worldX, -62, worldZ, flatDirtId_);
-            chunk->setBlock(worldX, -61, worldZ, flatGrassId_);
+            chunk->setBlock(worldX, 0, worldZ, flatBedrockId_); // FLATNATIVE_V1: родная высота — слои Y=0..3, игрок стоит на Y=4
+            chunk->setBlock(worldX, 1, worldZ, flatDirtId_);
+            chunk->setBlock(worldX, 2, worldZ, flatDirtId_);
+            chunk->setBlock(worldX, 3, worldZ, flatGrassId_);
         }
     }
     return chunk;
@@ -591,10 +617,10 @@ void World::generateFlat(i64 seed, i32 centerX, i32 centerZ, i32 radius) {
             getOrGenerateChunk(cx, cz);
         }
     }
-    if (langRu_) NC_INFO("World", "Flat мир: слои Y=-64..-61 (как в ванилле), стартовая зона {}x{} чанков, дальше — на лету", // FLATVANILLA_V1
+    if (langRu_) NC_INFO("World", "Flat мир: слои Y=0..3 (родная высота, стоим на Y=4), стартовая зона {}x{} чанков, дальше — на лету", // FLATNATIVE_V1
         radius * 2 + 1, radius * 2 + 1);
-    else NC_INFO("World", "Flat world: layers Y=-64..-61 (vanilla superflat), start area {}x{} chunks, the rest generated on the fly",
-        radius * 2 + 1, radius * 2 + 1); // LANGFIX_V1
+    else NC_INFO("World", "Flat world: layers Y=0..3 (stand on Y=4), start area {}x{} chunks, the rest generated on the fly",
+        radius * 2 + 1, radius * 2 + 1); // LANGFIX_V1 + FLATNATIVE_V1
 }
 
 
@@ -605,20 +631,58 @@ void World::generateFlat(i64 seed, i32 centerX, i32 centerZ, i32 radius) {
 // blockCount * (u8 lx, i16 y, u8 lz, i32 stateId) — только не-воздух.
 // ============================================================
 
+// SOFTRELOAD_V1: полная выгрузка мира для мягкого рестарта (вызывать с tick-потока)
+void World::reset() {
+    // остановить и прибрать фоновую загрузку с диска (иначе повторный startBackgroundLoad убьёт процесс на joinable-потоке)
+    loadStop_.store(true);
+    if (loadWorker_.joinable()) loadWorker_.join();
+    {
+        std::lock_guard<std::mutex> lk(loadMutex_);
+        loadReady_.clear();
+    }
+    loadDone_.store(true);
+    // очистить очереди генерации (воркеры просто ждут новую работу)
+    {
+        std::lock_guard<std::mutex> lk(genMutex_);
+        genQueue_.clear();
+        genInFlight_.clear();
+        genReady_.clear();
+    }
+    // выгрузить все чанки
+    {
+        std::lock_guard<std::mutex> lk(chunksMutex_);
+        chunks_.clear();
+    }
+    if (langRu_) NC_INFO("World", "Все чанки выгружены (мягкий рестарт)");
+    else NC_INFO("World", "All chunks unloaded (soft reload)");
+}
+
 bool World::saveToDisk(const std::string& path) const {
     std::filesystem::path p(path);
     if (p.has_parent_path()) {
         std::error_code ec;
         std::filesystem::create_directories(p.parent_path(), ec);
     }
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    // ASYNCSAVE_V1: пишем во временный файл и атомарно переименовываем — если
+    // сервер упадёт посреди записи, старый world.dat останется целым.
+    const std::string tmpPath = path + ".tmp";
+    std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
     if (!f) return false;
     f.write("ZEVW", 4);
-    u8 version = 3; // LIGHT_V1: ванильные ID блоков
+    u8 version = 4; // WORLDVER_V4
     f.write(reinterpret_cast<const char*>(&version), 1);
-    i32 count = static_cast<i32>(chunks_.size());
+    // ASYNCSAVE_V1: под мьютексом только копируем shared_ptr на чанки (микросекунды),
+    // сериализация ~100к блоков на чанк идёт уже БЕЗ блокировки —
+    // игровые потоки не ждут диск (раньше мьютекс держался все ~280мс).
+    std::vector<std::shared_ptr<ChunkColumn>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
+        snapshot.reserve(chunks_.size());
+        for (const auto& [pos, chunk] : chunks_) snapshot.push_back(chunk);
+    }
+    i32 count = static_cast<i32>(snapshot.size());
     f.write(reinterpret_cast<const char*>(&count), 4);
-    for (const auto& [pos, chunk] : chunks_) {
+    for (const auto& chunk : snapshot) {
         i32 cx = chunk->getX();
         i32 cz = chunk->getZ();
         f.write(reinterpret_cast<const char*>(&cx), 4);
@@ -644,7 +708,12 @@ bool World::saveToDisk(const std::string& path) const {
         f.write(reinterpret_cast<const char*>(&blockCount), 4);
         f.write(blockData.data(), static_cast<std::streamsize>(blockData.size()));
     }
-    return f.good();
+    f.close();
+    std::error_code ec;
+    if (!f.good()) { std::filesystem::remove(tmpPath, ec); return false; }
+    std::filesystem::rename(tmpPath, path, ec); // атомарная подмена (на Windows — MoveFileEx c REPLACE_EXISTING)
+    if (ec) { std::filesystem::remove(tmpPath, ec); return false; }
+    return true;
 }
 
 bool World::loadFromDisk(const std::string& path) {
@@ -655,26 +724,36 @@ bool World::loadFromDisk(const std::string& path) {
     if (!f || std::string_view(magic, 4) != "ZEVW") return false;
     u8 version = 0;
     f.read(reinterpret_cast<char*>(&version), 1);
-    if (version != 3) return false; // LIGHT_V1: сейвы со старыми ID отбрасываем
+    if (version != 5) return false; // WORLDCOMPRESS_V1: старые несжатые сейвы (v4 и раньше) отбрасываем — мир пересоздаётся
+    u32 rawSize = 0, compSize = 0;
+    f.read(reinterpret_cast<char*>(&rawSize), 4);
+    f.read(reinterpret_cast<char*>(&compSize), 4);
+    if (!f || rawSize > (500u * 1024 * 1024) || compSize > (500u * 1024 * 1024)) return false;
+    std::vector<u8> compressed(compSize);
+    f.read(reinterpret_cast<char*>(compressed.data()), static_cast<std::streamsize>(compSize));
+    if (!f) return false;
+    std::vector<u8> raw;
+    if (!net::zlibc::decompress(std::span<const u8>(compressed.data(), compressed.size()), rawSize, raw)) return false;
+
+    size_t off = 0;
+    auto readRaw = [&](void* dst, size_t n) -> bool {
+        if (off + n > raw.size()) return false;
+        std::memcpy(dst, raw.data() + off, n);
+        off += n;
+        return true;
+    };
     i32 count = 0;
-    f.read(reinterpret_cast<char*>(&count), 4);
-    if (!f || count < 0 || count > 100000) return false;
-    for (i32 c = 0; c < count && f; ++c) {
+    if (!readRaw(&count, 4) || count < 0 || count > 100000) return false;
+    for (i32 c = 0; c < count; ++c) {
         i32 cx = 0, cz = 0;
         u32 blockCount = 0;
-        f.read(reinterpret_cast<char*>(&cx), 4);
-        f.read(reinterpret_cast<char*>(&cz), 4);
-        f.read(reinterpret_cast<char*>(&blockCount), 4);
-        if (!f) return false;
+        if (!readRaw(&cx, 4) || !readRaw(&cz, 4) || !readRaw(&blockCount, 4)) return false;
         auto chunk = getChunkOrCreate(cx, cz);
-        for (u32 i = 0; i < blockCount && f; ++i) {
+        for (u32 i = 0; i < blockCount; ++i) {
             u8 lx = 0, lz = 0;
             i16 y = 0;
             i32 id = 0;
-            f.read(reinterpret_cast<char*>(&lx), 1);
-            f.read(reinterpret_cast<char*>(&y), 2);
-            f.read(reinterpret_cast<char*>(&lz), 1);
-            f.read(reinterpret_cast<char*>(&id), 4);
+            if (!readRaw(&lx, 1) || !readRaw(&y, 2) || !readRaw(&lz, 1) || !readRaw(&id, 4)) return false;
             chunk->setBlock(cx * 16 + lx, static_cast<i32>(y), cz * 16 + lz, id);
         }
     }
@@ -694,7 +773,7 @@ bool World::startBackgroundLoad(const std::string& path) {
     if (!f || std::string_view(magic, 4) != "ZEVW") return false;
     u8 version = 0;
     f.read(reinterpret_cast<char*>(&version), 1);
-    if (version != 3) return false; // LIGHT_V1: old saves are dropped
+    if (version != 4) return false; // WORLDVER_V4: old saves (incl. flat at -64..-61) are dropped — world is regenerated
     i32 count = 0;
     f.read(reinterpret_cast<char*>(&count), 4);
     if (!f || count < 0 || count > 100000) return false;
@@ -746,6 +825,7 @@ void World::drainLoadedChunks() {
         if (loadReady_.empty()) return;
         batch.swap(loadReady_);
     }
+    std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
     for (auto& col : batch) {
         if (!col) continue;
         ChunkPos pos{col->getX(), col->getZ()};

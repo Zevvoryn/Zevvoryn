@@ -84,20 +84,55 @@ void Server::stop() {
         acceptThread_.join();
     }
 
-    // Закрываем все соединения
+    // NETSTOP_V1: закрывать соединения, ДЕРЖА connectionsMutex_, нельзя:
+    // conn->close() синхронно зовёт onClose_ -> колбэк из acceptLoop зовёт
+    // getConnection()/removeConnection(), которые лочат ТОТ ЖЕ mutex в этом же
+    // потоке. Рекурсивный захват std::mutex = UB -> abort() при /stop с игроками.
+    // Поэтому под замком только снимаем срез и чистим карту, а close() — снаружи.
+    std::vector<std::shared_ptr<Connection>> toClose;
     {
         std::lock_guard lock(connectionsMutex_);
-        for (auto& [id, conn] : connections_) {
-            conn->close();
-        }
+        toClose.reserve(connections_.size());
+        for (auto& [id, conn] : connections_) toClose.push_back(conn);
         connections_.clear();
     }
+    for (auto& conn : toClose) conn->close();
 
 #ifdef _WIN32
     WSACleanup();
 #endif
 
     NC_INFO("Net", "Network listener stopped"); // LANGFIX_V1
+}
+
+// CRASHNET_V1: см. комментарий в server.hpp. Максимально самодостаточно и без
+// блокировок, которые могли бы навесить дедлок прямо в обработчике краша.
+void Server::crashShutdown() {
+    // Останавливаем accept-луп: новые соединения больше не принимаются.
+    running_.store(false, std::memory_order_release);
+
+    // Закрываем сокет прослушивания — это ГЛАВНОЕ: после этого зайти на сервер
+    // уже нельзя, даже пока висит 180-секундное окно с краш-репортом.
+    if (listenSocket_ != INVALID_SOCK) {
+#ifdef _WIN32
+        closesocket(listenSocket_);
+#else
+        ::shutdown(listenSocket_, SHUT_RDWR);
+        ::close(listenSocket_);
+#endif
+        listenSocket_ = INVALID_SOCK;
+    }
+
+    // Рвём уже подключённых игроков, чтобы никто не остался на «мёртвом» сервере.
+    // try_lock: если краш случился ВНУТРИ секции под connectionsMutex_, обычный
+    // lock повесил бы дедлок прямо в обработчике. Не смогли взять — не страшно,
+    // listen-сокет уже закрыт, новых входов не будет.
+    if (connectionsMutex_.try_lock()) {
+        for (auto& [id, conn] : connections_) {
+            if (conn) conn->close();
+        }
+        connectionsMutex_.unlock();
+    }
 }
 
 void Server::run() {
@@ -144,8 +179,28 @@ void Server::acceptLoop() {
             onConnect_(conn);
         }
 
-        // Запускаем чтение в отдельном потоке
-        std::thread([conn]() { conn->start(); }).detach();
+        // STRESSHARDEN_V1: под штурмом 300 ботов + churn поток-на-соединение упирается
+        // в лимиты ОС (память под стеки / хендлы), а любой throw внутри read-цикла или
+        // неудачный спавн std::thread раньше вылетал наружу из acceptLoop (отдельный поток) и
+        // НЕ ловился нигде -> std::terminate -> весь сервер падал (в стресс-тесте
+        // "процесс не найден, возможен краш"). Теперь: (1) тело потока обёрнуто
+        // try/catch, (2) сам спавн обёрнут — сбой роняет только ЭТО соединение, а не процесс.
+        try {
+            std::thread([conn]() {
+                try {
+                    conn->start();
+                } catch (const std::exception& e) {
+                    NC_ERROR("Net", "Connection thread crashed (id={}): {}", conn->getId(), e.what());
+                    conn->close();
+                } catch (...) {
+                    NC_ERROR("Net", "Connection thread crashed (id={}): unknown error", conn->getId());
+                    conn->close();
+                }
+            }).detach();
+        } catch (const std::exception& e) {
+            NC_ERROR("Net", "Failed to spawn connection thread (id={}): {} — dropping this client", id, e.what());
+            conn->close();
+        }
     }
 }
 
