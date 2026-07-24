@@ -1584,12 +1584,14 @@ static i32 stateToItem(i32 blockState) {
 }
 
 // ============================================================
-// ITEMDROP_V1: выпавшие предметы. Сущность minecraft:item (id 60 в реестре 1.21.1),
+// ITEMDROP_V1: выпавшие предметы. Сущность minecraft:item (id 58 в реестре 1.21.1),
 // вид предмета задаёт метадата index 8 (сериализатор 7 = Slot). Физика — в tickItemDrops():
 // гравитация, торможение, пол/стены; подбор = Take Item Entity (0x6F) + Remove Entities (0x42).
-// DROPENTITY_FIX_V1: id 60 — это minecraft:item_frame (скрин показал рамки),
-// а id 59 — настоящий minecraft:item в raw entity registry протокола 1.21.1.
-static constexpr i32 ITEM_ENTITY_TYPE = 59;
+// DROPENTITY_FIX_V2: краш-репорт (class_8122) доказал, что id 59 = minecraft:item_display,
+// а id 60 = minecraft:item_frame. Реестр entity_type 1.21.1 алфавитный, поэтому
+// item(58) < item_display(59) < item_frame(60) — настоящий minecraft:item = 58.
+// Метадата index 8 (Slot) корректна именно для minecraft:item; у item_display index 8 = Int → краш.
+static constexpr i32 ITEM_ENTITY_TYPE = 58;
 
 static void sendItemDropSpawnTo(const std::shared_ptr<entity::Player>& viewer, i32 eid, i32 itemId, i32 count, f64 x, f64 y, f64 z, f64 vx, f64 vy, f64 vz) {
     if (!viewer || !viewer->isAlive() || viewer->getState() != entity::PlayerState::Play) return;
