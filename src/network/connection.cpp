@@ -1,0 +1,410 @@
+#include "connection.hpp"
+#include "server.hpp"
+#include "zlib_codec.hpp" // ZLIB_V1
+#include "../core/log.hpp"
+#include <cstring>
+#include <thread> // GRACECLOSE_V2
+#include <chrono> // GRACECLOSE_V2
+
+namespace nc::net {
+
+Connection::Connection(socket_t sock, Server& server, u64 id)
+    : socket_(sock), server_(server), id_(id)
+{
+    readBuffer_.resize(65536);
+    connected_.store(true, std::memory_order_release);
+}
+
+Connection::~Connection() {
+    close(); // NETASYNC_V2: выставит connected_=false и разбудит writerLoop
+    // NETASYNC_V2: дождаться потока-писателя. Деструктор всегда в read-потоке (лямбда acceptLoop
+    // держит последний shared_ptr), поэтому join здесь не self-join.
+    if (writerThread_.joinable()) {
+        if (writerThread_.get_id() != std::this_thread::get_id()) writerThread_.join();
+        else writerThread_.detach();
+    }
+}
+
+void Connection::start() {
+    int flag = 1;
+    setsockopt(socket_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&flag), sizeof(flag));
+    // FREEZE_FIX_V1: doWrite() below does a raw blocking ::send() with no timeout,
+    // and it can run on the MAIN TICK THREAD (every broadcast — keep-alive, tab list,
+    // tps boss bar — calls sendPacket()/queueSend() straight from tick()). If even one
+    // of hundreds of clients has a full/stalled TCP receive buffer (slow bot script,
+    // half-dead socket during churn), that single ::send() blocks forever and freezes
+    // the ENTIRE server — world ticking, console commands, everything — until that one
+    // socket unsticks. This is the "consle doesn't respond at all until bots leave"
+    // freeze. A bounded send timeout caps the damage to one slow client getting
+    // dropped (same as any other send error, see doWrite()'s `sent <= 0 -> close()`)
+    // instead of the whole process hanging.
+#ifdef _WIN32
+    DWORD sndTimeoutMs = 250; // NETASYNC_V2: страховка; реальные send в writerLoop
+    setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sndTimeoutMs), sizeof(sndTimeoutMs));
+#else
+    struct timeval sndTimeout{0, 250000}; // NETASYNC_V2
+    setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sndTimeout), sizeof(sndTimeout));
+#endif
+    writerThread_ = std::thread([this]() { writerLoop(); }); // NETASYNC_V2: писатель до чтения
+    doRead();
+}
+
+void Connection::close() {
+    bool expected = true;
+    if (connected_.compare_exchange_strong(expected, false)) {
+#ifdef _WIN32
+        closesocket(socket_);
+#else
+        ::close(socket_);
+#endif
+        if (onClose_) onClose_(id_);
+    }
+    writeCv_.notify_all(); // NETASYNC_V2: всегда будим поток-писатель
+}
+
+// GRACECLOSE_V1: пометить соединение на закрытие после отправки очереди.
+// writerLoop дольёт всё, что уже в очереди (например Login Disconnect), и закроет сокет сам.
+void Connection::closeAfterFlush() {
+    if (!isConnected()) return;
+    closeAfterFlush_.store(true, std::memory_order_release);
+    writeCv_.notify_one();
+}
+
+
+// GRACECLOSE_V2: закрыть сокет так, чтобы клиент УСПЕЛ прочитать последний пакет.
+// Обычный close() сразу после send() часто даёт TCP RST: клиент ещё шлёт нам данные
+// (движение и т.п.), а мы закрываемся с непрочитанным входящим буфером — тогда клиент
+// показывает «Internal Exception: ... Connection reset» вместо причины кика (это было
+// видно при /reload). shutdown(SD_SEND) отправляет FIN и гарантирует доставку всего
+// отправленного, а короткая пауза даёт клиенту время отрисовать экран с причиной.
+// Вызывается ТОЛЬКО из writer-потока этого соединения.
+void Connection::gracefulShutdown() {
+    if (connected_.load(std::memory_order_relaxed)) {
+#ifdef _WIN32
+        ::shutdown(socket_, SD_SEND);
+#else
+        ::shutdown(socket_, SHUT_WR);
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    }
+    close();
+}
+
+// ZLIB_V1: включение сетевого сжатия после Set Compression
+void Connection::enableCompression(i32 threshold) {
+    compressionThreshold_ = threshold;
+    compressionEnabled_ = (threshold >= 0);
+}
+
+// ONLINE_V1: enable AES-128-CFB8 on the socket (both directions share one secret)
+void Connection::enableEncryption(std::span<const u8> secret) {
+    if (secret.size() != 16) return;
+    if (!encCipher_.init(secret) || !decCipher_.init(secret)) {
+        NC_ERROR("Net", "Failed to initialize AES cipher");
+        return;
+    }
+    encryptionEnabled_.store(true, std::memory_order_release);
+}
+
+void Connection::sendPacket(i32 packetId, const std::vector<u8>& payload, bool droppable) {
+    sendPacket(packetId, std::span<const u8>(payload), droppable);
+}
+
+void Connection::sendPacket(i32 packetId, std::span<const u8> payload, bool droppable) {
+    if (!isConnected()) return;
+
+    auto appendVarInt = [](std::vector<u8>& v, i32 val) {
+        u32 uval = static_cast<u32>(val);
+        while (uval > 0x7F) {
+            v.push_back(static_cast<u8>((uval & 0x7F) | 0x80));
+            uval >>= 7;
+        }
+        v.push_back(static_cast<u8>(uval));
+    };
+
+    // packetBody = [VarInt packetId][payload]
+    std::vector<u8> packetBody;
+    packetBody.reserve(payload.size() + 5);
+    appendVarInt(packetBody, packetId);
+    packetBody.insert(packetBody.end(), payload.begin(), payload.end());
+
+    std::vector<u8> frame;
+
+    if (compressionEnabled_) {
+        // ZLIB_V1: сжатый фрейминг [VarInt packetLength][VarInt dataLength][zlib(id+payload)]
+        if (static_cast<i32>(packetBody.size()) >= compressionThreshold_) {
+            std::vector<u8> compressed = zlibc::compress(std::span<const u8>(packetBody));
+            std::vector<u8> inner;
+            inner.reserve(5);
+            appendVarInt(inner, static_cast<i32>(packetBody.size())); // dataLength = размер до сжатия
+            frame.reserve(inner.size() + compressed.size() + 5);
+            appendVarInt(frame, static_cast<i32>(inner.size() + compressed.size()));
+            frame.insert(frame.end(), inner.begin(), inner.end());
+            frame.insert(frame.end(), compressed.begin(), compressed.end());
+        } else {
+            // мелкий пакет: dataLength = 0, дальше несжатые данные
+            frame.reserve(packetBody.size() + 6);
+            appendVarInt(frame, static_cast<i32>(packetBody.size() + 1));
+            frame.push_back(0);
+            frame.insert(frame.end(), packetBody.begin(), packetBody.end());
+        }
+    } else {
+        frame.reserve(packetBody.size() + 5);
+        appendVarInt(frame, static_cast<i32>(packetBody.size()));
+        frame.insert(frame.end(), packetBody.begin(), packetBody.end());
+    }
+
+    queueSend(std::move(frame), droppable);
+}
+
+void Connection::sendRaw(std::span<const u8> data) {
+    std::vector<u8> frame(data.begin(), data.end());
+    queueSend(std::move(frame));
+}
+
+void Connection::queueSend(const std::vector<u8>& data, bool droppable) {
+    if (!isConnected()) return;
+    bool overflow = false;
+    {
+        std::lock_guard lock(writeMutex_);
+        const size_t projected = writeQueueBytes_ + data.size();
+        if (droppable && projected > kSoftDropBytes) { droppedPackets_.fetch_add(1, std::memory_order_relaxed); return; } // NETSHED_V1
+        if (projected > kMaxWriteQueueBytes) overflow = true;
+        else { writeQueueBytes_ += data.size(); writeQueue_.push(data); }
+    }
+    if (overflow) { close(); return; } // NETASYNC_V2: медленный клиент дропается
+    writeCv_.notify_one();             // NETASYNC_V2: будим писателя, не шлём инлайн
+}
+
+void Connection::queueSend(std::vector<u8>&& data, bool droppable) {
+    if (!isConnected()) return;
+    bool overflow = false;
+    size_t n = data.size();
+    {
+        std::lock_guard lock(writeMutex_);
+        const size_t projected = writeQueueBytes_ + n;
+        if (droppable && projected > kSoftDropBytes) { droppedPackets_.fetch_add(1, std::memory_order_relaxed); return; } // NETSHED_V1
+        if (projected > kMaxWriteQueueBytes) overflow = true;
+        else { writeQueueBytes_ += n; writeQueue_.push(std::move(data)); }
+    }
+    if (overflow) { close(); return; } // NETASYNC_V2
+    writeCv_.notify_one();             // NETASYNC_V2
+}
+
+void Connection::writerLoop() {
+    // NETASYNC_V2: единственное место блокирующего ::send(). Работает в отдельном
+    // потоке — тик/read-потоки при рассылке НЕ блокируются.
+    while (true) {
+        std::vector<u8> data;
+        {
+            std::unique_lock<std::mutex> lock(writeMutex_);
+            writeCv_.wait(lock, [this]() {
+                return !connected_.load(std::memory_order_relaxed) || !writeQueue_.empty()
+                    || closeAfterFlush_.load(std::memory_order_relaxed); // GRACECLOSE_V1
+            });
+            if (!connected_.load(std::memory_order_relaxed)) return; // NETASYNC_V2: закрыто
+            if (writeQueue_.empty()) { // GRACECLOSE_V1: сюда попадаем только при closeAfterFlush_
+                lock.unlock();
+                gracefulShutdown(); // GRACECLOSE_V2
+                return;
+            }
+            data = std::move(writeQueue_.front());
+            writeQueue_.pop();
+            const size_t n = data.size();
+            writeQueueBytes_ -= (writeQueueBytes_ >= n ? n : writeQueueBytes_);
+        }
+
+        if (encryptionEnabled_.load(std::memory_order_acquire) && !data.empty()) {
+            encCipher_.encrypt(data.data(), data.size()); // ONLINE_V1
+        }
+
+        i32 totalSent = 0;
+        i32 dataSize = static_cast<i32>(data.size());
+        while (totalSent < dataSize && connected_.load(std::memory_order_relaxed)) {
+            i32 sent = ::send(socket_,
+                reinterpret_cast<const char*>(data.data() + totalSent),
+                dataSize - totalSent, 0);
+            if (sent <= 0) {
+                close();
+                return;
+            }
+            totalSent += sent;
+        }
+
+        // GRACECLOSE_V1: последний пакет ушёл и очередь пуста — закрываем сокет
+        if (closeAfterFlush_.load(std::memory_order_relaxed)) {
+            std::unique_lock<std::mutex> lock(writeMutex_);
+            if (writeQueue_.empty()) {
+                lock.unlock();
+                gracefulShutdown(); // GRACECLOSE_V2
+                return;
+            }
+        }
+    }
+}
+
+// ============================================================
+// Чтение данных из сокета и парсинг пакетов
+// Без сжатия: [VarInt length][VarInt packetId][payload...]
+// Со сжатием (ZLIB_V1): [VarInt packetLength][VarInt dataLength][(zlib) packetId+payload]
+// ============================================================
+
+// Прочитать VarInt из буфера, вернуть количество байт consumed
+// Если VarInt не полный — вернуть 0
+static int tryReadVarInt(const u8* data, size_t available, i32& out) {
+    out = 0;
+    int shift = 0;
+    for (size_t i = 0; i < available && i < 5; ++i) {
+        u8 byte = data[i];
+        out |= static_cast<i32>(byte & 0x7F) << shift;
+        shift += 7;
+        if (!(byte & 0x80)) {
+            return static_cast<int>(i + 1);
+        }
+    }
+    return 0; // не полный VarInt
+}
+
+void Connection::doRead() {
+    while (isConnected()) {
+        // Расширяем буфер если нужно
+        if (readEnd_ + 4096 > readBuffer_.size()) {
+            readBuffer_.resize(readBuffer_.size() + 4096);
+        }
+
+        int bytesRead = ::recv(socket_,
+            reinterpret_cast<char*>(readBuffer_.data() + readEnd_),
+            static_cast<int>(readBuffer_.size() - readEnd_), 0);
+
+        if (bytesRead <= 0) {
+            close();
+            return;
+        }
+
+        if (encryptionEnabled_.load(std::memory_order_acquire)) {
+            decCipher_.decrypt(readBuffer_.data() + readEnd_, static_cast<size_t>(bytesRead)); // ONLINE_V1
+        }
+
+        readEnd_ += static_cast<size_t>(bytesRead);
+
+        // Парсим все полные пакеты из буфера
+        bool progress = true;
+        while (progress && readPos_ < readEnd_) {
+            progress = false;
+
+            // 1. Читаем длину пакета (VarInt)
+            i32 packetLength = 0;
+            int lenBytes = tryReadVarInt(
+                readBuffer_.data() + readPos_,
+                readEnd_ - readPos_,
+                packetLength);
+
+            if (lenBytes == 0) break; // VarInt не полный
+            if (packetLength < 0 || packetLength > 2097151) {
+                NC_ERROR("Net", "Invalid packet length: {}", packetLength);
+                close();
+                return;
+            }
+
+            // 2. Проверяем, достаточно ли данных
+            size_t dataStart = readPos_ + lenBytes;
+            if (readEnd_ < dataStart + static_cast<size_t>(packetLength)) {
+                break; // Ждём больше данных
+            }
+
+            // ZLIB_V1: при включённом сжатии внутри пакета сначала идёт dataLength
+            if (compressionEnabled_) {
+                i32 dataLength = 0;
+                int dlBytes = tryReadVarInt(
+                    readBuffer_.data() + dataStart,
+                    static_cast<size_t>(packetLength),
+                    dataLength);
+
+                if (dlBytes == 0 || dataLength < 0 || dataLength > 8388608) {
+                    NC_ERROR("Net", "Invalid compressed dataLength: {}", dataLength);
+                    close();
+                    return;
+                }
+
+                const u8* bodyPtr = readBuffer_.data() + dataStart + dlBytes;
+                size_t bodySize = static_cast<size_t>(packetLength) - dlBytes;
+
+                std::vector<u8> plain; // должен жить до конца processPacket
+                if (dataLength > 0) {
+                    if (!zlibc::decompress(std::span<const u8>(bodyPtr, bodySize),
+                                           static_cast<size_t>(dataLength), plain)) {
+                        NC_ERROR("Net", "Failed to decompress packet (dataLength={})", dataLength);
+                        close();
+                        return;
+                    }
+                    bodyPtr = plain.data();
+                    bodySize = plain.size();
+                }
+
+                i32 packetId = 0;
+                int idBytes = tryReadVarInt(bodyPtr, bodySize, packetId);
+                if (idBytes == 0) {
+                    NC_ERROR("Net", "Invalid packet ID VarInt (compressed frame)");
+                    close();
+                    return;
+                }
+
+                Buffer packetData(bodyPtr + idBytes, bodySize - static_cast<size_t>(idBytes));
+                readPos_ = dataStart + static_cast<size_t>(packetLength);
+                processPacket(packetLength, packetId, packetData);
+                progress = true;
+                continue;
+            }
+
+            // 3. Читаем packet ID (VarInt внутри пакета)
+            i32 packetId = 0;
+            int idBytes = tryReadVarInt(
+                readBuffer_.data() + dataStart,
+                static_cast<size_t>(packetLength),
+                packetId);
+
+            if (idBytes == 0) {
+                NC_ERROR("Net", "Invalid packet ID VarInt");
+                close();
+                return;
+            }
+
+            // 4. Payload = всё после packet ID
+            size_t payloadStart = dataStart + idBytes;
+            size_t payloadSize = static_cast<size_t>(packetLength) - idBytes;
+
+            Buffer packetData(readBuffer_.data() + payloadStart, payloadSize);
+
+            // 5. Сдвигаем позицию чтения
+            readPos_ = dataStart + static_cast<size_t>(packetLength);
+
+            // 6. Обрабатываем пакет
+            processPacket(packetLength, packetId, packetData);
+            progress = true;
+        }
+
+        // Сдвигаем буфер если прочитали данные
+        if (readPos_ > 0) {
+            size_t remaining = readEnd_ - readPos_;
+            if (remaining > 0) {
+                std::memmove(readBuffer_.data(), readBuffer_.data() + readPos_, remaining);
+            }
+            readEnd_ = remaining;
+            readPos_ = 0;
+        }
+    }
+}
+
+void Connection::processPacket(i32 length, i32 packetId, Buffer& payload) {
+    try {
+        server_.handleIncomingPacket(shared_from_this(), packetId, payload);
+    } catch (const std::exception& e) {
+        NC_ERROR("Net", "Exception in packet handler (id={}): {}", packetId, e.what());
+        close();
+    } catch (...) {
+        NC_ERROR("Net", "Unknown exception in packet handler (id={})", packetId);
+        close();
+    }
+}
+
+} // namespace nc::net
