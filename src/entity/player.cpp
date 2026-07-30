@@ -23,4 +23,21 @@ void Player::sendSystemMessage(std::string_view message) {
     connection_->sendPacket(0x6C, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
 }
 
+void Player::kick(std::string_view reason) {
+    // KICKFIX_V1: send a real Play Disconnect (wire id 0x1D) before closing the
+    // socket, so the client shows a proper disconnect screen with the reason
+    // text instead of just losing the connection (which Minecraft otherwise
+    // renders as a generic, unhelpful "Connection Lost" error).
+    if (!connection_ || !connection_->isConnected()) return;
+    net::Buffer buf;
+    buf.writeByte(0x08);
+    std::string msg(reason);
+    buf.writeU16(static_cast<u16>(msg.size()));
+    buf.writeBytes(std::span<const u8>(reinterpret_cast<const u8*>(msg.data()), msg.size()));
+    connection_->sendPacket(0x1D, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+    // KICKFIX_V2: close() рвал сокет раньше, чем writer успевал отправить Disconnect,
+    // и клиент видел «Connection reset» вместо причины кика.
+    connection_->closeAfterFlush();
+}
+
 } // namespace nc::entity

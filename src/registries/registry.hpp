@@ -184,6 +184,8 @@ private:
     RegistryManager() = default;
 
     void loadBlockDefaults();
+    // STATE_VARIANTS_V1: регистрация property-вариантов состояний блоков.
+    void registerStateVariants();
     void loadItemDefaults();
     void loadEntityDefaults();
     void loadBiomeDefaults();

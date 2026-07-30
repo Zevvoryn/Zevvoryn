@@ -1,10 +1,19 @@
 cmake_minimum_required(VERSION 3.25)
-project(Zevvoryn VERSION 0.1.0 LANGUAGES CXX RC)
+
+# Убрали RC из языков по умолчанию, чтобы CMake не требовал windres/rc
+project(Zevvoryn VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Опция для ресурсов/иконки (по умолчанию ВЫКЛЮЧЕНА)
+option(ENABLE_RC "Enable Windows resource file (.rc)" OFF)
+
+if(ENABLE_RC AND WIN32)
+    enable_language(RC)
+endif()
 
 # Включаем все предупреждения
 add_compile_options(/W4 /permissive-)
@@ -45,11 +54,21 @@ file(GLOB_RECURSE ALL_SOURCES CONFIGURE_DEPENDS
     src/utils/*.cpp
 )
 
-add_executable(zevvoryn
+# Формируем список файлов для сборки
+set(ZEVVORYN_SOURCES
     src/main.cpp
     ${ALL_SOURCES}
-    zevvoryn.rc
 )
+
+# Добавляем .rc только если явно включен флаг ENABLE_RC=ON
+if(ENABLE_RC AND WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/zevvoryn.rc")
+    list(APPEND ZEVVORYN_SOURCES zevvoryn.rc)
+    message(STATUS "Ресурсы Windows (zevvoryn.rc) включены")
+else()
+    message(STATUS "Сборка БЕЗ ресурсов .rc и иконки")
+endif()
+
+add_executable(zevvoryn ${ZEVVORYN_SOURCES})
 
 target_include_directories(zevvoryn PRIVATE src)
 target_link_libraries(zevvoryn PRIVATE nlohmann_json::nlohmann_json)

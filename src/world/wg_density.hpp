@@ -156,7 +156,7 @@ struct OverworldRouter {
         double px = x * 0.25 + sx, pz = z * 0.25 + sz;
         double c = continentalness->getValue(px, 0.0, pz);
         double e = erosionN->getValue(px, 0.0, pz);
-        double r = ridgeN->getValue(px, 0.0, pz) * 0.62; // tuned: gentler, less frequent high relief
+        double r = ridgeN->getValue(px, 0.0, pz); // BIOMESCALE_V1: ванильный raw ridge
         cOut = c; eOut = e; rOut = r;
         SplineContext s;
         s.coords[SC_CONTINENTS]    = (float)c;
@@ -266,7 +266,7 @@ struct OverworldRouter {
         double px = x * 0.25 + sx, pz = z * 0.25 + sz;
         cont  = continentalness->getValue(px, 0.0, pz);
         ero   = erosionN->getValue(px, 0.0, pz);
-        weird = ridgeN->getValue(px, 0.0, pz) * 0.62; // keep biome climate aligned with terrain
+        weird = ridgeN->getValue(px, 0.0, pz); // BIOMESCALE_V1: без сжатия — иначе полосы биомов тянутся
         temp  = temperatureN->getValue(px, 0.0, pz);
         hum   = vegetationN->getValue(px, 0.0, pz);
         SplineContext s;

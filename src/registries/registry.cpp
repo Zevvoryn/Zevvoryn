@@ -1,5 +1,6 @@
 #include "registry.hpp"
 #include "../core/log.hpp"
+#include "../core/item_blocks.gen.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
 
@@ -50,41 +51,238 @@ std::optional<i32> RegistryManager::getBlockStateId(std::string_view name,
 }
 
 // ============================================================
-// Встроенные дефолтные данные.
-// В реальном сервере загружаются из data/generated/ ( Mojmap ).
-// Здесь — минимальный набор для работы.
+// Встроенные данные Java 1.21.1 / protocol 767.
+// item_blocks.gen.hpp уже содержит полную сгенерированную таблицу
+// minecraft:block -> vanilla default block-state id (1331 блок).
 // ============================================================
 
 void RegistryManager::loadBlockDefaults() {
-    // air
+    // REGISTRY_FULL_V1: больше никакой семиблочной заглушки. Клиент 1.21.1
+    // имеет тот же статический реестр; сервер обязан использовать его ID.
     blockStates_.registerEntry({0, 0, "minecraft:air", {}});
     blocks_.registerEntry({0, "minecraft:air", 0, 0, false, false, 0.0f, 0.0f, 0.0f});
 
-    // stone
-    blockStates_.registerEntry({1, 1, "minecraft:stone", {}});
-    blocks_.registerEntry({1, "minecraft:stone", 1, 1, true, false, 1.5f, 6.0f, 0.0f});
+    for (const auto& [shortName, defaultState] : nc::gen::blockStateByName()) {
+        if (shortName == "grass_block" || shortName == "water" || shortName == "lava" ||
+            shortName == "air") continue; // состояния ниже требуют специальных свойств
 
-    // grass_block
-    // LIGHT_V1: в ванилле 1.21.1 стейт 8 = snowy=TRUE, 9 = snowy=FALSE (было наоборот)
+        const std::string name = "minecraft:" + shortName;
+        const bool air = shortName == "cave_air" || shortName == "void_air";
+        blockStates_.registerEntry({defaultState, defaultState, name, {}});
+        blocks_.registerEntry({defaultState, name, defaultState, defaultState,
+            !air, false, air ? 0.0f : 1.0f, air ? 0.0f : 1.0f, 0.0f});
+    }
+
+    // Ванильный порядок bool: true, false. Default = snowy=false (state 9).
     blockStates_.registerEntry({8, 8, "minecraft:grass_block", {{"snowy", "true"}}});
     blockStates_.registerEntry({9, 8, "minecraft:grass_block", {{"snowy", "false"}}});
     blocks_.registerEntry({8, "minecraft:grass_block", 8, 9, true, false, 0.6f, 0.3f, 0.0f});
 
-    // dirt
-    blockStates_.registerEntry({10, 10, "minecraft:dirt", {}});
-    blocks_.registerEntry({10, "minecraft:dirt", 10, 10, true, false, 0.5f, 0.5f, 0.0f});
-
-    // bedrock
-    blockStates_.registerEntry({79, 79, "minecraft:bedrock", {}}); // LIGHT_V1: ванильный ID
-    blocks_.registerEntry({79, "minecraft:bedrock", 79, 79, true, false, -1.0f, 3600000.0f, 0.0f});
-
-    // oak_planks
-    blockStates_.registerEntry({15, 15, "minecraft:oak_planks", {}}); // LIGHT_V1: ванильный ID
-    blocks_.registerEntry({15, "minecraft:oak_planks", 15, 15, true, false, 2.0f, 3.0f, 0.0f});
-
-    // water
-    blockStates_.registerEntry({80, 80, "minecraft:water", {{"level", "0"}}}); // LIGHT_V1: ванильный ID
+    // LiquidBlock.LEVEL: все 16 сетевых состояний, а не только источник.
+    for (i32 level = 0; level < 16; ++level) {
+        blockStates_.registerEntry({80 + level, 80, "minecraft:water", {{"level", std::to_string(level)}}});
+        blockStates_.registerEntry({96 + level, 96, "minecraft:lava", {{"level", std::to_string(level)}}});
+    }
     blocks_.registerEntry({80, "minecraft:water", 80, 95, false, true, 100.0f, 500.0f, 0.0f});
+    blocks_.registerEntry({96, "minecraft:lava", 96, 111, false, true, 100.0f, 500.0f, 15.0f});
+
+    // STATE_VARIANTS_V1 — см. комментарий у registerStateVariants().
+    registerStateVariants();
+}
+
+// ============================================================
+// STATE_VARIANTS_V1
+//
+// Баг, который это чинит: loadBlockDefaults() регистрировал РОВНО ОДНО
+// состояние на блок, причём с ПУСТОЙ картой свойств (исключения: air,
+// grass_block, water, lava). Из-за этого:
+//   1) getBlockStateId("minecraft:sweet_berry_bush", {{"age","1"}}) и любой
+//      другой запрос с непустыми props ВСЕГДА возвращал std::nullopt;
+//   2) blockStates().getById(state)->properties всегда был пуст, поэтому
+//      чтение возраста/стадии (bs->properties.find("age")) всегда давало 0.
+// Итог: рост какао, сладких ягод, торчфлауэра, тыквенных/дынных стеблей,
+// келпа, бамбука и посадка деревьев из саженцев были тихими no-op'ами —
+// код выполнялся, но состояние блока никогда не менялось.
+//
+// Как считается ID варианта: состояния блока идут подряд от базового ID,
+// в порядке декартова произведения свойств, где ПОСЛЕДНЕЕ свойство меняется
+// быстрее всего (порядок ванильного StateDefinition), а bool перечисляется
+// как true, false (тот же порядок уже подтверждён grass_block[snowy]).
+// Число вариантов сверено с реальным размером ID-диапазона каждого блока
+// (разница до следующего блока в blockStateByName()): листья 28, брёвна 3,
+// саженцы 2, стебли 8, прикреплённые стебли 4, torchflower_crop 3, kelp 26,
+// бамбук 12, черепашье яйцо 12, котёл 3 и т.д. Совпадение точное.
+//
+// Не покрыто намеренно: pointed_dripstone (диапазон 15 против 20 ванильных
+// комбинаций — схема не сходится, гадать нельзя), mangrove_propagule,
+// glow_lichen, big/small_dripleaf, двери/люки/заборы/стены и прочая
+// «строительная» комбинаторика, которой физика пока не пользуется.
+// ============================================================
+void RegistryManager::registerStateVariants() {
+    using Values = std::vector<std::string>;
+    struct Prop { std::string name; Values values; };
+
+    auto baseOf = [](const std::string& shortName) -> i32 {
+        const auto& tbl = nc::gen::blockStateByName();
+        auto it = tbl.find(shortName);
+        return it == tbl.end() ? -1 : it->second;
+    };
+
+    auto add = [&](const std::string& shortName, const std::vector<Prop>& props) {
+        const i32 base = baseOf(shortName);
+        if (base < 0 || props.empty()) return;
+        size_t total = 1;
+        for (const auto& p : props) total *= p.values.size();
+        for (size_t idx = 0; idx < total; ++idx) {
+            size_t rem = idx;
+            std::unordered_map<std::string, std::string> map;
+            for (size_t pi = props.size(); pi-- > 0;) {
+                const auto& p = props[pi];
+                map[p.name] = p.values[rem % p.values.size()];
+                rem /= p.values.size();
+            }
+            blockStates_.registerEntry({base + static_cast<i32>(idx), base,
+                "minecraft:" + shortName, map});
+        }
+    };
+
+    auto range = [](i32 from, i32 to) {
+        Values v;
+        for (i32 i = from; i <= to; ++i) v.push_back(std::to_string(i));
+        return v;
+    };
+    const Values kBool = {"true", "false"};
+    const Values kHorizontal = {"north", "south", "west", "east"};
+    const Values kAxis = {"x", "y", "z"};
+
+    // Листья: distance(1..7) x persistent x waterlogged = 28 состояний.
+    for (const char* wood : {"oak", "spruce", "birch", "jungle", "acacia",
+                             "cherry", "dark_oak", "mangrove", "azalea"}) {
+        add(std::string(wood) + "_leaves",
+            {{"distance", range(1, 7)}, {"persistent", kBool}, {"waterlogged", kBool}});
+    }
+
+    // Брёвна/древесина/гифы: axis = x, y, z.
+    for (const char* pillar : {
+        "oak_log",
+        "stripped_oak_log",
+        "oak_wood",
+        "stripped_oak_wood",
+        "spruce_log",
+        "stripped_spruce_log",
+        "spruce_wood",
+        "stripped_spruce_wood",
+        "birch_log",
+        "stripped_birch_log",
+        "birch_wood",
+        "stripped_birch_wood",
+        "jungle_log",
+        "stripped_jungle_log",
+        "jungle_wood",
+        "stripped_jungle_wood",
+        "acacia_log",
+        "stripped_acacia_log",
+        "acacia_wood",
+        "stripped_acacia_wood",
+        "cherry_log",
+        "stripped_cherry_log",
+        "cherry_wood",
+        "stripped_cherry_wood",
+        "dark_oak_log",
+        "stripped_dark_oak_log",
+        "dark_oak_wood",
+        "stripped_dark_oak_wood",
+        "mangrove_log",
+        "stripped_mangrove_log",
+        "mangrove_wood",
+        "stripped_mangrove_wood",
+        "bamboo_block",
+        "stripped_bamboo_block",
+        "warped_stem",
+        "stripped_warped_stem",
+        "warped_hyphae",
+        "crimson_stem",
+        "stripped_crimson_stem",
+        "crimson_hyphae"}) {
+        add(pillar, {{"axis", kAxis}});
+    }
+
+    // Саженцы: stage 0/1 (нужно для роста дерева со второго тика).
+    for (const char* sap : {"oak", "spruce", "birch", "jungle", "acacia",
+                            "cherry", "dark_oak"}) {
+        add(std::string(sap) + "_sapling", {{"stage", range(0, 1)}});
+    }
+
+    // Культуры и растения.
+    add("wheat", {{"age", range(0, 7)}});
+    add("carrots", {{"age", range(0, 7)}});
+    add("potatoes", {{"age", range(0, 7)}});
+    add("beetroots", {{"age", range(0, 3)}});
+    add("nether_wart", {{"age", range(0, 3)}});
+    add("sweet_berry_bush", {{"age", range(0, 3)}});
+    add("torchflower_crop", {{"age", range(0, 2)}});
+    add("pumpkin_stem", {{"age", range(0, 7)}});
+    add("melon_stem", {{"age", range(0, 7)}});
+    add("attached_pumpkin_stem", {{"facing", kHorizontal}});
+    add("attached_melon_stem", {{"facing", kHorizontal}});
+    add("cactus", {{"age", range(0, 15)}});
+    add("sugar_cane", {{"age", range(0, 15)}});
+    add("kelp", {{"age", range(0, 25)}});
+    add("weeping_vines", {{"age", range(0, 25)}});
+    add("twisting_vines", {{"age", range(0, 25)}});
+    add("cave_vines", {{"age", range(0, 25)}, {"berries", kBool}});
+    add("chorus_flower", {{"age", range(0, 5)}});
+    add("cocoa", {{"age", range(0, 2)}, {"facing", kHorizontal}});
+    add("bamboo", {{"age", range(0, 1)},
+                   {"leaves", Values{"none", "small", "large"}},
+                   {"stage", range(0, 1)}});
+
+    // Почва, снег, лёд, котлы, яйца.
+    add("farmland", {{"moisture", range(0, 7)}});
+    add("snow", {{"layers", range(1, 8)}});
+    add("frosted_ice", {{"age", range(0, 3)}});
+    add("composter", {{"level", range(0, 8)}});
+    add("water_cauldron", {{"level", range(1, 3)}});
+    add("powder_snow_cauldron", {{"level", range(1, 3)}});
+    add("turtle_egg", {{"eggs", range(1, 4)}, {"hatch", range(0, 2)}});
+    // SEA_PICKLE / SNIFFER_EGG_V1: exact palette spans: 4 pickle counts x
+    // waterlogged, and three sniffer-egg hatch stages.
+    add("sea_pickle", {{"pickles", range(1, 4)}, {"waterlogged", kBool}});
+    add("sniffer_egg", {{"hatch", range(0, 2)}});
+
+    // CANDLE_LANTERN_STATE_V1: needed so CANDLE_SUPPORT_V1 / LANTERN_SUPPORT_V1
+    // (server.cpp) can read "hanging"/"lit"/"waterlogged" instead of always
+    // getting an empty properties map.
+    // Verified against blockStateByName() range gaps: every candle color spans
+    // exactly 16 ids (candles 1..4 x lit x waterlogged) EXCEPT black_candle,
+    // whose gap to candle_cake is only 14 (and black_candle_cake's gap to
+    // amethyst_block is 1, not 2). That is a real, isolated 2-id shortfall in
+    // this codebase's block table for the black variant specifically — not a
+    // transcription error, confirmed by re-diffing every other color pair.
+    // Registering black_candle with the normal 16-combination scheme would
+    // silently stomp on the next block's ids, so black_candle and
+    // black_candle_cake are intentionally left unregistered here (same
+    // reasoning as the pointed_dripstone exclusion above). Support-removal
+    // physics for black candles still works fine without this, since that
+    // check only needs the block name, not its properties.
+    for (const char* color : {"candle", "white_candle", "orange_candle", "magenta_candle",
+                              "light_blue_candle", "yellow_candle", "lime_candle", "pink_candle",
+                              "gray_candle", "light_gray_candle", "cyan_candle", "purple_candle",
+                              "blue_candle", "brown_candle", "green_candle", "red_candle"}) {
+        add(color, {{"candles", range(1, 4)}, {"lit", kBool}, {"waterlogged", kBool}});
+    }
+
+    // LANTERN_SUPPORT_V1: hanging x waterlogged = 4 states; range gap confirmed
+    // clean for both lantern and soul_lantern.
+    add("lantern", {{"hanging", kBool}, {"waterlogged", kBool}});
+    add("soul_lantern", {{"hanging", kBool}, {"waterlogged", kBool}});
+
+    // CAKE_EAT_V1: cake right-click eating needs a registered bites 0..6 state so
+    // registry-based lookups (blockRegistryIdForState etc.) resolve correctly.
+    // Verified gap: cake=5874 to repeater=5884 is 10, which is >= vanilla's 7 bite
+    // states (0..6); the remaining 3 ids are unused padding, matching the same kind
+    // of gap already seen and documented for other blocks in this table.
+    add("cake", {{"bites", range(0, 6)}});
 }
 
 void RegistryManager::loadItemDefaults() {

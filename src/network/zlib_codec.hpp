@@ -310,4 +310,86 @@ inline bool decompress(std::span<const std::uint8_t> in, std::size_t expectedSiz
     return adler32(out.data(), out.size()) == ad;
 }
 
+// ============================================================
+// ANVIL_CONVERT_V1: gzip (RFC 1952) wrap/unwrap around the same raw deflate
+// primitives used above. Needed for level.dat, which vanilla always stores
+// gzip-compressed (unlike region-file chunks, which use plain zlib).
+// ============================================================
+
+inline const std::uint32_t* crc32Table() {
+    static std::uint32_t table[256];
+    static bool built = false;
+    if (!built) {
+        for (std::uint32_t n = 0; n < 256; ++n) {
+            std::uint32_t c = n;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            table[n] = c;
+        }
+        built = true;
+    }
+    return table;
+}
+
+inline std::uint32_t crc32(const std::uint8_t* data, std::size_t len) {
+    const std::uint32_t* table = crc32Table();
+    std::uint32_t c = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < len; ++i) {
+        c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
+// gzip container: [10-byte header][raw deflate][crc32 LE][isize LE]
+inline std::vector<std::uint8_t> gzipCompress(std::span<const std::uint8_t> in) {
+    std::vector<std::uint8_t> out;
+    out.reserve(in.size() / 2 + 64);
+    out.push_back(0x1F);
+    out.push_back(0x8B);
+    out.push_back(0x08); // CM = deflate
+    out.push_back(0x00); // FLG
+    out.push_back(0x00); out.push_back(0x00); out.push_back(0x00); out.push_back(0x00); // MTIME (unset)
+    out.push_back(0x00); // XFL
+    out.push_back(0xFF); // OS = unknown
+    deflateFixed(in.data(), in.size(), out);
+    std::uint32_t c = crc32(in.data(), in.size());
+    std::uint32_t isize = static_cast<std::uint32_t>(in.size());
+    out.push_back(std::uint8_t(c & 0xFF));
+    out.push_back(std::uint8_t((c >> 8) & 0xFF));
+    out.push_back(std::uint8_t((c >> 16) & 0xFF));
+    out.push_back(std::uint8_t((c >> 24) & 0xFF));
+    out.push_back(std::uint8_t(isize & 0xFF));
+    out.push_back(std::uint8_t((isize >> 8) & 0xFF));
+    out.push_back(std::uint8_t((isize >> 16) & 0xFF));
+    out.push_back(std::uint8_t((isize >> 24) & 0xFF));
+    return out;
+}
+
+// Decompresses a gzip stream. maxOut bounds the decompressed size (defends
+// against corrupt/huge inputs); actual size is taken from the trailer once
+// validated against what inflate() produced.
+inline bool gzipDecompress(std::span<const std::uint8_t> in, std::vector<std::uint8_t>& out, std::size_t maxOut) {
+    if (in.size() < 18) return false;
+    if (in[0] != 0x1F || in[1] != 0x8B || in[2] != 0x08) return false;
+    std::uint8_t flg = in[3];
+    std::size_t pos = 10;
+    if (flg & 0x04) { // FEXTRA
+        if (pos + 2 > in.size()) return false;
+        std::uint16_t xlen = std::uint16_t(in[pos]) | (std::uint16_t(in[pos + 1]) << 8);
+        pos += 2 + xlen;
+    }
+    if (flg & 0x08) { while (pos < in.size() && in[pos] != 0) ++pos; ++pos; } // FNAME
+    if (flg & 0x10) { while (pos < in.size() && in[pos] != 0) ++pos; ++pos; } // FCOMMENT
+    if (flg & 0x02) pos += 2; // FHCRC
+    if (pos >= in.size() || in.size() - pos < 8) return false;
+    std::size_t deflateEnd = in.size() - 8;
+    out.clear();
+    out.reserve(maxOut > 0 ? std::min(maxOut, deflateEnd - pos) : (deflateEnd - pos));
+    if (!inflate(in.data() + pos, deflateEnd - pos, out, maxOut)) return false;
+    std::uint32_t expectedCrc = std::uint32_t(in[deflateEnd]) | (std::uint32_t(in[deflateEnd + 1]) << 8)
+                              | (std::uint32_t(in[deflateEnd + 2]) << 16) | (std::uint32_t(in[deflateEnd + 3]) << 24);
+    return crc32(out.data(), out.size()) == expectedCrc;
+}
+
 } // namespace nc::net::zlibc

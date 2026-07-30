@@ -345,7 +345,7 @@ struct BiomeBuilder {
         addHighSlice(P::span(-0.56666666f,-0.4f));
         addMidSlice(P::span(-0.4f,-0.26666668f));
         addLowSlice(P::span(-0.26666668f,-0.05f));
-        addValleys(P::span(-0.017f,0.017f)); // tuned: narrower river climate band
+        addValleys(P::span(-0.05f,0.05f)); // BIOMESCALE_V1: ванильная ширина речной полосы
         addLowSlice(P::span(0.05f,0.26666668f));
         addMidSlice(P::span(0.26666668f,0.4f));
         addHighSlice(P::span(0.4f,0.56666666f));

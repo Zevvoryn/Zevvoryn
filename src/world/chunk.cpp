@@ -13,6 +13,8 @@
 #include <string_view>
 #include <thread>   // PERF_ASYNC_V1
 #include <chrono>   // PERF_ASYNC_V1
+#include <cstring>  // WORLDCOMPRESS_V1
+#include "../network/zlib_codec.hpp" // WORLDCOMPRESS_V1
 
 namespace nc::world {
 
@@ -20,15 +22,69 @@ namespace nc::world {
 // ChunkSection
 // ============================================================
 
+// ============================================================
+// MEM_V4: paletted + bit-packed хранилище секции
+// ============================================================
+
+size_t ChunkSection::longsFor(u8 bits) {
+    const size_t vpl = 64u / bits;                       // значения не пересекают long
+    return (static_cast<size_t>(BLOCKS_PER_SECTION) + vpl - 1) / vpl;
+}
+
+u32 ChunkSection::rawAt(size_t idx) const {
+    if (bits_ == 0) return 0;
+    const size_t vpl = 64u / bits_;
+    const u64 word = data_[idx / vpl];
+    const size_t shift = (idx % vpl) * bits_;
+    return static_cast<u32>((word >> shift) & ((1ull << bits_) - 1ull));
+}
+
+void ChunkSection::setRaw(size_t idx, u32 value) {
+    if (bits_ == 0) return;
+    const size_t vpl = 64u / bits_;
+    const size_t shift = (idx % vpl) * bits_;
+    const u64 mask = ((1ull << bits_) - 1ull) << shift;
+    u64& word = data_[idx / vpl];
+    word = (word & ~mask) | ((static_cast<u64>(value) & ((1ull << bits_) - 1ull)) << shift);
+}
+
+i32 ChunkSection::stateAt(size_t idx) const {
+    if (bits_ == 0) return palette_.empty() ? 0 : static_cast<i32>(palette_[0]);
+    const u32 raw = rawAt(idx);
+    if (palette_.empty()) return static_cast<i32>(raw);   // direct-палитра
+    return raw < palette_.size() ? static_cast<i32>(palette_[raw]) : 0;
+}
+
+void ChunkSection::repack(u8 newBits, const std::vector<u16>& newPalette) {
+    std::vector<u16> old(static_cast<size_t>(BLOCKS_PER_SECTION));
+    for (size_t i = 0; i < static_cast<size_t>(BLOCKS_PER_SECTION); ++i)
+        old[i] = static_cast<u16>(stateAt(i));
+
+    std::unordered_map<u16, u32> lookup;
+    lookup.reserve(newPalette.size() * 2 + 1);
+    for (size_t i = 0; i < newPalette.size(); ++i) lookup.emplace(newPalette[i], static_cast<u32>(i));
+
+    palette_ = newPalette;
+    bits_ = newBits;
+    data_.assign(longsFor(newBits), 0ull);
+
+    for (size_t i = 0; i < old.size(); ++i) {
+        if (palette_.empty()) { setRaw(i, static_cast<u32>(old[i])); continue; }
+        auto it = lookup.find(old[i]);
+        setRaw(i, it != lookup.end() ? it->second : 0u);
+    }
+}
+
 ChunkSection::ChunkSection() {
-    blocks_.fill(0); // air = state ID 0
-    biomes_.fill(0); // plains = biome ID 0
+    palette_.push_back(0); // вся секция = air, данные не аллокатим вовсе
+    bits_ = 0;
+    biomes_.fill(39); // BIOMEGREEN_V1: plains = сетевой id 39 (0 был badlands — поэтому трава была жухлая!)
     nonAirCount_ = 0;
 }
 
 void ChunkSection::setBlock(i32 x, i32 y, i32 z, i32 stateId) {
-    auto idx = blockIndex(x, y, z);
-    i32 old = blocks_[idx];
+    const size_t idx = blockIndex(x, y, z);
+    const i32 old = stateAt(idx);
     if (old == stateId) return;
 
     // Подсчёт non-air
@@ -42,11 +98,44 @@ void ChunkSection::setBlock(i32 x, i32 y, i32 z, i32 stateId) {
     if (wasAir && !isAir) nonAirCount_++;
     else if (!wasAir && isAir) nonAirCount_--;
 
-    blocks_[idx] = static_cast<u16>(stateId);
+    const u16 st = static_cast<u16>(stateId);
+
+    if (bits_ == 0) {
+        // Была однородной — разворачиваемся в 4 бита на блок (2 КБ).
+        std::vector<u16> np = palette_;
+        if (np.empty()) np.push_back(0);
+        np.push_back(st);
+        repack(4, np);
+        setRaw(idx, static_cast<u32>(np.size() - 1));
+        return;
+    }
+
+    if (palette_.empty()) { setRaw(idx, static_cast<u32>(st)); return; } // direct
+
+    for (size_t i = 0; i < palette_.size(); ++i)
+        if (palette_[i] == st) { setRaw(idx, static_cast<u32>(i)); return; }
+
+    if (palette_.size() < (static_cast<size_t>(1) << bits_)) {
+        palette_.push_back(st);
+        setRaw(idx, static_cast<u32>(palette_.size() - 1));
+        return;
+    }
+
+    // Палитра переполнилась: шире на бит, а после 8 — в direct-палитру.
+    const u8 nb = static_cast<u8>(bits_ + 1);
+    if (nb > 8) {
+        repack(DIRECT_BITS, std::vector<u16>{});
+        setRaw(idx, static_cast<u32>(st));
+        return;
+    }
+    std::vector<u16> np = palette_;
+    np.push_back(st);
+    repack(nb, np);
+    setRaw(idx, static_cast<u32>(np.size() - 1));
 }
 
 i32 ChunkSection::getBlock(i32 x, i32 y, i32 z) const {
-    return blocks_[blockIndex(x, y, z)];
+    return stateAt(blockIndex(x, y, z));
 }
 
 void ChunkSection::setBiome(i32 x, i32 y, i32 z, i32 biomeId) {
@@ -57,50 +146,47 @@ i32 ChunkSection::getBiome(i32 x, i32 y, i32 z) const {
     return biomes_[biomeIndex(x, y, z)];
 }
 
-void ChunkSection::writeTo(net::Buffer& buf) const {
+void ChunkSection::writeTo(net::Buffer& buf, i32 biomeOverride) const { // DIMBIOME_V1
     // FLATWORLD_V1: корректный paletted container для 1.21.1.
     // ВАЖНО: с MC 1.16 значения НЕ пересекают границы long!
     // 15 бит/блок -> 4 блока на long -> 1024 long на секцию.
 
     buf.writeI16(static_cast<i16>(nonAirCount_));
 
-    if (nonAirCount_ == 0) {
-        // Пустая секция: single-value палитра (воздух) — экономит ~8КБ
-        buf.writeByte(0);   // bits per entry = 0
-        buf.writeVarInt(0); // единственное значение: air (state 0)
-        buf.writeVarInt(0); // data array length = 0
+    // MEM_V4: льём внутреннее представление как есть: оно уже в формате
+    // paletted container 1.21.1. Бонусом пакет Chunk Data стал в разы меньше:
+    // было всегда 1024 long на секцию (8 КБ), теперь типично 256 long (2 КБ).
+    if (bits_ == 0) {
+        buf.writeByte(0);                                                   // single-value палитра
+        buf.writeVarInt(palette_.empty() ? 0 : static_cast<i32>(palette_[0]));
+        buf.writeVarInt(0);                                                 // data array length = 0
+    } else if (!palette_.empty()) {
+        buf.writeByte(bits_);                                               // indirect: 4..8 бит
+        buf.writeVarInt(static_cast<i32>(palette_.size()));
+        for (u16 s : palette_) buf.writeVarInt(static_cast<i32>(s));
+        buf.writeVarInt(static_cast<i32>(data_.size()));
+        for (u64 word : data_) buf.writeU64(word);
     } else {
-        const u8 bitsPerBlock = 15; // direct palette для 1.21.1
-        buf.writeByte(bitsPerBlock);
-        const size_t valuesPerLong = 64 / bitsPerBlock; // 4
-        const size_t longsNeeded = (BLOCKS_PER_SECTION + valuesPerLong - 1) / valuesPerLong; // 1024
-        buf.writeVarInt(static_cast<i32>(longsNeeded));
-        size_t i = 0;
-        for (size_t l = 0; l < longsNeeded; ++l) {
-            u64 packed = 0;
-            for (size_t v = 0; v < valuesPerLong && i < BLOCKS_PER_SECTION; ++v, ++i) {
-                u64 val = static_cast<u64>(blocks_[i]) & ((1ull << bitsPerBlock) - 1);
-                packed |= val << (v * bitsPerBlock);
-            }
-            buf.writeU64(packed);
-        }
+        buf.writeByte(DIRECT_BITS);                                         // direct: 15 бит
+        buf.writeVarInt(static_cast<i32>(data_.size()));
+        for (u64 word : data_) buf.writeU64(word);
     }
 
     // Биомы: у нас один биом на секцию -> single-value палитра
     // (для биомов валидны только 0-3 бита, 4 было вне спеки)
     buf.writeByte(0);                            // bits per entry = 0
-    buf.writeVarInt(biomes_[0]);                 // единственный биом секции
+    buf.writeVarInt(biomeOverride >= 0 ? biomeOverride : biomes_[0]); // DIMBIOME_V1
     buf.writeVarInt(0);                          // data array length = 0
 }
 
 // MEM_V1: serialize an all-air section without allocating one.
-void ChunkSection::writeEmpty(net::Buffer& buf) {
+void ChunkSection::writeEmpty(net::Buffer& buf, i32 biomeOverride) { // DIMBIOME_V1
     buf.writeI16(0);    // non-air count = 0
     buf.writeByte(0);   // blocks: single-value palette
     buf.writeVarInt(0); // value = air (state 0)
     buf.writeVarInt(0); // data array length = 0
     buf.writeByte(0);   // biomes: single-value palette
-    buf.writeVarInt(0); // biome = plains (0)
+    buf.writeVarInt(biomeOverride >= 0 ? biomeOverride : 39); // DIMBIOME_V1
     buf.writeVarInt(0); // data array length = 0
 }
 
@@ -154,8 +240,8 @@ void ChunkColumn::writeTo(net::Buffer& buf, bool includeBiomes) const {
     // Chunk sections (MEM_V1: unallocated sections serialize as all-air)
     for (i32 i = 0; i < SECTIONS_PER_CHUNK; ++i) {
         const auto& sec = sections_[static_cast<size_t>(i)];
-        if (sec) sec->writeTo(buf);
-        else ChunkSection::writeEmpty(buf);
+        if (sec) sec->writeTo(buf, biomeId_); // DIMBIOME_V1
+        else ChunkSection::writeEmpty(buf, biomeId_);
     }
 }
 
@@ -165,17 +251,23 @@ void ChunkColumn::writeTo(net::Buffer& buf, bool includeBiomes) const {
 
 std::shared_ptr<ChunkColumn> World::getChunk(i32 x, i32 z) {
     ChunkPos pos{x, z};
+    std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
     auto it = chunks_.find(pos);
     return it != chunks_.end() ? it->second : nullptr;
 }
 
-std::shared_ptr<ChunkColumn> World::getChunkOrCreate(i32 x, i32 z) {
+std::shared_ptr<ChunkColumn> World::getChunkOrCreate(i32 x, i32 z, bool* wasCreated) {
     ChunkPos pos{x, z};
+    std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1: atomic find-or-create
     auto it = chunks_.find(pos);
-    if (it != chunks_.end()) return it->second;
+    if (it != chunks_.end()) {
+        if (wasCreated) *wasCreated = false;
+        return it->second;
+    }
 
     auto chunk = std::make_shared<ChunkColumn>(x, z);
     chunks_[pos] = chunk;
+    if (wasCreated) *wasCreated = true;
     return chunk;
 }
 
@@ -190,36 +282,63 @@ i32 World::getBlock(i32 x, i32 y, i32 z) const {
     i32 cx = x >> 4;
     i32 cz = z >> 4;
     ChunkPos pos{cx, cz};
+    std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
     auto it = chunks_.find(pos);
     if (it == chunks_.end()) return 0;
     return it->second->getBlock(x, y, z);
 }
 
 void World::unloadChunk(i32 x, i32 z) {
+    std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
     chunks_.erase(ChunkPos{x, z});
 }
 
 void World::pruneChunks(const std::vector<std::pair<i32, i32>>& keepCenters, i32 keepRadius) {
     if (keepCenters.empty()) return; // never unload everything
     std::vector<ChunkPos> toErase;
-    for (const auto& kv : chunks_) {
-        const ChunkPos& p = kv.first;
-        bool keep = false;
-        for (const auto& c : keepCenters) {
-            i32 dx = p.x - c.first;  if (dx < 0) dx = -dx;
-            i32 dz = p.z - c.second; if (dz < 0) dz = -dz;
-            if (dx <= keepRadius && dz <= keepRadius) { keep = true; break; }
+    {
+        std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
+        for (const auto& kv : chunks_) {
+            const ChunkPos& p = kv.first;
+            bool keep = false;
+            for (const auto& c : keepCenters) {
+                i32 dx = p.x - c.first;  if (dx < 0) dx = -dx;
+                i32 dz = p.z - c.second; if (dz < 0) dz = -dz;
+                if (dx <= keepRadius && dz <= keepRadius) { keep = true; break; }
+            }
+            // WORLD_DIRTY_PIN_V1: never unload live edits before they have been
+            // persisted. Otherwise clients keep a cached wall while the server
+            // silently forgets every edited chunk outside the current radius.
+            if (!keep && (!kv.second || !kv.second->isDirty())) toErase.push_back(p);
         }
-        if (!keep) toErase.push_back(p);
+        for (const auto& p : toErase) chunks_.erase(p);
     }
-    for (const auto& p : toErase) chunks_.erase(p);
     if (!toErase.empty()) {
         std::lock_guard<std::mutex> lk(genMutex_);
         for (const auto& p : toErase) { genInFlight_.erase(p); genReady_.erase(p); }
     }
+    // MEM_V2: фоновый пул генерит всю округу (requestChunkAsync из sendChunksAround),
+    // но takeReadyChunk() забирает только то, что реально ушло игроку. Незабранные
+    // колонны не лежат в chunks_, поэтому цикл выше их не видел и они висели в genReady_
+    // до конца жизни процесса — после каждого дальнего телепорта плюс сотни колонн в ОЗУ.
+    {
+        std::lock_guard<std::mutex> lk(genMutex_);
+        std::vector<ChunkPos> readyErase;
+        for (const auto& kv : genReady_) {
+            const ChunkPos& p = kv.first;
+            bool keep = false;
+            for (const auto& c : keepCenters) {
+                i32 dx = p.x - c.first;  if (dx < 0) dx = -dx;
+                i32 dz = p.z - c.second; if (dz < 0) dz = -dz;
+                if (dx <= keepRadius && dz <= keepRadius) { keep = true; break; }
+            }
+            if (!keep) readyErase.push_back(p);
+        }
+        for (const auto& p : readyErase) { genReady_.erase(p); genInFlight_.erase(p); }
+    }
 }
 
-// FLATWORLD_V1: классический суперфлэт: Y=0 бедрок, Y=1-2 з��мля, Y=3 трава.
+// FLATWORLD_V1: классический суперфлэт: Y=0 бедрок, Y=1-2 земля, Y=3 трава.
 // Чанки генерятся НА ЛЕТУ в getOrGenerateChunk -> мир бесконечный.
 
 // ============================================================
@@ -339,7 +458,7 @@ void World::initDefaultGenerator(i64 seed, bool ru) {
     S.podzol     = mgr.getBlockStateId("minecraft:podzol", {{"snowy", "false"}}).value_or(::nc::gen::blockNameToState("podzol"));
     defaultReady_ = true;
     flatReady_ = false;
-    if (ru) NC_INFO("World", "Ванильный ге����ератор готов (сид {})", (long long)seed);
+    if (ru) NC_INFO("World", "Ванильный генератор готов (сид {})", (long long)seed);
     else    NC_INFO("World", "Overworld generator ready (seed {})", (long long)seed);
 }
 
@@ -391,13 +510,71 @@ void World::fillDefaultChunk(ChunkColumn& chunk, i32 cx, i32 cz) {
     caves::carve(chunk, cx, cz, S.seed, /*air*/0, S.water, /*lava*/96);
     // FEATURES_V1: place ores, trees and plants after carvers (vanilla feature step).
     features::place(chunk, S.biomes, S.seed, cx, cz);
-    // STRUCTURES_V1: vanilla structure-set placement grids and compact start-chunk builds.
-    structures::place(chunk, S.biomes, S.seed, cx, cz);
+    // STRUCTURES_V2: постройки строятся целиком и режутся по границе чанка; раутер нужен
+    // для высоты привязки из того же шума, что и у рельефа.
+    // STRUCT_QUIET_V1: лог построек убран по просьбе — координаты доступны через /locate.
+    structures::place(chunk, S.biomes, S.router, S.seed, cx, cz);
     for (i32 si = 0; si < SECTIONS_PER_CHUNK; ++si) {
         i32 midY = CHUNK_HEIGHT_MIN + si * SECTION_HEIGHT + 8;
         int b = S.biomes.getBiomeAtBlock(cx * 16, midY, cz * 16);
         chunk.getSection(si).setBiome(0, 0, 0, wgBiomeNetworkId(b));
     }
+}
+
+// STRUCT_LOCATE_V1 -------------------------------------------------------------
+i32 World::biomeAtBlock(i32 wx, i32 wy, i32 wz) {
+    if (!defaultReady_ || !wgState_) return -1;
+    return wgState_->biomes.getBiomeAtBlock(wx, wy, wz);
+}
+
+std::string World::structureKeys() {
+    int specCount = 0;
+    const auto* specs = structures::gridSpecs(specCount);
+    std::string out;
+    for (int i = 0; i < specCount; ++i) { if (i) out += ", "; out += specs[i].key; }
+    return out;
+}
+
+bool World::locateStructure(const std::string& key, i32 fromCx, i32 fromCz, i32 maxRadiusChunks,
+                            i32& outX, i32& outZ, std::string& outNameRu, std::string& outNameEn) {
+    if (!defaultReady_ || !wgState_) return false;
+    int specCount = 0;
+    const auto* specs = structures::gridSpecs(specCount);
+    const structures::GridSpec* spec = nullptr;
+    for (int i = 0; i < specCount; ++i) if (key == specs[i].key) { spec = &specs[i]; break; }
+    auto& S = *wgState_;
+    const bool treasure = (key == "treasure");
+    if (!spec && !treasure) return false;
+    if (treasure) { outNameRu = "зарытое сокровище"; outNameEn = "buried treasure"; }
+    else { outNameRu = spec->nameRu; outNameEn = spec->nameEn; }
+    for (i32 r = 0; r <= maxRadiusChunks; ++r) {
+        for (i32 dx = -r; dx <= r; ++dx) {
+            for (i32 dz = -r; dz <= r; ++dz) {
+                if (r > 0 && std::abs(dx) != r && std::abs(dz) != r) continue; // только рамка кольца
+                const i32 cx = fromCx + dx, cz = fromCz + dz;
+                const i32 wx = cx * 16 + 8, wz = cz * 16 + 8;
+                if (treasure) {
+                    const int biome = S.biomes.getBiomeAtBlock(cx * 16 + 9, 64, cz * 16 + 9);
+                    if (!structures::isBeach(biome)) continue;
+                    auto tr = structures::buildRng(S.seed, cx, cz, 10);
+                    if (tr.nextInt(100) != 0) continue;
+                    outX = cx * 16 + 9; outZ = cz * 16 + 9;
+                    return true;
+                }
+                if (!structures::isStartChunk(cx, cz, S.seed, spec->spacing, spec->separation, spec->salt)) continue;
+                const int biome = S.biomes.getBiomeAtBlock(wx, 64, wz);
+                if (!structures::biomeOkFor(spec->key, biome)) continue;
+                if (key == "outpost") { // частота 0.2 + запретная зона вокруг деревень
+                    auto fr = structures::buildRng(S.seed, cx, cz, 44);
+                    if (fr.nextInt(5) != 0) continue;
+                    if (structures::nearVillageStart(S.seed, cx, cz, 10)) continue;
+                }
+                outX = wx; outZ = wz;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void World::generateDefault(i64 seed, i32 centerX, i32 centerZ, i32 radius, bool ru) {
@@ -461,7 +638,16 @@ void World::startGenPool() {
     genStarted_ = true;
     genStop_.store(false, std::memory_order_release);
     unsigned hc = std::thread::hardware_concurrency();
-    unsigned n = (hc > 1) ? (hc - 1) : 1; // leave one core for the tick/main thread
+    // CPU_V1: было hc-1 (на 12 потоках — 11 генераторов). Они грызут все ядра
+    // сразу, поэтому CPU улетал в 50%+, а клиент на той же машине лагал (ему
+    // нужны ядра на рендер и свой chunk builder). Генерация от этого не ускорялась:
+    // узкое место — отдача чанков игроку, а не шум. Стало: четверть ядер, 2..6.
+    // CPU_V2: hc/4 (3 потока на 12 ядрах) убило скорость загрузки при view-distance 16:
+    // это 1089 колонн на игрока. Стало: половина ядер, 4..8 — есть запас для
+    // клиента на той же машине, но пул больше не является узким местом.
+    unsigned n = hc / 2;
+    if (n < 4) n = 4;
+    if (n > 8) n = 8;
     if (genThreadOverride_ > 0) n = genThreadOverride_; // PERF_TUNE_V1: config max-cores
     if (n < 1) n = 1;
     if (n > 32) n = 32; // PERF_TUNE_V1: raised cap (was 8) for high-core CPUs
@@ -501,17 +687,15 @@ void World::genWorkerLoop() {
         if (defaultReady_ && wgState_) {
             fillDefaultChunk(*col, pos.x, pos.z);
         } else if (flatReady_) {
-            for (i32 lx = 0; lx < 16; ++lx) {
-                for (i32 lz = 0; lz < 16; ++lz) {
-                    i32 wx = pos.x * 16 + lx;
-                    i32 wz = pos.z * 16 + lz;
-                    col->setBlock(wx, 0, wz, flatBedrockId_);
-                    col->setBlock(wx, 1, wz, flatDirtId_);
-                    col->setBlock(wx, 2, wz, flatDirtId_);
-                    col->setBlock(wx, 3, wz, flatGrassId_);
-                }
-            }
+            fillFlatColumn(*col, pos.x, pos.z); // GRASSFIX_V1: фоновые чанки тоже уважают пресет измерения
         }
+        // MEM_V5 (ГЛАВНАЯ УТЕЧКА): ChunkColumn::setBlock ставит dirty_ = true на ЛЮБОЙ записи,
+        // а ворлдген пишет террайн именно через setBlock. Синхронный путь
+        // (getOrGenerateChunk) чистит флаг, а ФОНОВЫЙ ПУЛ — НЕТ. Поэтому КАЖДЫЙ
+        // сгенерированный в фоне чанк (т.е. почти все) был "грязным", а pruneChunks
+        // грязные не выгружает (WORLD_DIRTY_PIN_V1) -> ОЗУ росло бесконечно и линейно
+        // по пройденным координатам. Именно отсюда "бегаешь до 10к — забивает всю память".
+        col->clearDirty();
         {
             std::lock_guard<std::mutex> lk(genMutex_);
             genReady_[pos] = std::move(col); // stays in genInFlight_ until taken
@@ -520,12 +704,23 @@ void World::genWorkerLoop() {
 }
 
 void World::requestChunkAsync(i32 cx, i32 cz) {
-    if (!genStarted_) startGenPool(); // lazy start (main thread only)
+    if (!genStarted_) startGenPool(); // lazily started; startGenPool() itself is guarded by genMutex_
     ChunkPos pos{cx, cz};
-    if (chunks_.find(pos) != chunks_.end()) return; // already live
+    {
+        std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
+        if (chunks_.find(pos) != chunks_.end()) return; // already live
+    }
     {
         std::lock_guard<std::mutex> lk(genMutex_);
         if (genInFlight_.count(pos) || genReady_.count(pos)) return;
+        // MEM_V3: backpressure. Раньше очередь была безграничной: при беге/полёте
+        // sendChunksAround заказывал чанки быстрее, чем пул успевал их отдавать,
+        // и готовые-но-незабранные колонны (~200 КБ каждая) накапливались сотнями —
+        // отсюда резкие выбросы ОЗУ в несколько ГБ. Лишние заказы теперь просто
+        // отбрасываются: следующий sendChunksAround закажет их заново.
+        // CPU_V2: лимиты подняты под view-distance 16. Колонны теперь палитрованные
+        // (MEM_V4) и сразу чистые (MEM_V5), так что 160 готовых — десятки МБ, не ГБ.
+        if (genReady_.size() >= 160 || genQueue_.size() >= 512) return;
         genInFlight_.insert(pos);
         genQueue_.push_back(pos);
     }
@@ -549,8 +744,34 @@ std::shared_ptr<ChunkColumn> World::takeReadyChunk(i32 cx, i32 cz) {
         genReady_.erase(it);
         genInFlight_.erase(pos);
     }
-    chunks_[pos] = col; // install into the live world (main thread only)
+    {
+        // CHUNKSYNC_V1: generation may finish after the disk loader (or another
+        // connection thread) already installed this coordinate. Never replace a
+        // live column: a client may already have received it, and replacement
+        // would make world_.getBlock() disagree with the client's collision map.
+        std::lock_guard<std::mutex> lk(chunksMutex_);
+        auto [it, inserted] = chunks_.emplace(pos, col);
+        if (!inserted) col = it->second;
+    }
     return col;
+}
+
+// GRASSFIX_V1: одна общая заливка плоского чанка — и для синхронной, и для фоновой генерации.
+// Раньше genWorkerLoop() игнорировал flatPreset_/flatBiomeId_ и лил траву в Аду и Энде.
+void World::fillFlatColumn(ChunkColumn& col, i32 cx, i32 cz) {
+    if (flatBiomeId_ >= 0) col.setColumnBiome(flatBiomeId_); // DIMBIOME_V1
+    const i32 surface = (flatPreset_ == 1 ? flatNetherrackId_ : (flatPreset_ == 2 ? flatEndStoneId_ : flatGrassId_));
+    const i32 filler  = (flatPreset_ == 1 ? flatNetherrackId_ : (flatPreset_ == 2 ? flatEndStoneId_ : flatDirtId_));
+    for (i32 lx = 0; lx < 16; ++lx) {
+        for (i32 lz = 0; lz < 16; ++lz) {
+            const i32 wx = cx * 16 + lx;
+            const i32 wz = cz * 16 + lz;
+            col.setBlock(wx, 0, wz, flatBedrockId_); // FLATNATIVE_V1: пол Y=0..3, стоим на Y=4
+            col.setBlock(wx, 1, wz, filler);
+            col.setBlock(wx, 2, wz, filler);
+            col.setBlock(wx, 3, wz, surface);
+        }
+    }
 }
 
 void World::initFlatGenerator() {
@@ -558,28 +779,27 @@ void World::initFlatGenerator() {
     flatBedrockId_ = mgr.getBlockStateId("minecraft:bedrock").value_or(79); // LIGHT_V1
     flatDirtId_    = mgr.getBlockStateId("minecraft:dirt").value_or(10);
     flatGrassId_   = mgr.getBlockStateId("minecraft:grass_block", {{"snowy", "false"}}).value_or(9); // LIGHT_V1
+    flatNetherrackId_ = wgResolve(mgr, "minecraft:netherrack", 4157); // MULTIWORLD_V1
+    flatEndStoneId_   = wgResolve(mgr, "minecraft:end_stone", 12456); // MULTIWORLD_V1
     flatReady_ = true;
 }
 
 std::shared_ptr<ChunkColumn> World::getOrGenerateChunk(i32 cx, i32 cz) {
-    auto it = chunks_.find(ChunkPos{cx, cz});
-    if (it != chunks_.end()) return it->second;
-    auto chunk = getChunkOrCreate(cx, cz);
+    // RACE_FIX_V1: a separate chunks_.find() here (before getChunkOrCreate()) used
+    // to race with other connection threads inserting into chunks_ concurrently.
+    // getChunkOrCreate() now does the find-or-create atomically under one lock and
+    // reports whether it created a new column, so we only generate content once.
+    bool wasCreated = false;
+    auto chunk = getChunkOrCreate(cx, cz, &wasCreated);
+    if (!wasCreated) return chunk; // already generated by an earlier call
     if (defaultReady_ && wgState_) { // WORLDGEN_V1
         fillDefaultChunk(*chunk, cx, cz);
+        chunk->clearDirty(); // generated terrain is baseline, not a live edit
         return chunk;
     }
     if (!flatReady_) return chunk;
-    for (i32 lx = 0; lx < 16; ++lx) {
-        for (i32 lz = 0; lz < 16; ++lz) {
-            i32 worldX = cx * 16 + lx;
-            i32 worldZ = cz * 16 + lz;
-            chunk->setBlock(worldX, -64, worldZ, flatBedrockId_); // FLATVANILLA_V1: ванильный суперфлэт -64..-61
-            chunk->setBlock(worldX, -63, worldZ, flatDirtId_);
-            chunk->setBlock(worldX, -62, worldZ, flatDirtId_);
-            chunk->setBlock(worldX, -61, worldZ, flatGrassId_);
-        }
-    }
+    fillFlatColumn(*chunk, cx, cz); // GRASSFIX_V1
+    chunk->clearDirty(); // generated flat terrain may be pruned normally
     return chunk;
 }
 
@@ -591,10 +811,7 @@ void World::generateFlat(i64 seed, i32 centerX, i32 centerZ, i32 radius) {
             getOrGenerateChunk(cx, cz);
         }
     }
-    if (langRu_) NC_INFO("World", "Flat мир: слои Y=-64..-61 (как в ванилле), стартовая зона {}x{} чанков, дальше — на лету", // FLATVANILLA_V1
-        radius * 2 + 1, radius * 2 + 1);
-    else NC_INFO("World", "Flat world: layers Y=-64..-61 (vanilla superflat), start area {}x{} chunks, the rest generated on the fly",
-        radius * 2 + 1, radius * 2 + 1); // LANGFIX_V1
+    (void)radius; // FLATLOG_V1: стартовый лог убран — с тремя мирами он печатался по три раза
 }
 
 
@@ -605,24 +822,60 @@ void World::generateFlat(i64 seed, i32 centerX, i32 centerZ, i32 radius) {
 // blockCount * (u8 lx, i16 y, u8 lz, i32 stateId) — только не-воздух.
 // ============================================================
 
+// SOFTRELOAD_V1: полная выгрузка мира для мягкого рестарта (вызывать с tick-потока)
+void World::reset() {
+    // остановить и прибрать фоновую загрузку с диска (иначе повторный startBackgroundLoad убьёт процесс на joinable-потоке)
+    loadStop_.store(true);
+    if (loadWorker_.joinable()) loadWorker_.join();
+    {
+        std::lock_guard<std::mutex> lk(loadMutex_);
+        loadReady_.clear();
+    }
+    loadDone_.store(true);
+    // очистить очереди генерации (воркеры просто ждут новую работу)
+    {
+        std::lock_guard<std::mutex> lk(genMutex_);
+        genQueue_.clear();
+        genInFlight_.clear();
+        genReady_.clear();
+    }
+    // выгрузить все чанки
+    {
+        std::lock_guard<std::mutex> lk(chunksMutex_);
+        chunks_.clear();
+    }
+    if (langRu_) NC_INFO("World", "Все чанки выгружены (мягкий рестарт)");
+    else NC_INFO("World", "All chunks unloaded (soft reload)");
+}
+
 bool World::saveToDisk(const std::string& path) const {
     std::filesystem::path p(path);
     if (p.has_parent_path()) {
         std::error_code ec;
         std::filesystem::create_directories(p.parent_path(), ec);
     }
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    // ASYNCSAVE_V1: пишем во временный файл и атомарно переименовываем — если
+    // сервер упадёт посреди записи, старый world.dat останется целым.
+    const std::string tmpPath = path + ".tmp";
+    std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
     if (!f) return false;
-    f.write("ZEVW", 4);
-    u8 version = 3; // LIGHT_V1: ванильные ID блоков
-    f.write(reinterpret_cast<const char*>(&version), 1);
-    i32 count = static_cast<i32>(chunks_.size());
-    f.write(reinterpret_cast<const char*>(&count), 4);
-    for (const auto& [pos, chunk] : chunks_) {
+    // ASYNCSAVE_V1: под мьютексом только копируем shared_ptr на чанки (микросекунды),
+    // сериализация ~100к блоков на чанк идёт уже БЕЗ блокировки —
+    // игровые потоки не ждут диск (раньше мьютекс держался все ~280мс).
+    std::vector<std::shared_ptr<ChunkColumn>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
+        snapshot.reserve(chunks_.size());
+        for (const auto& [pos, chunk] : chunks_) snapshot.push_back(chunk);
+    }
+    std::string raw;
+    i32 count = static_cast<i32>(snapshot.size());
+    raw.append(reinterpret_cast<const char*>(&count), 4);
+    for (const auto& chunk : snapshot) {
         i32 cx = chunk->getX();
         i32 cz = chunk->getZ();
-        f.write(reinterpret_cast<const char*>(&cx), 4);
-        f.write(reinterpret_cast<const char*>(&cz), 4);
+        raw.append(reinterpret_cast<const char*>(&cx), 4);
+        raw.append(reinterpret_cast<const char*>(&cz), 4);
         std::string blockData;
         u32 blockCount = 0;
         for (i32 y = CHUNK_HEIGHT_MIN; y < CHUNK_HEIGHT_MAX; ++y) {
@@ -641,10 +894,24 @@ bool World::saveToDisk(const std::string& path) const {
                 }
             }
         }
-        f.write(reinterpret_cast<const char*>(&blockCount), 4);
-        f.write(blockData.data(), static_cast<std::streamsize>(blockData.size()));
+        raw.append(reinterpret_cast<const char*>(&blockCount), 4);
+        raw.append(blockData);
     }
-    return f.good();
+    const auto compressed = net::zlibc::compress(std::span<const u8>(reinterpret_cast<const u8*>(raw.data()), raw.size()));
+    f.write("ZEVW", 4);
+    u8 version = 5; // WORLDCOMPRESS_V1
+    f.write(reinterpret_cast<const char*>(&version), 1);
+    const u32 rawSize = static_cast<u32>(raw.size());
+    const u32 compSize = static_cast<u32>(compressed.size());
+    f.write(reinterpret_cast<const char*>(&rawSize), 4);
+    f.write(reinterpret_cast<const char*>(&compSize), 4);
+    f.write(reinterpret_cast<const char*>(compressed.data()), static_cast<std::streamsize>(compressed.size()));
+    f.close();
+    std::error_code ec;
+    if (!f.good()) { std::filesystem::remove(tmpPath, ec); return false; }
+    std::filesystem::rename(tmpPath, path, ec); // атомарная подмена (на Windows — MoveFileEx c REPLACE_EXISTING)
+    if (ec) { std::filesystem::remove(tmpPath, ec); return false; }
+    return true;
 }
 
 bool World::loadFromDisk(const std::string& path) {
@@ -655,26 +922,36 @@ bool World::loadFromDisk(const std::string& path) {
     if (!f || std::string_view(magic, 4) != "ZEVW") return false;
     u8 version = 0;
     f.read(reinterpret_cast<char*>(&version), 1);
-    if (version != 3) return false; // LIGHT_V1: сейвы со старыми ID отбрасываем
+    if (version != 5) return false; // WORLDCOMPRESS_V1: старые несжатые сейвы (v4 и раньше) отбрасываем — мир пересоздаётся
+    u32 rawSize = 0, compSize = 0;
+    f.read(reinterpret_cast<char*>(&rawSize), 4);
+    f.read(reinterpret_cast<char*>(&compSize), 4);
+    if (!f || rawSize > (500u * 1024 * 1024) || compSize > (500u * 1024 * 1024)) return false;
+    std::vector<u8> compressed(compSize);
+    f.read(reinterpret_cast<char*>(compressed.data()), static_cast<std::streamsize>(compSize));
+    if (!f) return false;
+    std::vector<u8> raw;
+    if (!net::zlibc::decompress(std::span<const u8>(compressed.data(), compressed.size()), rawSize, raw)) return false;
+
+    size_t off = 0;
+    auto readRaw = [&](void* dst, size_t n) -> bool {
+        if (off + n > raw.size()) return false;
+        std::memcpy(dst, raw.data() + off, n);
+        off += n;
+        return true;
+    };
     i32 count = 0;
-    f.read(reinterpret_cast<char*>(&count), 4);
-    if (!f || count < 0 || count > 100000) return false;
-    for (i32 c = 0; c < count && f; ++c) {
+    if (!readRaw(&count, 4) || count < 0 || count > 100000) return false;
+    for (i32 c = 0; c < count; ++c) {
         i32 cx = 0, cz = 0;
         u32 blockCount = 0;
-        f.read(reinterpret_cast<char*>(&cx), 4);
-        f.read(reinterpret_cast<char*>(&cz), 4);
-        f.read(reinterpret_cast<char*>(&blockCount), 4);
-        if (!f) return false;
+        if (!readRaw(&cx, 4) || !readRaw(&cz, 4) || !readRaw(&blockCount, 4)) return false;
         auto chunk = getChunkOrCreate(cx, cz);
-        for (u32 i = 0; i < blockCount && f; ++i) {
+        for (u32 i = 0; i < blockCount; ++i) {
             u8 lx = 0, lz = 0;
             i16 y = 0;
             i32 id = 0;
-            f.read(reinterpret_cast<char*>(&lx), 1);
-            f.read(reinterpret_cast<char*>(&y), 2);
-            f.read(reinterpret_cast<char*>(&lz), 1);
-            f.read(reinterpret_cast<char*>(&id), 4);
+            if (!readRaw(&lx, 1) || !readRaw(&y, 2) || !readRaw(&lz, 1) || !readRaw(&id, 4)) return false;
             chunk->setBlock(cx * 16 + lx, static_cast<i32>(y), cz * 16 + lz, id);
         }
     }
@@ -694,16 +971,46 @@ bool World::startBackgroundLoad(const std::string& path) {
     if (!f || std::string_view(magic, 4) != "ZEVW") return false;
     u8 version = 0;
     f.read(reinterpret_cast<char*>(&version), 1);
-    if (version != 3) return false; // LIGHT_V1: old saves are dropped
-    i32 count = 0;
-    f.read(reinterpret_cast<char*>(&count), 4);
-    if (!f || count < 0 || count > 100000) return false;
+    if (version != 5) return false; // WORLDCOMPRESS_V1
+    u32 rawSize = 0, compSize = 0;
+    f.read(reinterpret_cast<char*>(&rawSize), 4);
+    f.read(reinterpret_cast<char*>(&compSize), 4);
+    if (!f || rawSize > (500u * 1024 * 1024) || compSize > (500u * 1024 * 1024)) return false;
+    std::vector<u8> compressed(compSize);
+    f.read(reinterpret_cast<char*>(compressed.data()), static_cast<std::streamsize>(compSize));
+    if (!f) return false;
+    std::vector<u8> raw;
+    if (!net::zlibc::decompress(std::span<const u8>(compressed.data(), compressed.size()), rawSize, raw)) return false;
+    if (raw.size() < 4) return false;
+    i32 count = 0; std::memcpy(&count, raw.data(), 4);
+    if (count < 0 || count > 100000) return false;
     // Header is valid; hand the heavy per-block parsing to a background thread so
     // the server can start listening immediately.
     loadExpected_ = count;
     loadDone_.store(false);
     loadStop_.store(false);
-    loadWorker_ = std::thread([this, path, count]() { loadWorkerLoop(path, count); });
+    loadWorker_ = std::thread([this, raw = std::move(raw), count]() mutable {
+        size_t off = 4;
+        auto readRaw = [&](void* dst, size_t n) -> bool {
+            if (off + n > raw.size()) return false;
+            std::memcpy(dst, raw.data() + off, n);
+            off += n;
+            return true;
+        };
+        for (i32 c = 0; c < count && !loadStop_.load(); ++c) {
+            i32 cx = 0, cz = 0; u32 blockCount = 0;
+            if (!readRaw(&cx, 4) || !readRaw(&cz, 4) || !readRaw(&blockCount, 4)) break;
+            auto col = std::make_shared<ChunkColumn>(cx, cz);
+            for (u32 i = 0; i < blockCount; ++i) {
+                u8 lx = 0, lz = 0; i16 y = 0; i32 id = 0;
+                if (!readRaw(&lx, 1) || !readRaw(&y, 2) || !readRaw(&lz, 1) || !readRaw(&id, 4)) { loadDone_.store(true); return; }
+                col->setBlock(cx * 16 + lx, static_cast<i32>(y), cz * 16 + lz, id);
+            }
+            col->clearDirty();
+            { std::lock_guard<std::mutex> lk(loadMutex_); loadReady_.push_back(std::move(col)); }
+        }
+        loadDone_.store(true);
+    });
     return true;
 }
 
@@ -746,6 +1053,7 @@ void World::drainLoadedChunks() {
         if (loadReady_.empty()) return;
         batch.swap(loadReady_);
     }
+    std::lock_guard<std::mutex> lk(chunksMutex_); // RACE_FIX_V1
     for (auto& col : batch) {
         if (!col) continue;
         ChunkPos pos{col->getX(), col->getZ()};

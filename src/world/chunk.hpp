@@ -47,16 +47,33 @@ public:
     i32 getBiome(i32 x, i32 y, i32 z) const;
 
     // Сериализация для chunk data packet
-    void writeTo(net::Buffer& buf) const;
+    void writeTo(net::Buffer& buf, i32 biomeOverride = -1) const; // DIMBIOME_V1
     // MEM_V1: serialize an all-air section (used for unallocated/lazy sections).
-    static void writeEmpty(net::Buffer& buf);
+    static void writeEmpty(net::Buffer& buf, i32 biomeOverride = -1); // DIMBIOME_V1
 
 private:
-    // MEM_V1: block/biome state ids fit in 16 bits (max ~27k states in 1.21.1),
-    // so store as u16 instead of i32 — halves per-section RAM (16KB -> 8KB).
-    std::array<u16, BLOCKS_PER_SECTION> blocks_;
+    // MEM_V4: палитра + бит-пакинг вместо плоского массива.
+    // Было (MEM_V1): std::array<u16, 4096> = 8 КБ на секцию ВСЕГДА, даже если
+    // секция целиком из камня. Колонна с рельефом — ~13 живых секций = ~110 КБ.
+    // Плоский мир трогает ОДНУ секцию из 24 — поэтому там 24 МБ, а в обычном мире 500.
+    // Стало: однородная секция (весь камень/весь воздух) = 0 байт данных,
+    // типичная подземная (камень/сланец/воздух/руды, <=16 состояний) = 4 бита
+    // на блок = 2 КБ. Палитра растёт 4->5->6->7->8 бит, дальше direct 15 бит.
+    // Формат совпадает с сетевым paletted container 1.21.1, поэтому writeTo()
+    // льёт внутреннее представление как есть, без переупаковки в 15 бит.
+    static constexpr u8 DIRECT_BITS = 15;
+
+    std::vector<u16> palette_;  // сетевые state id; пустая = direct-палитра
+    std::vector<u64> data_;     // упакованные индексы; значения НЕ пересекают long
+    u8 bits_ = 0;               // 0 = вся секция равна palette_[0]
     std::array<u16, BIOMES_PER_SECTION> biomes_;
     i32 nonAirCount_ = 0;
+
+    static size_t longsFor(u8 bits);
+    i32 stateAt(size_t idx) const;
+    u32 rawAt(size_t idx) const;
+    void setRaw(size_t idx, u32 value);
+    void repack(u8 newBits, const std::vector<u16>& newPalette);
 
     static size_t blockIndex(i32 x, i32 y, i32 z) {
         return static_cast<size_t>((y & 0xF) * SECTION_WIDTH * SECTION_WIDTH + (z & 0xF) * SECTION_WIDTH + (x & 0xF));
@@ -94,10 +111,15 @@ public:
     bool isDirty() const { return dirty_; }
     void clearDirty() { dirty_ = false; }
 
+    // DIMBIOME_V1: весь столбец одним биомом (Ад/Энд); -1 = как было
+    void setColumnBiome(i32 b) { biomeId_ = b; }
+    i32 columnBiome() const { return biomeId_; }
+
 private:
     i32 x_, z_;
     std::array<std::unique_ptr<ChunkSection>, SECTIONS_PER_CHUNK> sections_;
     bool dirty_ = false;
+    i32 biomeId_ = -1; // DIMBIOME_V1
 };
 
 // ============================================================
@@ -110,7 +132,11 @@ public:
     ~World(); // WORLDGEN_V1
 
     std::shared_ptr<ChunkColumn> getChunk(i32 x, i32 z);
-    std::shared_ptr<ChunkColumn> getChunkOrCreate(i32 x, i32 z);
+    // RACE_FIX_V1: optional out-param reports whether this call created a brand-new
+    // (empty) column vs returned an already-live one, so callers like
+    // getOrGenerateChunk() can decide whether to fill it in — all in one atomic
+    // lock instead of a separate find() + getChunkOrCreate() race.
+    std::shared_ptr<ChunkColumn> getChunkOrCreate(i32 x, i32 z, bool* wasCreated = nullptr);
 
     void setBlock(i32 x, i32 y, i32 z, i32 stateId);
     i32 getBlock(i32 x, i32 y, i32 z) const;
@@ -120,7 +146,11 @@ public:
     // without bound as players roam. keepRadius is in chunks. Centers are (cx,cz).
     void pruneChunks(const std::vector<std::pair<i32, i32>>& keepCenters, i32 keepRadius);
 
-    size_t getLoadedChunkCount() const { return chunks_.size(); }
+    size_t getLoadedChunkCount() const { std::lock_guard<std::mutex> lk(chunksMutex_); return chunks_.size(); }
+
+    // ANVIL_CONVERT_V1: read-only iteration over all currently loaded chunks,
+    // used by the vanilla Anvil world exporter/importer.
+    const std::unordered_map<ChunkPos, std::shared_ptr<ChunkColumn>>& getAllChunks() const { return chunks_; }
 
     // PERF_TUNE_V1: override worldgen worker-thread count (0 = auto). Set from the
     // config max-cores value before the pool lazily starts.
@@ -128,9 +158,14 @@ public:
 
     // Генерация flat-мира
     void generateFlat(i64 seed, i32 centerX, i32 centerZ, i32 radius);
+    // MULTIWORLD_V1: 0 = overworld superflat, 1 = nether flat, 2 = end flat
+    void setFlatPreset(i32 preset) { flatPreset_ = preset; flatBiomeId_ = (preset == 1 ? 34 : (preset == 2 ? 55 : -1)); } // DIMBIOME_V1: nether_wastes / the_end
 
     // WORLDSAVE_V1: сохранение/загрузка мира на диск
     bool saveToDisk(const std::string& path) const;
+    // SOFTRELOAD_V1: выгрузить ВСЕ чанки и очереди генерации/загрузки.
+    // Потоки пула генерации не останавливаются — они без состояния и ждут новую работу.
+    void reset();
     bool loadFromDisk(const std::string& path);
 
     // FASTBOOT_V1: read the save header on the calling (main) thread and return
@@ -161,6 +196,10 @@ public:
     i32 flatBedrockId_ = 79; // LIGHT_V1
     i32 flatDirtId_ = 10;
     i32 flatGrassId_ = 9;  // LIGHT_V1
+    i32 flatPreset_ = 0;           // MULTIWORLD_V1
+    i32 flatBiomeId_ = -1;         // DIMBIOME_V1
+    i32 flatNetherrackId_ = 4157;  // MULTIWORLD_V1: resolved in initFlatGenerator
+    i32 flatEndStoneId_ = 12456;   // MULTIWORLD_V1: resolved in initFlatGenerator
 
     // WORLDGEN_V1: ванильный overworld генератор
     void initDefaultGenerator(i64 seed, bool ru = false); // SPAWN_V1
@@ -171,12 +210,30 @@ public:
     bool defaultReady_ = false;
     struct WorldGenState;
     std::unique_ptr<WorldGenState> wgState_;
+    // STRUCT_LOCATE_V1: биом в точке (-1, если генератор не ванильный).
+    i32 biomeAtBlock(i32 wx, i32 wy, i32 wz);
+    // STRUCT_LOCATE_V1: поиск ближайшей структуры только по арифметике сетки
+    // и шуму биомов: ни одного чанка не генерируется.
+    bool locateStructure(const std::string& key, i32 fromCx, i32 fromCz, i32 maxRadiusChunks,
+                         i32& outX, i32& outZ, std::string& outNameRu, std::string& outNameEn);
+    static std::string structureKeys();
     void fillDefaultChunk(ChunkColumn& chunk, i32 cx, i32 cz);
 
 private:
+    // RACE_FIX_V1: handlePlay() runs on each connection's OWN thread (one thread
+    // per player, see network::Server accept loop), NOT the main tick thread.
+    // sendChunksAround() therefore calls getOrGenerateChunk()/takeReadyChunk()
+    // concurrently from many player threads at once. Both mutate chunks_, so
+    // without a lock this was a data race on a std::unordered_map (concurrent
+    // insert/rehash from multiple threads = undefined behavior: corruption,
+    // infinite loops in a broken bucket chain, or crashes) — exactly what a
+    // mass join/churn burst with 300 bots would trigger. All access to chunks_
+    // now goes through chunksMutex_.
+    mutable std::mutex chunksMutex_;
     std::unordered_map<ChunkPos, std::shared_ptr<ChunkColumn>> chunks_;
 
     // PERF_ASYNC_V1: background generation pool state.
+    void fillFlatColumn(ChunkColumn& col, i32 cx, i32 cz); // GRASSFIX_V1
     void genWorkerLoop();
     std::vector<std::thread> genWorkers_;
     std::mutex genMutex_;

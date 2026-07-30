@@ -4,6 +4,7 @@
 build/
 build-ninja/
 release/
+DevInfo/
 *.bak*
 *.rs
 *.exe
@@ -39,7 +40,6 @@ package-lock.json
 # Local dev tools
 # ===========================
 .mcp-hidden/
-.mimocode/
 server.js
 server.json
 package.json
@@ -60,3 +60,4 @@ stop-mcp.bat
 Thumbs.db
 Desktop.ini
 .DS_Store
+*.txt

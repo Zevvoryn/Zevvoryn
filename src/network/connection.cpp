@@ -3,6 +3,8 @@
 #include "zlib_codec.hpp" // ZLIB_V1
 #include "../core/log.hpp"
 #include <cstring>
+#include <thread> // GRACECLOSE_V2
+#include <chrono> // GRACECLOSE_V2
 
 namespace nc::net {
 
@@ -14,12 +16,36 @@ Connection::Connection(socket_t sock, Server& server, u64 id)
 }
 
 Connection::~Connection() {
-    close();
+    close(); // NETASYNC_V2: выставит connected_=false и разбудит writerLoop
+    // NETASYNC_V2: дождаться потока-писателя. Деструктор всегда в read-потоке (лямбда acceptLoop
+    // держит последний shared_ptr), поэтому join здесь не self-join.
+    if (writerThread_.joinable()) {
+        if (writerThread_.get_id() != std::this_thread::get_id()) writerThread_.join();
+        else writerThread_.detach();
+    }
 }
 
 void Connection::start() {
     int flag = 1;
     setsockopt(socket_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&flag), sizeof(flag));
+    // FREEZE_FIX_V1: doWrite() below does a raw blocking ::send() with no timeout,
+    // and it can run on the MAIN TICK THREAD (every broadcast — keep-alive, tab list,
+    // tps boss bar — calls sendPacket()/queueSend() straight from tick()). If even one
+    // of hundreds of clients has a full/stalled TCP receive buffer (slow bot script,
+    // half-dead socket during churn), that single ::send() blocks forever and freezes
+    // the ENTIRE server — world ticking, console commands, everything — until that one
+    // socket unsticks. This is the "consle doesn't respond at all until bots leave"
+    // freeze. A bounded send timeout caps the damage to one slow client getting
+    // dropped (same as any other send error, see doWrite()'s `sent <= 0 -> close()`)
+    // instead of the whole process hanging.
+#ifdef _WIN32
+    DWORD sndTimeoutMs = 250; // NETASYNC_V2: страховка; реальные send в writerLoop
+    setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sndTimeoutMs), sizeof(sndTimeoutMs));
+#else
+    struct timeval sndTimeout{0, 250000}; // NETASYNC_V2
+    setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sndTimeout), sizeof(sndTimeout));
+#endif
+    writerThread_ = std::thread([this]() { writerLoop(); }); // NETASYNC_V2: писатель до чтения
     doRead();
 }
 
@@ -33,6 +59,35 @@ void Connection::close() {
 #endif
         if (onClose_) onClose_(id_);
     }
+    writeCv_.notify_all(); // NETASYNC_V2: всегда будим поток-писатель
+}
+
+// GRACECLOSE_V1: пометить соединение на закрытие после отправки очереди.
+// writerLoop дольёт всё, что уже в очереди (например Login Disconnect), и закроет сокет сам.
+void Connection::closeAfterFlush() {
+    if (!isConnected()) return;
+    closeAfterFlush_.store(true, std::memory_order_release);
+    writeCv_.notify_one();
+}
+
+
+// GRACECLOSE_V2: закрыть сокет так, чтобы клиент УСПЕЛ прочитать последний пакет.
+// Обычный close() сразу после send() часто даёт TCP RST: клиент ещё шлёт нам данные
+// (движение и т.п.), а мы закрываемся с непрочитанным входящим буфером — тогда клиент
+// показывает «Internal Exception: ... Connection reset» вместо причины кика (это было
+// видно при /reload). shutdown(SD_SEND) отправляет FIN и гарантирует доставку всего
+// отправленного, а короткая пауза даёт клиенту время отрисовать экран с причиной.
+// Вызывается ТОЛЬКО из writer-потока этого соединения.
+void Connection::gracefulShutdown() {
+    if (connected_.load(std::memory_order_relaxed)) {
+#ifdef _WIN32
+        ::shutdown(socket_, SD_SEND);
+#else
+        ::shutdown(socket_, SHUT_WR);
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    }
+    close();
 }
 
 // ZLIB_V1: включение сетевого сжатия после Set Compression
@@ -51,11 +106,11 @@ void Connection::enableEncryption(std::span<const u8> secret) {
     encryptionEnabled_.store(true, std::memory_order_release);
 }
 
-void Connection::sendPacket(i32 packetId, const std::vector<u8>& payload) {
-    sendPacket(packetId, std::span<const u8>(payload));
+void Connection::sendPacket(i32 packetId, const std::vector<u8>& payload, bool droppable) {
+    sendPacket(packetId, std::span<const u8>(payload), droppable);
 }
 
-void Connection::sendPacket(i32 packetId, std::span<const u8> payload) {
+void Connection::sendPacket(i32 packetId, std::span<const u8> payload, bool droppable) {
     if (!isConnected()) return;
 
     auto appendVarInt = [](std::vector<u8>& v, i32 val) {
@@ -99,7 +154,7 @@ void Connection::sendPacket(i32 packetId, std::span<const u8> payload) {
         frame.insert(frame.end(), packetBody.begin(), packetBody.end());
     }
 
-    queueSend(std::move(frame));
+    queueSend(std::move(frame), droppable);
 }
 
 void Connection::sendRaw(std::span<const u8> data) {
@@ -107,43 +162,56 @@ void Connection::sendRaw(std::span<const u8> data) {
     queueSend(std::move(frame));
 }
 
-void Connection::queueSend(const std::vector<u8>& data) {
-    bool shouldWrite = false;
+void Connection::queueSend(const std::vector<u8>& data, bool droppable) {
+    if (!isConnected()) return;
+    bool overflow = false;
     {
         std::lock_guard lock(writeMutex_);
-        writeQueue_.push(data);
-        if (!writing_) {
-            writing_ = true;
-            shouldWrite = true;
-        }
+        const size_t projected = writeQueueBytes_ + data.size();
+        if (droppable && projected > kSoftDropBytes) { droppedPackets_.fetch_add(1, std::memory_order_relaxed); return; } // NETSHED_V1
+        if (projected > kMaxWriteQueueBytes) overflow = true;
+        else { writeQueueBytes_ += data.size(); writeQueue_.push(data); }
     }
-    if (shouldWrite) doWrite();
+    if (overflow) { close(); return; } // NETASYNC_V2: медленный клиент дропается
+    writeCv_.notify_one();             // NETASYNC_V2: будим писателя, не шлём инлайн
 }
 
-void Connection::queueSend(std::vector<u8>&& data) {
-    bool shouldWrite = false;
+void Connection::queueSend(std::vector<u8>&& data, bool droppable) {
+    if (!isConnected()) return;
+    bool overflow = false;
+    size_t n = data.size();
     {
         std::lock_guard lock(writeMutex_);
-        writeQueue_.push(std::move(data));
-        if (!writing_) {
-            writing_ = true;
-            shouldWrite = true;
-        }
+        const size_t projected = writeQueueBytes_ + n;
+        if (droppable && projected > kSoftDropBytes) { droppedPackets_.fetch_add(1, std::memory_order_relaxed); return; } // NETSHED_V1
+        if (projected > kMaxWriteQueueBytes) overflow = true;
+        else { writeQueueBytes_ += n; writeQueue_.push(std::move(data)); }
     }
-    if (shouldWrite) doWrite();
+    if (overflow) { close(); return; } // NETASYNC_V2
+    writeCv_.notify_one();             // NETASYNC_V2
 }
 
-void Connection::doWrite() {
-    while (isConnected()) {
+void Connection::writerLoop() {
+    // NETASYNC_V2: единственное место блокирующего ::send(). Работает в отдельном
+    // потоке — тик/read-потоки при рассылке НЕ блокируются.
+    while (true) {
         std::vector<u8> data;
         {
-            std::lock_guard lock(writeMutex_);
-            if (writeQueue_.empty()) {
-                writing_ = false;
+            std::unique_lock<std::mutex> lock(writeMutex_);
+            writeCv_.wait(lock, [this]() {
+                return !connected_.load(std::memory_order_relaxed) || !writeQueue_.empty()
+                    || closeAfterFlush_.load(std::memory_order_relaxed); // GRACECLOSE_V1
+            });
+            if (!connected_.load(std::memory_order_relaxed)) return; // NETASYNC_V2: закрыто
+            if (writeQueue_.empty()) { // GRACECLOSE_V1: сюда попадаем только при closeAfterFlush_
+                lock.unlock();
+                gracefulShutdown(); // GRACECLOSE_V2
                 return;
             }
             data = std::move(writeQueue_.front());
             writeQueue_.pop();
+            const size_t n = data.size();
+            writeQueueBytes_ -= (writeQueueBytes_ >= n ? n : writeQueueBytes_);
         }
 
         if (encryptionEnabled_.load(std::memory_order_acquire) && !data.empty()) {
@@ -152,8 +220,7 @@ void Connection::doWrite() {
 
         i32 totalSent = 0;
         i32 dataSize = static_cast<i32>(data.size());
-
-        while (totalSent < dataSize && isConnected()) {
+        while (totalSent < dataSize && connected_.load(std::memory_order_relaxed)) {
             i32 sent = ::send(socket_,
                 reinterpret_cast<const char*>(data.data() + totalSent),
                 dataSize - totalSent, 0);
@@ -162,6 +229,16 @@ void Connection::doWrite() {
                 return;
             }
             totalSent += sent;
+        }
+
+        // GRACECLOSE_V1: последний пакет ушёл и очередь пуста — закрываем сокет
+        if (closeAfterFlush_.load(std::memory_order_relaxed)) {
+            std::unique_lock<std::mutex> lock(writeMutex_);
+            if (writeQueue_.empty()) {
+                lock.unlock();
+                gracefulShutdown(); // GRACECLOSE_V2
+                return;
+            }
         }
     }
 }

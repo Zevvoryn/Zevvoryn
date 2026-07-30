@@ -16,6 +16,18 @@
 #include <utility>
 #include <cctype>
 
+// CONUTF8_V1: консольный вывод через WriteConsoleW — одна строка = один вызов,
+// иначе UTF-8 последовательность рвётся между вызовами WriteFile и кириллица превращается в "??".
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
+
 namespace nc::log {
 
 enum class Level : u8 {
@@ -45,6 +57,7 @@ namespace detail {
 
 inline std::mutex g_mutex;
 inline std::ofstream g_file; // WORLDSAVE_V1: файл текущего лога
+inline thread_local std::string* g_captureSink = nullptr; // RCON_BRIDGE_V1: перехват текста ответа для RCON
 
 // ── ANSI цвета ──
 constexpr const char* RESET   = "\033[0m";
@@ -104,25 +117,54 @@ inline std::string wallTime() {
         std::format("{:03d}", ms.count()));
 }
 
+// CONUTF8_V1: печатаем целую строку за один вызов. На Windows — через WriteConsoleW
+// (переводим UTF-8 -> UTF-16), чтобы консоль не ломала многобайтные символы.
+// Если вывод перенаправлен в файл/pipe — честно пишем UTF-8 байты.
+inline void writeConsole(const std::string& s) {
+#ifdef _WIN32
+    static HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (hOut != INVALID_HANDLE_VALUE && hOut != nullptr && GetConsoleMode(hOut, &mode)) {
+        const int wlen = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        if (wlen > 0) {
+            std::wstring w(static_cast<size_t>(wlen), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), wlen);
+            DWORD written = 0;
+            WriteConsoleW(hOut, w.data(), static_cast<DWORD>(w.size()), &written, nullptr);
+            return;
+        }
+    }
+#endif
+    std::fwrite(s.data(), 1, s.size(), stdout);
+    std::fflush(stdout);
+}
+
 inline void doLog(Level lv, std::string_view tag, const std::string& msg)
 {
     const char* color = levelColor(lv);
+    (void)tag; // CONUTF8_V1: тег пока не выводится — глушим C4100 на /W4
+
+    // RCON_BRIDGE_V1: если для текущего потока включён перехват (RCON-команда,
+    // исполняемая на тик-потоке), копим текст сообщения — это станет ответом RCON-клиенту.
+    if (g_captureSink) {
+        if (!g_captureSink->empty()) g_captureSink->push_back('\n');
+        g_captureSink->append(msg);
+    }
 
     std::lock_guard lock(g_mutex);
 
     // Формат как PMMP:
     // [HH:mm:ss.ms] [Server thread/LEVEL]: сообщение
-    std::cout << CYAN
-        << "[" << wallTime() << "]"
-        << RESET << " "
-        << color << BRIGHT
-        << "[Server thread/" << levelTag(lv) << "]"
-        << RESET << " "
-        << WHITE << msg << RESET
-        << "\n";
-
-    // Принудительно сбрасываем буфер
-    std::cout.flush();
+    std::string line;
+    line.reserve(96 + msg.size());
+    line += CYAN;   line += "["; line += wallTime(); line += "]";
+    line += RESET;  line += " ";
+    line += color;  line += BRIGHT;
+    line += "[Server thread/"; line += levelTag(lv); line += "]";
+    line += RESET;  line += " ";
+    line += WHITE;  line += msg; line += RESET;
+    line += "\n";
+    writeConsole(line); // CONUTF8_V1
 
     // WORLDSAVE_V1: дублируем в файл (без ANSI-цветов)
     if (g_file.is_open()) {
@@ -132,6 +174,14 @@ inline void doLog(Level lv, std::string_view tag, const std::string& msg)
 }
 
 } // namespace detail
+
+// RCON_BRIDGE_V1: включить/выключить перехват вывода NC_INFO/NC_WARN/NC_ERROR для
+// текущего (тик-)потока — используется, чтобы вернуть текст ответа RCON-клиенту.
+inline void beginCapture(std::string* sink) { detail::g_captureSink = sink; }
+inline void endCapture() { detail::g_captureSink = nullptr; }
+
+// CONUTF8_V1: сырая печать в консоль одним вызовом (без таймштампа и без записи в файл).
+inline void console(const std::string& s) { detail::writeConsole(s); }
 
 // LOGNAME_V1 (бывш. WORLDSAVE_V1): логи в файл с датой в имени, храним 15 последних.
 // rus: logs/log-20.07.26.log (ДД.ММ.ГГ), eng: logs/log-07.20.26.log (ММ.ДД.ГГ, как в США).
@@ -158,8 +208,8 @@ inline void rawLine(const std::string& s) {
 // (чтобы переписка игроков не засоряла logs/*.log).
 inline void chatLine(const std::string& s) {
     std::lock_guard<std::mutex> lock(detail::g_mutex);
-    std::cout << "[" << detail::wallTime() << "] [Server thread/CHAT] " << s << "\n";
-    std::cout.flush();
+    // CONUTF8_V1
+    detail::writeConsole("[" + detail::wallTime() + "] [Server thread/CHAT] " + s + "\n");
 }
 
 inline void initFileLog(const std::string& language = "rus") {
