@@ -1,0 +1,46 @@
+Zevvoryn Custom License (Draft v0.1)
+Copyright (c) 2026 yicekot811 and Zevvoryn contributors
+
+This license applies to all Zevvoryn source code and assets in this
+repository, EXCEPT for the third-party components listed in
+NOTICE.txt / THIRD-PARTY-NOTICES.txt (e.g. the "cubiomes" library under
+thirdparty/cubiomes/), which remain under their own original licenses.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software ("Zevvoryn") to use and modify it for personal,
+non-commercial purposes, subject to the following conditions:
+
+1. Attribution.
+   Any distributed copy or modified version must retain this license
+   file, the NOTICE.txt file, and clear credit to the original author(s)
+   of Zevvoryn.
+
+2. Non-commercial use only.
+   You may not sell, sublicense, or otherwise commercially exploit
+   Zevvoryn or derivative works based on it without prior written
+   permission from the copyright holder.
+
+3. No warranty.
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY
+   CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE USE OF THE
+   SOFTWARE.
+
+4. Third-party components.
+   Zevvoryn bundles the "cubiomes" library (thirdparty/cubiomes/),
+   Copyright Cubitect, licensed under the MIT License. See
+   thirdparty/cubiomes/LICENSE and THIRD-PARTY-NOTICES.txt for the full
+   text and terms. Nothing in this license overrides or restricts the
+   MIT License terms for that component.
+
+5. Minecraft trademark.
+   "Minecraft" is a trademark of Mojang Synergies AB / Microsoft.
+   Zevvoryn is an independent, unofficial project and is not affiliated
+   with, endorsed by, or sponsored by Mojang or Microsoft.
+
+---
+NOTE: This is a draft starting point. Tell me if you want different
+terms (e.g. allow commercial use, allow forks/redistribution, require
+source disclosure, etc.) and I will adjust the wording.

@@ -15,8 +15,12 @@ if(ENABLE_RC AND WIN32)
     enable_language(RC)
 endif()
 
-# Включаем все предупреждения
-add_compile_options(/W4 /permissive-)
+# Включаем все предупреждения (только для MSVC — флаги /W4 и т.д. clang/gcc не понимают)
+if(MSVC)
+    add_compile_options(/W4 /permissive- /utf-8)
+else()
+    add_compile_options(-Wall -Wextra)
+endif()
 
 # Статический рантайм MSVC
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

@@ -5,8 +5,8 @@ build/
 build-ninja/
 release/
 DevInfo/
+out/
 *.bak*
-*.rs
 *.exe
 *.obj
 *.o
@@ -31,7 +31,26 @@ _deps/
 build.ninja
 
 # ===========================
-# Node.js
+# Secrets - NEVER commit these
+# ===========================
+.env
+.env.*
+!.env.example
+
+# ===========================
+# Server runtime data (created next to CMakeLists.txt when run from repo root)
+# ===========================
+world/
+logs/
+crash-reports/
+ops.json
+banned-players.json
+whitelist.txt
+usercache.json
+settings.properties
+
+# ===========================
+# Node.js (Discord bot / web panel)
 # ===========================
 node_modules/
 package-lock.json
@@ -40,9 +59,6 @@ package-lock.json
 # Local dev tools
 # ===========================
 .mcp-hidden/
-server.js
-server.json
-package.json
 hotfix18_multiplayer.py
 start-mcp-hidden.ps1
 start-mcp-proxy.bat
@@ -60,4 +76,3 @@ stop-mcp.bat
 Thumbs.db
 Desktop.ini
 .DS_Store
-*.txt

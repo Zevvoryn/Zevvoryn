@@ -1,0 +1,16 @@
+Zevvoryn Minecraft Server
+Copyright 2026 yicekot811 and Zevvoryn contributors
+
+Licensed under the Zevvoryn Custom License (see LICENSE.txt in this
+folder).
+
+This product includes the "cubiomes" library
+(https://github.com/Cubitect/cubiomes), Copyright Cubitect, licensed
+under the MIT License. Used for Minecraft-compatible biome/terrain
+generation in world/anvil.cpp, world/anvil.hpp, world/biomegen.cpp, and
+world/biomegen.hpp. See thirdparty/cubiomes/LICENSE and
+THIRD-PARTY-NOTICES.txt for the full license text.
+
+"Minecraft" is a trademark of Mojang Synergies AB. Zevvoryn is an
+independent project and is NOT an official Minecraft product, and is
+not affiliated with or endorsed by Mojang or Microsoft.
