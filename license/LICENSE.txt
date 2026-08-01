@@ -39,8 +39,3 @@ non-commercial purposes, subject to the following conditions:
    "Minecraft" is a trademark of Mojang Synergies AB / Microsoft.
    Zevvoryn is an independent, unofficial project and is not affiliated
    with, endorsed by, or sponsored by Mojang or Microsoft.
-
----
-NOTE: This is a draft starting point. Tell me if you want different
-terms (e.g. allow commercial use, allow forks/redistribution, require
-source disclosure, etc.) and I will adjust the wording.
