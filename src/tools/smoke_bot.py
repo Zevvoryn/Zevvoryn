@@ -66,14 +66,28 @@ SMOKE_V13: смоук-бот для сервера Zevvoryn (Minecraft Java 1.21
   BUCKET_REUSE — survival water bucket работает place→pickup→place повторно
   MINIEDIT_SET/REPLACE/UNDO/REDO/COPY_ROTATE_PASTE — встроенный редактор и section batch packets
   MINIEDIT_OUTLINE — красная dust-рамка выделения, только рёбра
+  --- измерения и порталы (SMOKE_DIM_V1), отдельный бот SmokeBotD ---
+  PORTAL_LIT / PORTAL_NO_CORNERS — рамка без углов зажигается огнивом (PORTAL_V2)
+  PORTAL_TRAVEL / PORTAL_SCALE — переход в Ад и масштаб 1:8
+  NETHER_TERRAIN / NETHER_CEILING / NETHER_BIOMES — реальная генерация вместо флэта (DIMGEN_V1)
+  NETHER_FALLING / NETHER_FLUID — гравитация и жидкости тикают в Аду (DIMPHYS_V1)
+  END_TRAVEL / END_ISLAND / END_VOID / END_BIOMES / END_FALLING — острова Энда и физика в нём
+  ENDPORTAL_EYES / ENDPORTAL_FILL / ENDPORTAL_TRAVEL / END_PLATFORM — кольцо рамок, глаза, высадка на платформу
   MINIEDIT_WAND_NAME — деревянный топор приходит с custom_name Builder's Wand
 
 Запуск:  python tools/smoke_bot.py [--host 127.0.0.1] [--port 25565]
+         [--crowd-bots 29] [--time-scale auto|1.5] [--any-world]
+SMOKE_V15: физ-бот и dim-бот заходят первыми, а размер толпы считается по max-players
+из статус-пинга — больше никто не получает «Сервер заполнен».
+SMOKE_V14: перед прогоном проверяется, что мир действительно ФЛЭТ (иначе стоп за 20 секунд,
+а не 80 ложных FAIL), измеряется реальный TPS сервера и все ожидания растягиваются
+под слабый CPU, а все фазы (толпа + физика + измерения) идут параллельно.
 Требования: Python 3.10+, сервер в offline-режиме, pvp=true, ops пустой,
 генератор FLAT, лучше на свежем мире. Зрители на сервере не ломают
 прицеливание (боты ищут друг друга по UUID), но не бейте ботов во время прогона :)
 """
 import argparse
+import json
 import socket
 import struct
 import sys
@@ -104,6 +118,18 @@ EXPERIENCE_BOTTLE = 1088
 DIAMOND_HOE = 842      # 818 + tier4*5 + hoe (HOE_TILL_V1)
 WHEAT_SEEDS_ITEM = 853 # SEED_PLANT_V1 / BONE_MEAL_V1
 BONE_MEAL_ITEM = 960   # BONE_MEAL_V1: minecraft:bone_meal
+# SMOKE_DIM_V1: real Nether/End generation + portals
+OBSIDIAN_ITEM = 290
+SAND_ITEM = 57
+LAVA_BUCKET = 910
+END_PORTAL_FRAME_ITEM = 376
+ENDER_EYE_ITEM = 1006
+OVERWORLD_ID = "minecraft:overworld"
+NETHER_ID = "minecraft:the_nether"
+END_ID = "minecraft:the_end"
+NETHER_BIOMES = {2, 7, 34, 48, 58}   # basalt_deltas, crimson, wastes, soul_sand, warped
+END_BIOMES = {16, 17, 18, 43, 55}    # barrens, highlands, midlands, small_islands, the_end
+FALLING_BLOCK_TYPE = 40
 
 
 def enc_varint(v: int) -> bytes:
@@ -297,6 +323,7 @@ class Bot(threading.Thread):
         self.wand_name = None            # MINIEDIT_V2: custom_name component on item 821
         self.wand_color = None
         self.time_of_day = None
+        self.time_stamps = []      # SMOKE_V14: метки Update Time — по ним считается реальный TPS
         self.experience_bar = None
         self.experience_level = 0
         self.experience_total = 0
@@ -305,8 +332,18 @@ class Bot(threading.Thread):
         self.chunks_good = 0            # чанки с блоками в ожидаемой секции
         self.chunk_parse_errors = 0
         self.biome_single = None
+        self.chunk_profiles = {}   # SMOKE_DIM_V1: (cx,cz) -> block counts of every section
+        self.chunk_biomes = {}     # SMOKE_DIM_V1: (cx,cz) -> biome ids of every section
+        self.dim_name = OVERWORLD_ID  # SMOKE_DIM_V1: current dimension from Respawn 0x47
+        self.dim_changes = []
         self.in_play = threading.Event()
         self.positioned = threading.Event()
+
+    def reset_chunk_stats(self):
+        """SMOKE_DIM_V1: drop the terrain profile before entering a new dimension."""
+        with self.lock:
+            self.chunk_profiles.clear()
+            self.chunk_biomes.clear()
 
     # ---------- сеть ----------
     def _read_exact(self, n):
@@ -633,6 +670,14 @@ class Bot(threading.Thread):
             elif pid == 0x64:  # Time Update
                 r.i64()
                 self.time_of_day = r.i64()
+                with self.lock:
+                    self.time_stamps.append(time.time())   # SMOKE_V14
+            elif pid == 0x47:  # Respawn - SMOKE_DIM_V1: dimension switch
+                r.varint()
+                dim_name = r.string()
+                with self.lock:
+                    self.dim_name = dim_name
+                    self.dim_changes.append(dim_name)
             elif pid == 0x27:  # Chunk Data
                 self.parse_chunk(r)
         except Exception:
@@ -640,16 +685,23 @@ class Bot(threading.Thread):
                 self.chunk_parse_errors += 1
 
     def parse_chunk(self, r):
-        r.i32(); r.i32()
+        cx = r.i32(); cz = r.i32()   # SMOKE_DIM_V1: chunk coords feed the terrain profile
         r.nbt_skip_network()
         size = r.varint()
         sub = Reader(r.d[r.o:r.o + size])
         occ = []
+        counts = []          # SMOKE_DIM_V1
+        biomes = []          # SMOKE_DIM_V1
         biome0 = None
         for s in range(24):
+            if sub.remaining() < 3:
+                break        # SMOKE_DIM_V1: the Nether/End columns are shorter than 24 sections
             bc = sub.i16()
+            counts.append(bc)
             sv = sub.paletted()      # блоки
             bio = sub.paletted()     # биомы
+            if bio is not None:
+                biomes.append(bio)   # SMOKE_DIM_V1
             if s == self.ground_section and bio is not None:
                 biome0 = bio
             if bc > 0 or (sv is not None and sv != 0):
@@ -662,12 +714,23 @@ class Bot(threading.Thread):
                 self.chunks_good += 1
             if biome0 is not None:
                 self.biome_single = biome0
+            self.chunk_profiles[(cx, cz)] = counts   # SMOKE_DIM_V1
+            self.chunk_biomes[(cx, cz)] = biomes
 
 
 class Suite:
     def __init__(self):
         self.results = []
+        self.skipped = []        # SMOKE_V14
+        self.started = time.time()
         self.lock = threading.Lock()
+
+    def skip(self, name, info=""):
+        """SMOKE_V14: тест неприменим к этому миру — это не провал."""
+        line = "[SKIP] %s" % name + ((" — %s" % info) if info else "")
+        with self.lock:
+            print(line, flush=True)
+            self.skipped.append(name)
 
     def check(self, name, ok, info=""):
         mark = "PASS" if ok else "FAIL"
@@ -681,7 +744,10 @@ class Suite:
             passed = sum(1 for _, ok in self.results if ok)
             failed = len(self.results) - passed
             print("-" * 60, flush=True)
-            print(f"Итог: {passed} PASS, {failed} FAIL из {len(self.results)}", flush=True)
+            mins, secs = divmod(int(time.time() - self.started), 60)
+            skipped = len(self.skipped)
+            print(f"Итог: {passed} PASS, {failed} FAIL, {skipped} SKIP из {len(self.results) + skipped}"
+                  f" — прогон занял {mins} мин {secs} с", flush=True)
         return failed == 0
 
 
@@ -1608,20 +1674,423 @@ def run_physics_phase(s, args, ground_section, grass_y):
     run_throwable_test(EXPERIENCE_BOTTLE, 37, "XP_BOTTLE", expect_xp=True)
 
 
+# ---------------------------------------------------------------- SMOKE_DIM_V1
+def dim_wait(bot, name, timeout=25.0):
+    """Waits for a Respawn packet that puts the bot into the given dimension."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if bot.dim_name == name:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def region_set(bot, x1, y1, z1, x2, y2, z2, block, settle=0.55):
+    """MiniEdit cuboid fill: //pos1 -> //pos2 -> //set <block>."""
+    bot.send_pos_raw(x1 + 0.5, y1, z1 + 0.5, True); time.sleep(0.22)
+    bot.send_command("/pos1"); time.sleep(0.22)
+    bot.send_pos_raw(x2 + 0.5, y2, z2 + 0.5, True); time.sleep(0.22)
+    bot.send_command("/pos2"); time.sleep(0.22)
+    bot.send_command("set " + block); time.sleep(settle)
+
+
+def terrain_report(bot):
+    """Flat preset => every column looks identical; real generation varies."""
+    with bot.lock:
+        profiles = {k: list(v) for k, v in bot.chunk_profiles.items()}
+        biome_map = {k: list(v) for k, v in bot.chunk_biomes.items()}
+    biomes = set()
+    for v in biome_map.values():
+        biomes.update(v)
+    columns = varied = empty = 0
+    sections = set()
+    tops = []
+    signatures = set()
+    for counts in profiles.values():
+        nonzero = [i for i, c in enumerate(counts) if c > 0]
+        if not nonzero:
+            empty += 1
+            continue
+        columns += 1
+        sections.update(nonzero)
+        tops.append(nonzero[-1])
+        signatures.add(tuple(counts))
+        partial = [c for c in counts if 0 < c < 4096]
+        if len(set(partial)) >= 2:
+            varied += 1
+    return {
+        "chunks": len(profiles), "columns": columns, "empty": empty,
+        "varied": varied, "sections": sections, "tops": tops,
+        "signatures": len(signatures), "biomes": biomes,
+    }
+
+
+def falling_probe(bot, s, px, py, pz, label):
+    """Places sand next to a floating block: gravity must run in this dimension."""
+    region_set(bot, px + 2, py + 4, pz, px + 2, py + 4, pz, "obsidian")
+    bot.set_creative_slot(36, SAND_ITEM); time.sleep(0.4)
+    with bot.lock:
+        known = set(bot.entity_types)
+    bot.place_block(px + 2, py + 4, pz, face=4)   # west face -> sand hangs in the air
+    time.sleep(2.0)
+    with bot.lock:
+        fresh = [eid for eid, t in bot.entity_types.items()
+                 if t == FALLING_BLOCK_TYPE and eid not in known]
+    s.check(label, len(fresh) >= 1,
+            "FallingBlockEntity: %d (гравитация вне оверворлда)" % len(fresh))
+
+
+def run_dimension_phase(s, args, ground_section, grass_y):
+    """SMOKE_DIM_V1: real Nether/End terrain, corner-less Nether portal, End portal."""
+    d = Bot("SmokeBotD", args.host, args.port, ground_section)
+    d.start()
+    if not d.in_play.wait(30) or d.error:
+        s.check("DIM_LOGIN", False, d.error or "таймаут входа dim-бота")
+        return
+    d.positioned.wait(20)
+    time.sleep(4.0)
+    if d.pos is None:
+        s.check("DIM_LOGIN", False, "нет позиции dim-бота")
+        return
+    s.check("DIM_LOGIN", True, "dim-бот в игре, Y=%.1f" % d.pos[1])
+    d.send_command("gm1 SmokeBotD")   # creative: one-tick portal delay
+    time.sleep(0.9)
+
+    # ---------------- corner-less Nether portal (PORTAL_V2) ----------------
+    wx, wz = 700, 700
+    y0 = int(d.pos[1]) + 1   # SMOKE_V14: от реальной высоты бота, а не от высоты флэт-травы
+    base_y = y0
+    for _ in range(6):
+        d.send_pos_raw(wx + 0.5, y0, wz + 0.5, True); time.sleep(0.3)
+    time.sleep(2.0)   # wait for the work-area chunks
+
+    region_set(d, wx - 2, y0 - 1, wz - 1, wx + 3, y0 + 5, wz + 1, "air")
+    region_set(d, wx - 2, y0 - 2, wz - 1, wx + 3, y0 - 2, wz + 1, "obsidian")   # SMOKE_V14: опора в любом мире
+    region_set(d, wx, y0 - 1, wz, wx + 1, y0 - 1, wz, "obsidian")      # floor
+    region_set(d, wx, y0 + 3, wz, wx + 1, y0 + 3, wz, "obsidian")      # ceiling
+    region_set(d, wx - 1, y0, wz, wx - 1, y0 + 2, wz, "obsidian")      # left column
+    region_set(d, wx + 2, y0, wz, wx + 2, y0 + 2, wz, "obsidian")      # right column
+    # the four corners stay air on purpose - vanilla does not need them
+
+    inner = {(wx + dx, y0 + dy, wz) for dx in (0, 1) for dy in (0, 1, 2)}
+    with d.lock:
+        mark = len(d.block_updates)
+    d.set_creative_slot(36, FLINT_AND_STEEL); time.sleep(0.5)
+    d.place_block(wx, y0 - 1, wz, face=1)   # click the floor -> ignite the cell above
+    time.sleep(1.6)
+    with d.lock:
+        fresh = list(d.block_updates[mark:])
+    lit = {(x, y, z): st for x, y, z, st in fresh if (x, y, z) in inner and st != 0}
+    states = set(lit.values())
+    ok_lit = len(lit) == 6 and len(states) == 1
+    s.check("PORTAL_LIT", ok_lit,
+            "портальных блоков %d/6, states=%s" % (len(lit), sorted(states)))
+    s.check("PORTAL_NO_CORNERS", ok_lit,
+            "рамка без угловых блоков зажигается" if ok_lit else "без углов портал не зажёгся")
+
+    # ---------------- travel to the Nether ----------------
+    d.reset_chunk_stats()
+    for _ in range(12):
+        d.send_pos_raw(wx + 0.5, y0, wz + 0.5, True)
+        time.sleep(0.3)
+        if d.dim_name == NETHER_ID:
+            break
+    in_nether = dim_wait(d, NETHER_ID, 20)
+    s.check("PORTAL_TRAVEL", in_nether, "dimension=%s" % d.dim_name)
+    if not in_nether:
+        return
+    time.sleep(3.0)
+    scaled = abs(d.pos[0] - (wx + 0.5) / 8.0) <= 40 and abs(d.pos[2] - (wz + 0.5) / 8.0) <= 40
+    s.check("PORTAL_SCALE", scaled,
+            "1:8 — прибытие (%.1f, %.1f, %.1f)" % d.pos)
+
+    time.sleep(5.0)   # let the Nether chunks stream in
+    rep = terrain_report(d)
+    s.check("NETHER_TERRAIN", rep["varied"] >= 3 and rep["signatures"] >= 4,
+            "чанков %d, разных профилей %d, неровных %d (флэт дал бы 1 профиль)"
+            % (rep["chunks"], rep["signatures"], rep["varied"]))
+    tops = rep["tops"]
+    roof = bool(tops) and tops.count(max(set(tops), key=tops.count)) >= max(1, int(len(tops) * 0.8))
+    s.check("NETHER_CEILING", roof and len(rep["sections"]) >= 4,
+            "верхние секции %s, всего секций %d" % (sorted(set(tops)), len(rep["sections"])))
+    nether_biomes = rep["biomes"] & NETHER_BIOMES
+    s.check("NETHER_BIOMES", len(nether_biomes) >= 1 and 39 not in rep["biomes"],
+            "биомы %s (ожидались %s)" % (sorted(rep["biomes"]), sorted(NETHER_BIOMES)))
+
+    # ---------------- physics inside the Nether ----------------
+    px, py, pz = int(d.pos[0]), int(d.pos[1]), int(d.pos[2])
+    region_set(d, px - 3, py, pz - 3, px + 3, py + 6, pz + 3, "air")
+    region_set(d, px - 3, py - 1, pz - 3, px + 3, py - 1, pz + 3, "obsidian")
+    falling_probe(d, s, px, py, pz, "NETHER_FALLING")
+
+    d.set_creative_slot(36, LAVA_BUCKET); time.sleep(0.4)
+    with d.lock:
+        mark = len(d.block_updates)
+    d.place_block(px, py - 1, pz, face=1)
+    time.sleep(3.5)
+    with d.lock:
+        fresh = list(d.block_updates[mark:])
+    spread = {(x, z) for x, y, z, st in fresh if y == py and st != 0 and (x, z) != (px, pz)}
+    s.check("NETHER_FLUID", len(spread) >= 2,
+            "лава растеклась на %d клеток (tickFluidsIn в Аду)" % len(spread))
+
+    # ---------------- the End: island + void ----------------
+    d.reset_chunk_stats()
+    d.send_command("end")
+    in_end = dim_wait(d, END_ID, 25)
+    s.check("END_TRAVEL", in_end, "dimension=%s" % d.dim_name)
+    if in_end:
+        time.sleep(6.0)
+        rep = terrain_report(d)
+        s.check("END_ISLAND", rep["varied"] >= 1 and rep["columns"] >= 1,
+                "чанков с рельефом %d, разных профилей %d" % (rep["columns"], rep["signatures"]))
+        s.check("END_VOID", rep["empty"] >= 1,
+                "пустых чанков вокруг острова: %d" % rep["empty"])
+        s.check("END_BIOMES", len(rep["biomes"] & END_BIOMES) >= 1,
+                "биомы %s" % sorted(rep["biomes"]))
+        if d.pos is not None:
+            ex, ey, ez = int(d.pos[0]), int(d.pos[1]), int(d.pos[2])
+            region_set(d, ex - 3, ey, ez - 3, ex + 3, ey + 6, ez + 3, "air")
+            region_set(d, ex - 3, ey - 1, ez - 3, ex + 3, ey - 1, ez + 3, "obsidian")
+            falling_probe(d, s, ex, ey, ez, "END_FALLING")
+
+    # ---------------- End portal frames + eyes (ENDPORTAL_V1) ----------------
+    d.send_command("overworld")
+    if not dim_wait(d, OVERWORLD_ID, 25):
+        s.check("ENDPORTAL_EYES", False, "не вернулись в оверворлд")
+        return
+    time.sleep(2.5)
+    cx, cz = 800, 800
+    fy = base_y   # SMOKE_V14
+    for _ in range(6):
+        d.send_pos_raw(cx + 0.5, fy, cz + 0.5, True); time.sleep(0.3)
+    time.sleep(2.0)
+    region_set(d, cx - 3, fy, cz - 3, cx + 3, fy + 4, cz + 3, "air")
+    region_set(d, cx - 3, fy - 1, cz - 3, cx + 3, fy - 1, cz + 3, "obsidian")   # SMOKE_V14
+    region_set(d, cx - 2, fy, cz - 1, cx - 2, fy, cz + 1, "end_portal_frame")
+    region_set(d, cx + 2, fy, cz - 1, cx + 2, fy, cz + 1, "end_portal_frame")
+    region_set(d, cx - 1, fy, cz - 2, cx + 1, fy, cz - 2, "end_portal_frame")
+    region_set(d, cx - 1, fy, cz + 2, cx + 1, fy, cz + 2, "end_portal_frame")
+
+    ring = ([(cx - 2, cz + i) for i in (-1, 0, 1)] + [(cx + 2, cz + i) for i in (-1, 0, 1)]
+            + [(cx + i, cz - 2) for i in (-1, 0, 1)] + [(cx + i, cz + 2) for i in (-1, 0, 1)])
+    centre = {(cx + i, fy, cz + j) for i in (-1, 0, 1) for j in (-1, 0, 1)}
+    with d.lock:
+        mark = len(d.block_updates)
+    d.set_creative_slot(36, ENDER_EYE_ITEM); time.sleep(0.5)
+    for fx, fz in ring:
+        d.place_block(fx, fy, fz, face=1)
+        time.sleep(0.28)
+    time.sleep(2.0)
+    with d.lock:
+        fresh = list(d.block_updates[mark:])
+    eyed = {(x, z) for x, y, z, st in fresh if y == fy and (x, z) in ring and st != 0}
+    filled = {(x, y, z): st for x, y, z, st in fresh if (x, y, z) in centre and st != 0}
+    s.check("ENDPORTAL_EYES", len(eyed) >= 12,
+            "рамок с глазом %d/12" % len(eyed))
+    s.check("ENDPORTAL_FILL", len(filled) == 9 and len(set(filled.values())) == 1,
+            "блоков портала %d/9, states=%s" % (len(filled), sorted(set(filled.values()))))
+
+    time.sleep(16.0)   # portal cooldown after the Nether trip (300 ticks)
+    for _ in range(12):
+        d.send_pos_raw(cx + 0.5, fy, cz + 0.5, True)
+        time.sleep(0.3)
+        if d.dim_name == END_ID:
+            break
+    arrived = dim_wait(d, END_ID, 20)
+    s.check("ENDPORTAL_TRAVEL", arrived, "dimension=%s" % d.dim_name)
+    if arrived:
+        time.sleep(3.0)
+        x, y, z = d.pos
+        s.check("END_PLATFORM", abs(x - 100.5) < 3 and abs(z - 0.5) < 3 and 46 <= y <= 54,
+                "высадка (%.1f, %.1f, %.1f), ждали (100.5, 49, 0.5)" % (x, y, z))
+        s.check("END_ALIVE", d.health > 0.0, "хп после высадки: %.1f" % d.health)
+    d.send_command("overworld")
+
+
+# ------------------------------------------------------------- SMOKE_V14
+_REAL_SLEEP = time.sleep
+
+
+def install_time_scale(scale):
+    """Растягивает ВСЕ ожидания сразу: на слабом CPU сервер не успевает за 20 tps."""
+    if abs(scale - 1.0) < 0.05:
+        return
+
+    def scaled(seconds):
+        _REAL_SLEEP(seconds * scale)
+
+    time.sleep = scaled
+
+
+def measure_tps(bot, window=8.0):
+    """Сервер шлёт Update Time каждые 20 тиков, так что интервал = 20 / tps."""
+    with bot.lock:
+        bot.time_stamps.clear()
+    _REAL_SLEEP(window)
+    with bot.lock:
+        stamps = list(bot.time_stamps)
+    if len(stamps) < 3:
+        return None, None
+    gaps = sorted(b - a for a, b in zip(stamps, stamps[1:]))
+    median = gaps[len(gaps) // 2]
+    if median <= 0.05:
+        return None, None
+    return 20.0 / median, median
+
+
+def calibrate(args, bot):
+    """SMOKE_V14: автоподстройка под реальный TPS сервера."""
+    if args.time_scale != "auto":
+        scale = max(0.5, min(6.0, float(args.time_scale)))
+        print("[LAG] ручной множитель ожиданий x%.2f" % scale, flush=True)
+        install_time_scale(scale)
+        return scale
+    tps, median = measure_tps(bot)
+    if tps is None:
+        print("[LAG] TPS не измерился (нет Update Time), берём x1.5", flush=True)
+        install_time_scale(1.5)
+        return 1.5
+    scale = max(1.0, min(4.0, median))
+    print("[LAG] сервер даёт ~%.1f tps -> все ожидания x%.2f" % (tps, scale), flush=True)
+    install_time_scale(scale)
+    return scale
+
+
+def world_precheck(s, bot, args, spawn_y):
+    """SMOKE_V14: большинство тестов ждёт свежий ФЛЭТ-мир.
+
+    На обычном мире они дают десятки ложных FAIL: боты строят в толще камня
+    на Y=4, а земля там на Y=112. Лучше честно остановиться через 20 секунд,
+    чем гнать 10 минут и получить фейковый отчёт.
+    """
+    y_ok = bot.pos is not None and abs(bot.pos[1] - spawn_y) < 0.01
+    chunks_ok = bot.chunks_total > 0 and bot.chunks_bad == 0
+    biome_ok = bot.biome_single == 39
+    y_info = ("спавн Y=%s (ожидался %s); если тут -60 — старый world/spawn.dat"
+              % (bot.pos[1] if bot.pos else '?', spawn_y))
+    chunk_info = ("чанков: %d, старых (блоки на -64..-49): %d, на родной высоте: %d, ошибок парсинга: %d"
+                  % (bot.chunks_total, bot.chunks_bad, bot.chunks_good, bot.chunk_parse_errors))
+    biome_info = "биом секции земли: %s (ожидался plains=39)" % bot.biome_single
+    flat = y_ok and chunks_ok and biome_ok
+    if flat or not args.any_world:
+        s.check("SPAWN_Y", y_ok, y_info)
+        s.check("CHUNKS", chunks_ok, chunk_info)
+        s.check("BIOME", biome_ok, biome_info)
+    else:
+        s.skip("SPAWN_Y", y_info)
+        s.skip("CHUNKS", chunk_info)
+        s.skip("BIOME", biome_info)
+    if flat:
+        return True
+    print("", flush=True)
+    print("=" * 70, flush=True)
+    print("ЭТО НЕ ФЛЭТ-МИР (или мир не свежий).", flush=True)
+    print("Боты строят и ломают на Y=%d; если там камень или воздух, почти всё упадёт зря." % args.grass_y, flush=True)
+    print("Нужно: level-type=FLAT, чистая папка world/, или запуск с --grass-y под ваш мир.", flush=True)
+    print("Флаг --any-world запустит прогон всё равно (результаты будут ненадёжными).", flush=True)
+    print("=" * 70, flush=True)
+    return bool(args.any_world)
+
+
+def server_status(host, port, timeout=5.0):
+    """SMOKE_V15: обычный server list ping — узнаём max-players ДО того, как забьём слоты."""
+    sock = None
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(timeout)
+        host_b = host.encode("utf-8")
+        payload = (enc_varint(0x00) + enc_varint(PROTOCOL) + enc_varint(len(host_b)) + host_b
+                   + struct.pack(">H", port) + enc_varint(1))
+        sock.sendall(enc_varint(len(payload)) + payload)
+        req = enc_varint(0x00)
+        sock.sendall(enc_varint(len(req)) + req)
+
+        def read_varint():
+            num = 0
+            shift = 0
+            while True:
+                chunk = sock.recv(1)
+                if not chunk:
+                    raise ConnectionError("status: соединение закрыто")
+                byte = chunk[0]
+                num |= (byte & 0x7F) << shift
+                if not (byte & 0x80):
+                    return num
+                shift += 7
+
+        length = read_varint()
+        data = b""
+        while len(data) < length:
+            chunk = sock.recv(length - len(data))
+            if not chunk:
+                break
+            data += chunk
+        r = Reader(data)
+        r.varint()          # packet id 0x00
+        return json.loads(r.string())
+    except Exception:
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+RESERVED_SLOTS = 5   # SmokeBotA, SmokeBotB, SmokeBotC, физ-бот, dim-бот
+
+
+def plan_crowd_size(args, s):
+    """SMOKE_V15: считаем бюджет слотов.
+
+    Раньше толпа съедала все слоты, и физ-бот с dim-ботом получали «Сервер
+    заполнен» — половина прогона просто не выполнялась.
+    """
+    status = server_status(args.host, args.port)
+    if not status:
+        print("[SLOTS] статус-пинг не ответил, берём crowd как есть", flush=True)
+        return args.crowd_bots, None
+    try:
+        max_players = int(status["players"]["max"])
+        online = int(status["players"]["online"])
+    except Exception:
+        return args.crowd_bots, None
+    allowed = max_players - online - RESERVED_SLOTS
+    if allowed < 0:
+        allowed = 0
+    if args.crowd_bots <= allowed:
+        print("[SLOTS] max-players=%d, занято %d, crowd=%d, резерв %d слотов под фазовые боты"
+              % (max_players, online, args.crowd_bots, RESERVED_SLOTS), flush=True)
+        return args.crowd_bots, max_players
+    print("", flush=True)
+    print("[SLOTS] max-players=%d — на %d crowd-ботов места не хватит." % (max_players, args.crowd_bots), flush=True)
+    print("[SLOTS] снижаю толпу до %d, чтобы остались слоты под физ-бота, dim-бота и бота C." % allowed, flush=True)
+    print("[SLOTS] чтобы гнать все %d: поставьте max-players=%d в server.properties."
+          % (args.crowd_bots, args.crowd_bots + RESERVED_SLOTS), flush=True)
+    print("", flush=True)
+    return allowed, max_players
+
+
 def main():
     ap = argparse.ArgumentParser(description="Zevvoryn smoke bot (1.21.1)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=25565)
     ap.add_argument("--grass-y", type=int, default=3,
                     help="ожидаемый Y травы флэта (FLATNATIVE_V1: 3)")
-    ap.add_argument("--crowd-bots", type=int, default=15,
-                    help="дополнительные активные боты: все делятся по кругу на 8 заданий А-З (CROWD_SWARM_V5: добавлен З-бамбук через /warprandomtick), никто не остаётся в gm3")
+    ap.add_argument("--crowd-bots", type=int, default=29,
+                    help="дополнительные активные боты (SMOKE_V14: по умолчанию 29, все работают параллельно по 8 заданиям А-З)")
+    ap.add_argument("--time-scale", default="auto",
+                    help="SMOKE_V14: множитель всех ожиданий. auto = считается по реальному TPS сервера")
+    ap.add_argument("--any-world", action="store_true",
+                    help="SMOKE_V14: не останавливаться, если мир не флэт (результаты будут ненадёжными)")
     args = ap.parse_args()
 
     ground_section = (args.grass_y + 64) // 16
     spawn_y = args.grass_y + 1
     s = Suite()
-    print(f"SMOKE_V13: сервер {args.host}:{args.port}, ожидаем траву на Y={args.grass_y}, спавн Y={spawn_y}, crowd={args.crowd_bots}", flush=True)
+    print(f"SMOKE_V15: сервер {args.host}:{args.port}, ожидаем траву на Y={args.grass_y}, спавн Y={spawn_y}, crowd={args.crowd_bots}", flush=True)
 
     a = Bot("SmokeBotA", args.host, args.port, ground_section)
     b = Bot("SmokeBotB", args.host, args.port, ground_section)
@@ -1637,17 +2106,57 @@ def main():
         sys.exit(1)
     s.check("LOGIN", True, "оба бота в игре")
 
+    # SMOKE_V14: сначала убеждаемся, что мир вообще тот, под который написаны тесты,
+    # и только потом зовём толпу и мучаем слабый CPU десять минут.
+    a.positioned.wait(20)
+    b.positioned.wait(20)
+    _REAL_SLEEP(6)   # даём чанкам доехать
+    if not world_precheck(s, a, args, spawn_y):
+        s.summary()
+        sys.exit(2)
+
+    # SMOKE_V14: замеряем TPS до нагрузки и растягиваем все ожидания под машину.
+    calibrate(args, a)
+
+    # SMOKE_V15: фазовые боты заходят ПЕРВЫМИ — иначе толпа съедает все слоты
+    # и целые фазы (физика, порталы) падают с «Сервер заполнен».
+    physics_thread = threading.Thread(
+        target=run_physics_phase,
+        args=(s, args, ground_section, args.grass_y),
+        daemon=True,
+    )
+    physics_thread.start()
+    dimension_thread = threading.Thread(
+        target=run_dimension_phase,
+        args=(s, args, ground_section, args.grass_y),
+        daemon=True,
+    )
+    dimension_thread.start()
+    _REAL_SLEEP(3.0)   # даём им взять свои слоты
+
+    planned, max_players = plan_crowd_size(args, s)
+
     crowd = []
-    for i in range(args.crowd_bots):
+    server_full = False
+    for i in range(planned):
         bot = Bot(f"SmokeCrowd{i + 1:02d}", args.host, args.port, ground_section)
         crowd.append(bot)
         bot.start()
         time.sleep(0.05)
+        if any(b.error and "заполнен" in b.error for b in crowd):
+            server_full = True
+            print("[SLOTS] сервер сказал «заполнен» на боте %d — больше не зовём" % (i + 1), flush=True)
+            break
     for bot in crowd:
         bot.in_play.wait(30)
     crowd_ok = [bot for bot in crowd if bot.error is None and bot.in_play.is_set()]
-    s.check("CROWD_BOTS", len(crowd_ok) == args.crowd_bots,
-            f"crowd online: {len(crowd_ok)}/{args.crowd_bots}")
+    if server_full or planned < args.crowd_bots:
+        s.skip("CROWD_BOTS",
+               f"в игре {len(crowd_ok)} из запрошенных {args.crowd_bots}: мало слотов "
+               f"(max-players={max_players if max_players else '?'}), это настройка сервера, а не баг")
+    else:
+        s.check("CROWD_BOTS", len(crowd_ok) == planned,
+                f"crowd online: {len(crowd_ok)}/{planned}")
 
     # CROWD_SWARM_V3: раньше только первые 4 crowd-бота реально работали, а
     # остальные сразу уходили в gm3 (креатив) и просто стояли без дела до конца
@@ -1681,17 +2190,7 @@ def main():
     s.check("CROWD_SWARM", len(swarm_threads) == len(crowd_ok),
             f"активных рабочих ботов: {len(swarm_threads)}/{len(crowd_ok)} (задания А-З, никто не простаивает в gm3)")
 
-    a.positioned.wait(20)
-    b.positioned.wait(20)
-    time.sleep(6)  # даём чанкам доехать
-
-    s.check("SPAWN_Y", a.pos is not None and abs(a.pos[1] - spawn_y) < 0.01,
-            f"спавн Y={a.pos[1] if a.pos else '?'} (ожидался {spawn_y}); если тут -60 — старый world/spawn.dat")
-    s.check("CHUNKS", a.chunks_total > 0 and a.chunks_bad == 0,
-            f"чанков: {a.chunks_total}, старых (блоки на -64..-49): {a.chunks_bad}, "
-            f"на родной высоте: {a.chunks_good}, ошибок парсинга: {a.chunk_parse_errors}")
-    s.check("BIOME", a.biome_single == 39,
-            f"биом секции земли: {a.biome_single} (ожидался plains=39)")
+    # SMOKE_V14: SPAWN_Y / CHUNKS / BIOME уже проверены в world_precheck до входа толпы
 
     # оба в выживание и фиксируем позиции
     b.send_command("gm0 SmokeBotA")
@@ -1833,12 +2332,6 @@ def main():
             f"удар во время кд щита: урон {drop:.2f} (должен проходить)")
 
     # PHYS_PARALLEL_V1: физический пакет гоняем параллельно с combat/time.
-    physics_thread = threading.Thread(
-        target=run_physics_phase,
-        args=(s, args, ground_section, args.grass_y),
-        daemon=True,
-    )
-    physics_thread.start()
 
     # SHIELD_RECOVER: через 5 с кд истёк — щит снова блокирует
     time.sleep(5.5)
@@ -1855,6 +2348,7 @@ def main():
     s.check("TIME", t is not None and 6000 <= t <= 6300, f"time у A: {t}")
 
     physics_thread.join()
+    dimension_thread.join()   # SMOKE_DIM_V1
     for th in swarm_threads:
         th.join()
 

@@ -61,6 +61,13 @@ public:
     i64 pendingKeepAliveId = 0;
     bool awaitingKeepAlive = false;
     i64 keepAliveSentAtMs = 0;
+    // PINGSTAT_V1: последний измеренный round-trip игрока в мс (-1 = ещё не знаем).
+    // Считается по ответу на Keep Alive: id пакета и есть метка отправки.
+    i32 pingMs = -1;
+
+    // COMBAT_V8: ванильные Enter/End Combat Event (0x3B / 0x3A)
+    bool inCombat = false;
+    i64 combatStartMs = 0;
 
     // LIGHT_V1: какие чанки уже отправлены игроку (чтобы не слать их повторно)
     static u64 chunkKey(i32 cx, i32 cz) {
@@ -111,7 +118,12 @@ public:
     static constexpr int INV_SIZE = 46;
     i32 invItemId[INV_SIZE] = {};
     i32 invCount[INV_SIZE] = {};
+    std::string invCustomName[INV_SIZE]; // ALLPACKETS_V3: Edit Book / Rename Item persist a real per-slot custom name
     bool builderWandOwned = false; // MINIEDIT_V4: persists named wand across reconnects
+    // ALLPACKETS_V3: real per-player recipe book UI state (Recipe Book Settings / Seen Recipe)
+    bool recipeBookOpen = false;
+    bool recipeBookFilterActive = false;
+    std::unordered_set<std::string> seenRecipes;
     // PLAYER_VIS_V1: состояние приседа/спринта для метаданных сущности
     bool sneaking = false;
     bool sprinting = false;
@@ -135,6 +147,9 @@ public:
     std::vector<u8> encVerifyToken; // ONLINE_V1: verify token sent in EncryptionRequest
     bool tpsBossbarShown = false;
     i32 tpsBossbarColor = -1; // BOSSCOLOR_V1: последний отправленный цвет бара (при смене шлём UPDATE_STYLE)
+    // JOINSAFE_V1: true только после того, как клиенту ушёл Login (Play) и у него есть мир.
+    // До этого любой мировой пакет = NullPointerException и Network Protocol Error.
+    bool playReady = false;
     bool tabHeaderFooterSent = false; // TABLIST_V2: новый/перезашедший игрок должен получить header/footer даже без смены payload
 
     // SKIN_V1: game-profile "textures" property (skin + cape). Forwarded to other

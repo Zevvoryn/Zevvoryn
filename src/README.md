@@ -75,7 +75,7 @@ cmake --build build
 
 При первом запуске (когда рядом нет `settings.properties`) стартует мастер настройки:
 язык, порт, seed, режим игры, сложность, максимум игроков, whitelist, RCON, Discord-бот и веб-панель.
-По завершении мастер сам создаст `settings.properties`, а при необходимости — папку `DiscrordBotRcon`
+По завершении мастер сам создаст `settings.properties`, а при необходимости — папку `DiscordBotRcon`
 с файлами бота и готовым `.env`.
 
 ```
@@ -147,12 +147,12 @@ rcon.password=ваш_пароль
 auto-start-panel=true
 ```
 
-При `auto-start-panel=true` сервер сам поднимет `DiscrordBotRcon/index.js` и **синхронизирует** его `.env`
+При `auto-start-panel=true` сервер сам поднимет `DiscordBotRcon/index.js` и **синхронизирует** его `.env`
 с актуальными настройками RCON, так что пароли не разъезжаются.
 
 Веб-панель по умолчанию: **http://127.0.0.1:3000**
 
-### DiscrordBotRcon/.env
+### DiscordBotRcon/.env
 
 | Переменная | Назначение |
 |---|---|
@@ -195,7 +195,7 @@ src/
   crypto/             шифрование и хеши
   utils/              вспомогательные утилиты
   thirdparty/cubiomes генератор биомов
-DiscrordBotRcon/      Discord-бот и веб-панель (Node.js)
+DiscordBotRcon/      Discord-бот и веб-панель (Node.js)
 ```
 
 ---

@@ -80,10 +80,101 @@ inline std::string tabToUtf8(const std::string& s) {
 // TABSERVER_V1: готовит папку tab_Server (инструкция + tab.properties) и возвращает распарсенный конфиг.
 // Читается заново при каждом вызове (файл маленький, а broadcastTabListHeaderFooter шлётся не каждый тик) —
 // это позволяет менять настройки без перезапуска сервера.
+// CFGDOC_V1: рядом с конфигом кладётся файл-инструкция. Имя и текст — на языке сервера
+// (language= в settings.properties), том же, на котором говорит консоль.
+// Имя файла собирается через char8_t: на Windows узкий путь трактуется как ANSI,
+// и кириллица в имени превратилась бы в мусор. BOM в начале — чтобы старый
+// Блокнот не показал текст крякозябрами.
+inline void writeConfigDoc(const char* folder, bool ru, const std::string& text) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const char8_t* fileName = ru ? u8"ИНСТРУКЦИЯ.txt" : u8"HOW-TO.txt";
+    const fs::path docPath = fs::path(folder) / fs::path(fileName);
+    if (fs::exists(docPath, ec)) return;
+    std::ofstream out(docPath, std::ios::binary);
+    if (!out.is_open()) return;
+    out << "\xEF\xBB\xBF" << text;
+}
+
 inline TabConfig loadTabConfig(bool ru) {
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::create_directories("tab_Server", ec);
+
+    // CFGDOC_V1: инструкция рядом с конфигом — на языке сервера
+    writeConfigDoc("tab_Server", ru, ru
+        ? std::string(
+            "ПАПКА tab_Server — настройка таб-листа\r\n"
+            "====================================================\r\n"
+            "\r\n"
+            "Таб-лист — это список игроков, который открывается клавишей Tab.\r\n"
+            "Всё настраивается в файле tab.properties рядом с этой инструкцией.\r\n"
+            "Файл перечитывается на ходу — перезапуск сервера не нужен.\r\n"
+            "Сохраняй его в кодировке UTF-8 (в Блокноте: Сохранить как -> UTF-8).\r\n"
+            "Удалишь этот файл или tab.properties — сервер создаст их заново.\r\n"
+            "\r\n"
+            "НАСТРОЙКИ tab.properties\r\n"
+            "----------------------------------------------------\r\n"
+            "disable         true  — кастомный таб-лист выключен, клиент рисует обычный\r\n"
+            "                        ванильный список без шапки и подвала.\r\n"
+            "                false — кастомный таб-лист включён (по умолчанию).\r\n"
+            "\r\n"
+            "name            Имя сервера в шапке таб-листа. Можно с цветами: name=§bZevvoryn\r\n"
+            "show-online     true — показывать строку \"Игроков онлайн: N\".\r\n"
+            "extra-line-N    Свои строки в подвале, по порядку N = 1, 2, 3...\r\n"
+            "                Пустые строки пропускаются, количество не ограничено.\r\n"
+            "\r\n"
+            "ЦВЕТА И СТИЛИ\r\n"
+            "----------------------------------------------------\r\n"
+            "§0 чёрный    §1 тёмно-синий  §2 тёмно-зелёный  §3 бирюзовый\r\n"
+            "§4 тёмно-красный  §5 фиолетовый  §6 золотой  §7 серый\r\n"
+            "§8 тёмно-серый  §9 синий  §a зелёный  §b голубой\r\n"
+            "§c красный  §d розовый  §e жёлтый  §f белый\r\n"
+            "§l жирный  §o курсив  §n подчёркнутый  §r сброс форматирования\r\n"
+            "\r\n"
+            "ПРИМЕР\r\n"
+            "----------------------------------------------------\r\n"
+            "disable=false\r\n"
+            "name=§b§lZevvoryn\r\n"
+            "show-online=true\r\n"
+            "extra-line-1=§7Сайт: example.com\r\n"
+            "extra-line-2=§eПриятной игры!\r\n")
+        : std::string(
+            "FOLDER tab_Server — tab list settings\r\n"
+            "====================================================\r\n"
+            "\r\n"
+            "The tab list is the player list opened with the Tab key.\r\n"
+            "Everything is configured in tab.properties next to this file.\r\n"
+            "It is re-read while the server runs — no restart needed.\r\n"
+            "Save it as UTF-8 (Notepad: Save As -> UTF-8).\r\n"
+            "Delete this file or tab.properties and the server recreates them.\r\n"
+            "\r\n"
+            "tab.properties KEYS\r\n"
+            "----------------------------------------------------\r\n"
+            "disable         true  — custom tab list off, the client draws the plain\r\n"
+            "                        vanilla list with no header and no footer.\r\n"
+            "                false — custom tab list on (default).\r\n"
+            "\r\n"
+            "name            Server name in the tab list header. Colours allowed: name=§bZevvoryn\r\n"
+            "show-online     true — show the \"Players online: N\" line.\r\n"
+            "extra-line-N    Your own footer lines, in order N = 1, 2, 3...\r\n"
+            "                Empty lines are skipped, the count is not limited.\r\n"
+            "\r\n"
+            "COLOURS AND STYLES\r\n"
+            "----------------------------------------------------\r\n"
+            "§0 black     §1 dark blue   §2 dark green   §3 dark aqua\r\n"
+            "§4 dark red  §5 purple      §6 gold        §7 gray\r\n"
+            "§8 dark gray §9 blue        §a green       §b aqua\r\n"
+            "§c red       §d pink        §e yellow      §f white\r\n"
+            "§l bold  §o italic  §n underline  §r reset formatting\r\n"
+            "\r\n"
+            "EXAMPLE\r\n"
+            "----------------------------------------------------\r\n"
+            "disable=false\r\n"
+            "name=§b§lZevvoryn\r\n"
+            "show-online=true\r\n"
+            "extra-line-1=§7Website: example.com\r\n"
+            "extra-line-2=§eHave fun!\r\n"));
 
     const char* cfgPath = "tab_Server/tab.properties";
     if (!fs::exists(cfgPath, ec)) {

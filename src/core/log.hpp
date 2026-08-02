@@ -57,6 +57,9 @@ namespace detail {
 
 inline std::mutex g_mutex;
 inline std::ofstream g_file; // WORLDSAVE_V1: файл текущего лога
+// RCONQUIET_V1: когда silent=true, перехваченный текст уходит ТОЛЬКО RCON-клиенту,
+// не засоряя консоль и лог-файл опросами веб-панели каждую минуту.
+inline thread_local bool g_captureSilent = false;
 inline thread_local std::string* g_captureSink = nullptr; // RCON_BRIDGE_V1: перехват текста ответа для RCON
 
 // ── ANSI цвета ──
@@ -149,6 +152,8 @@ inline void doLog(Level lv, std::string_view tag, const std::string& msg)
     if (g_captureSink) {
         if (!g_captureSink->empty()) g_captureSink->push_back('\n');
         g_captureSink->append(msg);
+        // RCONQUIET_V1: в консоли должно оставаться только то, что ввёл человек.
+        if (g_captureSilent) return;
     }
 
     std::lock_guard lock(g_mutex);
@@ -177,8 +182,14 @@ inline void doLog(Level lv, std::string_view tag, const std::string& msg)
 
 // RCON_BRIDGE_V1: включить/выключить перехват вывода NC_INFO/NC_WARN/NC_ERROR для
 // текущего (тик-)потока — используется, чтобы вернуть текст ответа RCON-клиенту.
-inline void beginCapture(std::string* sink) { detail::g_captureSink = sink; }
-inline void endCapture() { detail::g_captureSink = nullptr; }
+inline void beginCapture(std::string* sink, bool silent = false) {
+    detail::g_captureSink = sink;
+    detail::g_captureSilent = silent; // RCONQUIET_V1
+}
+inline void endCapture() {
+    detail::g_captureSink = nullptr;
+    detail::g_captureSilent = false;
+}
 
 // CONUTF8_V1: сырая печать в консоль одним вызовом (без таймштампа и без записи в файл).
 inline void console(const std::string& s) { detail::writeConsole(s); }

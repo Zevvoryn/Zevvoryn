@@ -359,13 +359,17 @@ public:
     }
 
     EditResult rotate(u64 playerKey, i32 degrees) {
-        if (degrees != 90 && degrees != 180 && degrees != 270)
-            return EditResult::failure("rotation must be 90, 180 or 270");
+        // MINIEDIT_ROTATE_V2: accept -90 / 360 / 0 as well, they are the same turns.
+        const i32 norm = ((degrees % 360) + 360) % 360;
+        if (norm != 0 && norm != 90 && norm != 180 && norm != 270)
+            return EditResult::failure("rotation must be 90, 180, 270 (or -90 / 0)");
         std::lock_guard lock(mutex_);
         auto& cb = sessions_[playerKey].clipboard;
-        if (cb.empty()) return EditResult::failure("clipboard is empty");
-        cb.rotation = (cb.rotation + degrees) % 360;
-        return EditResult::success(0, "rotation=" + std::to_string(cb.rotation));
+        if (cb.empty())
+            return EditResult::failure("clipboard is empty - do //pos1, //pos2 and //copy first");
+        cb.rotation = (cb.rotation + norm) % 360;
+        return EditResult::success(static_cast<i64>(cb.states.size()),
+                                   "rotation=" + std::to_string(cb.rotation));
     }
 
     EditResult paste(u64 playerKey, BlockPos playerPos, const EditHooks& hooks) {

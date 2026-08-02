@@ -1,5 +1,5 @@
 {
-  "name": "discrordbotrcon",
+  "name": "discordbotrcon",
   "version": "1.0.0",
   "description": "Discord RCON bot with a local web panel",
   "main": "index.js",

@@ -2,7 +2,7 @@
 
 ## Установка
 ```
-cd DiscrordBotRcon
+cd DiscordBotRcon
 npm install
 cp .env.example .env   # заполните токен и ID
 npm run deploy         # регистрация slash-команд

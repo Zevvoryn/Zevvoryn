@@ -4,6 +4,7 @@
 #include "wg_aquifer.hpp" // AQUIFER_V1
 #include "wg_features.hpp" // FEATURES_V1
 #include "wg_structures.hpp" // STRUCTURES_V1
+#include "wg_dim.hpp"        // DIMGEN_V1: генераторы Ада и Энда
 #include "../registries/registry.hpp"
 #include "../core/item_blocks.gen.hpp" // BLOCKFIX_V1: полная ванильная таблица block-state id 1.21.1
 #include <unordered_map> // WORLDGEN_V1
@@ -219,6 +220,7 @@ void ChunkColumn::setBlock(i32 x, i32 y, i32 z, i32 stateId) {
     }
     sec->setBlock(x, y, z, stateId);
     dirty_ = true;
+    saveBlobValid_ = false; // FASTSAVE_V2: кэш этой колонны устарел
 }
 
 i32 ChunkColumn::getBlock(i32 x, i32 y, i32 z) const {
@@ -276,6 +278,7 @@ void World::setBlock(i32 x, i32 y, i32 z, i32 stateId) {
     i32 cz = z >> 4;
     auto chunk = getChunkOrCreate(cx, cz);
     chunk->setBlock(x, y, z, stateId);
+    editSeq_.fetch_add(1, std::memory_order_relaxed); // IDLESAVE_V1
 }
 
 i32 World::getBlock(i32 x, i32 y, i32 z) const {
@@ -684,7 +687,10 @@ void World::genWorkerLoop() {
         }
         // Heavy CPU work happens OUTSIDE the lock on a private column.
         auto col = std::make_shared<ChunkColumn>(pos.x, pos.z);
-        if (defaultReady_ && wgState_) {
+        if (dimReady_ && dimState_) {                       // DIMGEN_V1
+            if (dimKind_ == 1) fillNetherChunk(*col, pos.x, pos.z);
+            else               fillEndChunk(*col, pos.x, pos.z);
+        } else if (defaultReady_ && wgState_) {
             fillDefaultChunk(*col, pos.x, pos.z);
         } else if (flatReady_) {
             fillFlatColumn(*col, pos.x, pos.z); // GRASSFIX_V1: фоновые чанки тоже уважают пресет измерения
@@ -696,6 +702,7 @@ void World::genWorkerLoop() {
         // грязные не выгружает (WORLD_DIRTY_PIN_V1) -> ОЗУ росло бесконечно и линейно
         // по пройденным координатам. Именно отсюда "бегаешь до 10к — забивает всю память".
         col->clearDirty();
+        editSeq_.fetch_add(1, std::memory_order_relaxed); // IDLESAVE_V2
         {
             std::lock_guard<std::mutex> lk(genMutex_);
             genReady_[pos] = std::move(col); // stays in genInFlight_ until taken
@@ -774,6 +781,118 @@ void World::fillFlatColumn(ChunkColumn& col, i32 cx, i32 cz) {
     }
 }
 
+
+// ============================================================
+// DIMGEN_V1: Ад и Энд с настоящим рельефом.
+// Раньше оба измерения были плоскими (setFlatPreset 1/2): бедрок + три слоя.
+// ============================================================
+struct World::DimGenState {
+    std::unique_ptr<wgdim::NetherGen> nether;
+    std::unique_ptr<wgdim::EndGen> end;
+};
+
+void World::initNetherGenerator(i64 seed) {
+    auto& mgr = registries::RegistryManager::instance();
+    dimState_ = std::make_unique<DimGenState>();
+    dimState_->nether = std::make_unique<wgdim::NetherGen>((int64_t)seed);
+    auto& I = dimState_->nether->ids;
+    I.bedrock         = wgResolve(mgr, "minecraft:bedrock", 79);
+    I.netherrack      = wgResolve(mgr, "minecraft:netherrack", 4157);
+    I.lava            = wgResolve(mgr, "minecraft:lava", 96);
+    I.soulSand        = wgResolve(mgr, "minecraft:soul_sand", I.netherrack);
+    I.soulSoil        = wgResolve(mgr, "minecraft:soul_soil", I.netherrack);
+    I.gravel          = wgResolve(mgr, "minecraft:gravel", I.netherrack);
+    I.magma           = wgResolve(mgr, "minecraft:magma_block", I.netherrack);
+    I.glowstone       = wgResolve(mgr, "minecraft:glowstone", I.netherrack);
+    I.blackstone      = wgResolve(mgr, "minecraft:blackstone", I.netherrack);
+    I.basalt          = mgr.getBlockStateId("minecraft:basalt", {{"axis", "y"}}).value_or(I.blackstone);
+    I.crimsonNylium   = wgResolve(mgr, "minecraft:crimson_nylium", I.netherrack);
+    I.warpedNylium    = wgResolve(mgr, "minecraft:warped_nylium", I.netherrack);
+    I.netherGoldOre   = wgResolve(mgr, "minecraft:nether_gold_ore", -1);
+    I.quartzOre       = wgResolve(mgr, "minecraft:nether_quartz_ore", -1);
+    I.netherWartBlock = wgResolve(mgr, "minecraft:nether_wart_block", -1);
+    I.warpedWartBlock = wgResolve(mgr, "minecraft:warped_wart_block", -1);
+    I.shroomlight     = wgResolve(mgr, "minecraft:shroomlight", -1);
+    dimKind_ = 1;
+    dimReady_ = true;
+    flatReady_ = false;
+    defaultReady_ = false;
+    if (langRu_) NC_INFO("World", "Генератор Ада готов (сид {})", (long long)seed);
+    else         NC_INFO("World", "Nether generator ready (seed {})", (long long)seed);
+}
+
+void World::initEndGenerator(i64 seed) {
+    auto& mgr = registries::RegistryManager::instance();
+    dimState_ = std::make_unique<DimGenState>();
+    dimState_->end = std::make_unique<wgdim::EndGen>((int64_t)seed);
+    auto& I = dimState_->end->ids;
+    I.endStone = wgResolve(mgr, "minecraft:end_stone", 12456);
+    I.obsidian = wgResolve(mgr, "minecraft:obsidian", I.endStone);
+    dimKind_ = 2;
+    dimReady_ = true;
+    flatReady_ = false;
+    defaultReady_ = false;
+    if (langRu_) NC_INFO("World", "Генератор Энда готов (сид {})", (long long)seed);
+    else         NC_INFO("World", "End generator ready (seed {})", (long long)seed);
+}
+
+void World::generateDimSpawn(i32 centerX, i32 centerZ, i32 radius) {
+    for (i32 cx = centerX - radius; cx <= centerX + radius; ++cx)
+        for (i32 cz = centerZ - radius; cz <= centerZ + radius; ++cz)
+            getOrGenerateChunk(cx, cz);
+}
+
+void World::fillNetherChunk(ChunkColumn& col, i32 cx, i32 cz) {
+    auto& G = *dimState_->nether;
+    const i32 ROOF = wgdim::NetherGen::ROOF_Y;
+    col.setColumnBiome(G.biomeAt(cx * 16 + 8, cz * 16 + 8));
+    for (i32 lx = 0; lx < 16; ++lx) {
+        for (i32 lz = 0; lz < 16; ++lz) {
+            const i32 wx = cx * 16 + lx;
+            const i32 wz = cz * 16 + lz;
+            const int biome = G.biomeAt(wx, wz);
+            int depth = 0;
+            bool prevSolid = false; // блок выше текущего (идём сверху вниз)
+            for (i32 y = ROOF; y >= 0; --y) {
+                const uint64_t bh = wgdim::dimHash(((int64_t)wx << 22) ^ (int64_t)y, wz, G.seed);
+                // Бедрок: ровный слой снизу и сверху + рваные края, как в ванилле
+                if (y == 0 || y == ROOF) { col.setBlock(wx, y, wz, G.ids.bedrock); prevSolid = true; depth = 0; continue; }
+                if (y <= 4 && (bh % 5ull) >= (uint64_t)y) { col.setBlock(wx, y, wz, G.ids.bedrock); prevSolid = true; depth = 0; continue; }
+                if (y >= ROOF - 4 && (bh % 5ull) >= (uint64_t)(ROOF - y)) { col.setBlock(wx, y, wz, G.ids.bedrock); prevSolid = true; depth = 0; continue; }
+                const bool solid = G.isSolid(wx, y, wz);
+                if (solid) {
+                    depth = prevSolid ? depth + 1 : 0;
+                    i32 id = G.surfaceId(biome, wx, y, wz, depth);
+                    if (depth > 3) { const int ore = G.oreAt(wx, y, wz); if (ore >= 0) id = ore; }
+                    col.setBlock(wx, y, wz, id);
+                } else {
+                    // Лавовое море до Y=31 и светящийся камень под потолком
+                    if (y <= wgdim::NetherGen::LAVA_Y) col.setBlock(wx, y, wz, G.ids.lava);
+                    else if (prevSolid && y > 90 && G.ids.glowstone >= 0 && (bh % 61ull) == 0ull)
+                        col.setBlock(wx, y, wz, G.ids.glowstone);
+                }
+                prevSolid = solid;
+            }
+        }
+    }
+}
+
+void World::fillEndChunk(ChunkColumn& col, i32 cx, i32 cz) {
+    auto& G = *dimState_->end;
+    const double vMid = G.islandValue(cx * 16 + 8, cz * 16 + 8);
+    col.setColumnBiome(G.biomeAt(cx * 16 + 8, cz * 16 + 8, vMid));
+    for (i32 lx = 0; lx < 16; ++lx) {
+        for (i32 lz = 0; lz < 16; ++lz) {
+            const i32 wx = cx * 16 + lx;
+            const i32 wz = cz * 16 + lz;
+            const double v = G.islandValue(wx, wz);
+            if (v <= 0.0) continue; // пустота между островами
+            for (i32 y = 0; y <= 127; ++y)
+                if (G.isSolid(wx, y, wz, v)) col.setBlock(wx, y, wz, G.ids.endStone);
+        }
+    }
+}
+
 void World::initFlatGenerator() {
     auto& mgr = registries::RegistryManager::instance();
     flatBedrockId_ = mgr.getBlockStateId("minecraft:bedrock").value_or(79); // LIGHT_V1
@@ -792,6 +911,13 @@ std::shared_ptr<ChunkColumn> World::getOrGenerateChunk(i32 cx, i32 cz) {
     bool wasCreated = false;
     auto chunk = getChunkOrCreate(cx, cz, &wasCreated);
     if (!wasCreated) return chunk; // already generated by an earlier call
+    editSeq_.fetch_add(1, std::memory_order_relaxed); // IDLESAVE_V2: свежий чанк — мир изменён
+    if (dimReady_ && dimState_) { // DIMGEN_V1: Ад/Энд со своим рельефом
+        if (dimKind_ == 1) fillNetherChunk(*chunk, cx, cz);
+        else               fillEndChunk(*chunk, cx, cz);
+        chunk->clearDirty();
+        return chunk;
+    }
     if (defaultReady_ && wgState_) { // WORLDGEN_V1
         fillDefaultChunk(*chunk, cx, cz);
         chunk->clearDirty(); // generated terrain is baseline, not a live edit
@@ -856,6 +982,15 @@ bool World::saveToDisk(const std::string& path) const {
     }
     // ASYNCSAVE_V1: пишем во временный файл и атомарно переименовываем — если
     // сервер упадёт посреди записи, старый world.dat останется целым.
+    // IDLESAVE_V1: мир не менялся с прошлого сейва и файл на месте — писать нечего.
+    {
+        std::error_code ecs;
+        if (savedSeq_.load(std::memory_order_relaxed) == editSeq_.load(std::memory_order_relaxed) &&
+            std::filesystem::exists(p, ecs)) {
+            return true;
+        }
+    }
+    const u64 seqAtStart = editSeq_.load(std::memory_order_relaxed);
     const std::string tmpPath = path + ".tmp";
     std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
     if (!f) return false;
@@ -869,6 +1004,7 @@ bool World::saveToDisk(const std::string& path) const {
         for (const auto& [pos, chunk] : chunks_) snapshot.push_back(chunk);
     }
     std::string raw;
+    raw.reserve(snapshot.size() * 16384 + 4); // FASTSAVE_V1: меньше realloc'ов на большом мире
     i32 count = static_cast<i32>(snapshot.size());
     raw.append(reinterpret_cast<const char*>(&count), 4);
     for (const auto& chunk : snapshot) {
@@ -876,26 +1012,49 @@ bool World::saveToDisk(const std::string& path) const {
         i32 cz = chunk->getZ();
         raw.append(reinterpret_cast<const char*>(&cx), 4);
         raw.append(reinterpret_cast<const char*>(&cz), 4);
+        // FASTSAVE_V1: раньше каждый сейв проходил ВСЕ 384 слоя столба (98304 getBlock
+        // на чанк, ~43 млн на 441 чанк) через мировые координаты с поиском секции на
+        // каждый блок. В плоском мире живая только 1 секция из 24 — остальные
+        // просто пропускаем, формат файла не меняется.
+        { // FASTSAVE_V2: нетронутая колонна — берём байты прошлого сейва
+            std::lock_guard<std::mutex> lk(saveCacheMutex_);
+            if (const std::string* cached = chunk->saveBlob()) {
+                const u32 cachedCount = chunk->saveBlobCount();
+                raw.append(reinterpret_cast<const char*>(&cachedCount), 4);
+                raw.append(*cached);
+                continue;
+            }
+        }
         std::string blockData;
         u32 blockCount = 0;
-        for (i32 y = CHUNK_HEIGHT_MIN; y < CHUNK_HEIGHT_MAX; ++y) {
-            for (i32 lx = 0; lx < 16; ++lx) {
-                for (i32 lz = 0; lz < 16; ++lz) {
-                    i32 id = chunk->getBlock(cx * 16 + lx, y, cz * 16 + lz);
-                    if (id == 0) continue;
-                    u8 blx = static_cast<u8>(lx);
-                    u8 blz = static_cast<u8>(lz);
-                    i16 by = static_cast<i16>(y);
-                    blockData.append(reinterpret_cast<const char*>(&blx), 1);
-                    blockData.append(reinterpret_cast<const char*>(&by), 2);
-                    blockData.append(reinterpret_cast<const char*>(&blz), 1);
-                    blockData.append(reinterpret_cast<const char*>(&id), 4);
-                    ++blockCount;
+        const ChunkColumn& col = *chunk;
+        for (i32 si = 0; si < SECTIONS_PER_CHUNK; ++si) {
+            if (!col.sectionHasBlocks(si)) continue;
+            const ChunkSection& sec = col.getSection(si);
+            const i32 baseY = CHUNK_HEIGHT_MIN + si * SECTION_HEIGHT;
+            for (i32 ly = 0; ly < SECTION_HEIGHT; ++ly) {
+                const i16 by = static_cast<i16>(baseY + ly);
+                for (i32 lx = 0; lx < 16; ++lx) {
+                    for (i32 lz = 0; lz < 16; ++lz) {
+                        const i32 id = sec.getBlock(lx, ly, lz);
+                        if (id == 0) continue;
+                        const u8 blx = static_cast<u8>(lx);
+                        const u8 blz = static_cast<u8>(lz);
+                        blockData.append(reinterpret_cast<const char*>(&blx), 1);
+                        blockData.append(reinterpret_cast<const char*>(&by), 2);
+                        blockData.append(reinterpret_cast<const char*>(&blz), 1);
+                        blockData.append(reinterpret_cast<const char*>(&id), 4);
+                        ++blockCount;
+                    }
                 }
             }
         }
         raw.append(reinterpret_cast<const char*>(&blockCount), 4);
         raw.append(blockData);
+        { // FASTSAVE_V2: запоминаем готовые байты до следующей правки этой колонны
+            std::lock_guard<std::mutex> lk(saveCacheMutex_);
+            chunk->setSaveBlob(std::move(blockData), blockCount);
+        }
     }
     const auto compressed = net::zlibc::compress(std::span<const u8>(reinterpret_cast<const u8*>(raw.data()), raw.size()));
     f.write("ZEVW", 4);
@@ -911,6 +1070,7 @@ bool World::saveToDisk(const std::string& path) const {
     if (!f.good()) { std::filesystem::remove(tmpPath, ec); return false; }
     std::filesystem::rename(tmpPath, path, ec); // атомарная подмена (на Windows — MoveFileEx c REPLACE_EXISTING)
     if (ec) { std::filesystem::remove(tmpPath, ec); return false; }
+    savedSeq_.store(seqAtStart, std::memory_order_relaxed); // IDLESAVE_V1
     return true;
 }
 

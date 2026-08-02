@@ -97,6 +97,17 @@ public:
         }
     }
 
+    // ALLPACKETS_V3: homogeneous List<Double> (e.g. NBT "Pos"/"Motion" triples) —
+    // only the numeric list shape query-entity NBT responses actually need.
+    void writeDoubleList(const std::vector<f64>& values, std::string_view name) {
+        writeTagHeader(TagType::List, name);
+        buffer_.writeByte(static_cast<u8>(TagType::Double));
+        buffer_.writeI32(static_cast<i32>(values.size()));
+        for (auto v : values) {
+            buffer_.writeF64(v);
+        }
+    }
+
     std::vector<u8> toVector() const {
         return std::vector<u8>(buffer_.writtenSpan().begin(), buffer_.writtenSpan().end());
     }

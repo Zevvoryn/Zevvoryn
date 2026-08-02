@@ -107,9 +107,27 @@ public:
     // Записать полный chunk data payload для 1.21.1
     void writeTo(net::Buffer& buf, bool includeBiomes = true) const;
 
+    // FASTSAVE_V1: есть ли в секции хоть один не-воздушный блок.
+    // Важно: НЕ трогает getSection(), который лениво создаёт секцию.
+    bool sectionHasBlocks(i32 index) const {
+        if (index < 0 || index >= SECTIONS_PER_CHUNK) return false;
+        const auto& sec = sections_[static_cast<size_t>(index)];
+        return sec && sec->getNonAirBlockCount() > 0;
+    }
+
     // Были ли изменения с момента последней отправки
     bool isDirty() const { return dirty_; }
     void clearDirty() { dirty_ = false; }
+
+    // FASTSAVE_V2: кэш сериализованных блоков для saveToDisk(). Колонна, которую никто
+    // не трогал с прошлого сейва, больше не перебирается поблочно.
+    const std::string* saveBlob() const { return saveBlobValid_ ? &saveBlob_ : nullptr; }
+    u32 saveBlobCount() const { return saveBlobCount_; }
+    void setSaveBlob(std::string blob, u32 count) const {
+        saveBlob_ = std::move(blob);
+        saveBlobCount_ = count;
+        saveBlobValid_ = true;
+    }
 
     // DIMBIOME_V1: весь столбец одним биомом (Ад/Энд); -1 = как было
     void setColumnBiome(i32 b) { biomeId_ = b; }
@@ -120,6 +138,9 @@ private:
     std::array<std::unique_ptr<ChunkSection>, SECTIONS_PER_CHUNK> sections_;
     bool dirty_ = false;
     i32 biomeId_ = -1; // DIMBIOME_V1
+    mutable std::string saveBlob_;      // FASTSAVE_V2
+    mutable u32 saveBlobCount_ = 0;     // FASTSAVE_V2
+    mutable bool saveBlobValid_ = false; // FASTSAVE_V2
 };
 
 // ============================================================
@@ -161,6 +182,14 @@ public:
     // MULTIWORLD_V1: 0 = overworld superflat, 1 = nether flat, 2 = end flat
     void setFlatPreset(i32 preset) { flatPreset_ = preset; flatBiomeId_ = (preset == 1 ? 34 : (preset == 2 ? 55 : -1)); } // DIMBIOME_V1: nether_wastes / the_end
 
+    // DIMGEN_V1: настоящая генерация Ада/Энда вместо плоских пресетов.
+    // dimKind_: 1 = Ад, 2 = Энд. Выбирается раньше flat- и overworld-путей.
+    void initNetherGenerator(i64 seed);
+    void initEndGenerator(i64 seed);
+    void generateDimSpawn(i32 centerX, i32 centerZ, i32 radius);
+    bool dimReady() const { return dimReady_; }
+    i32  dimKind() const { return dimKind_; }
+
     // WORLDSAVE_V1: сохранение/загрузка мира на диск
     bool saveToDisk(const std::string& path) const;
     // SOFTRELOAD_V1: выгрузить ВСЕ чанки и очереди генерации/загрузки.
@@ -197,6 +226,10 @@ public:
     i32 flatDirtId_ = 10;
     i32 flatGrassId_ = 9;  // LIGHT_V1
     i32 flatPreset_ = 0;           // MULTIWORLD_V1
+    struct DimGenState;            // DIMGEN_V1
+    std::unique_ptr<DimGenState> dimState_; // DIMGEN_V1
+    bool dimReady_ = false;        // DIMGEN_V1
+    i32  dimKind_ = 0;             // DIMGEN_V1: 1 = nether, 2 = end
     i32 flatBiomeId_ = -1;         // DIMBIOME_V1
     i32 flatNetherrackId_ = 4157;  // MULTIWORLD_V1: resolved in initFlatGenerator
     i32 flatEndStoneId_ = 12456;   // MULTIWORLD_V1: resolved in initFlatGenerator
@@ -232,8 +265,21 @@ private:
     mutable std::mutex chunksMutex_;
     std::unordered_map<ChunkPos, std::shared_ptr<ChunkColumn>> chunks_;
 
+    // IDLESAVE_V1: счётчик правок мира. Автосейв каждые 5 минут молотил полную
+    // сериализацию + сжатие, даже когда в мире не менялся ни один блок.
+    mutable std::mutex saveCacheMutex_; // FASTSAVE_V2: два параллельных сейва не дерут кэш
+    std::atomic<u64> editSeq_{0};
+    mutable std::atomic<u64> savedSeq_{~0ull};
+public:
+    u64 editSeq() const { return editSeq_.load(std::memory_order_relaxed); }
+    void markEdited() { editSeq_.fetch_add(1, std::memory_order_relaxed); }
+    bool saveUpToDate() const { return savedSeq_.load(std::memory_order_relaxed) == editSeq(); }
+private:
+
     // PERF_ASYNC_V1: background generation pool state.
     void fillFlatColumn(ChunkColumn& col, i32 cx, i32 cz); // GRASSFIX_V1
+    void fillNetherChunk(ChunkColumn& col, i32 cx, i32 cz); // DIMGEN_V1
+    void fillEndChunk(ChunkColumn& col, i32 cx, i32 cz);    // DIMGEN_V1
     void genWorkerLoop();
     std::vector<std::thread> genWorkers_;
     std::mutex genMutex_;

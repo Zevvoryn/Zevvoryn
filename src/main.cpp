@@ -26,7 +26,14 @@
 
 static nc::NetherCraftServer* g_server = nullptr;
 
-// AUTOSTARTPANEL_V1: запуск DiscrordBotRcon/index.js (Discord-бот + веб-панель) вместе с
+// PATHU8_V1: fs::path::string() на Windows отдаёт путь в ANSI (CP1251), а консоль у нас в UTF-8 —
+// из-за этого C:\Users\<русское имя> превращался в кракозябры. u8string() всегда UTF-8.
+static std::string pathU8(const std::filesystem::path& p) {
+    const auto s = p.u8string();
+    return std::string(s.begin(), s.end());
+}
+
+// AUTOSTARTPANEL_V1: запуск DiscordBotRcon/index.js (Discord-бот + веб-панель) вместе с
 // zevvoryn.exe, если это включено в мастере установки (auto-start-panel=true).
 #ifdef _WIN32
 static PROCESS_INFORMATION g_panelProc{};
@@ -73,16 +80,16 @@ static void extractEmbeddedBotFiles(const std::filesystem::path& panelDir, bool 
     if (written > 0) {
         if (ru) {
             std::cout << "\033[36m[AutoStart] \xd0\xa0\xd0\xb0\xd1\x81\xd0\xbf\xd0\xb0\xd0\xba\xd0\xbe\xd0\xb2\xd0\xb0\xd0\xbd\xd0\xbe " << written
-                       << " \xd0\xb2\xd1\x81\xd1\x82\xd1\x80\xd0\xbe\xd0\xb5\xd0\xbd\xd0\xbd\xd1\x8b\xd1\x85 \xd1\x84\xd0\xb0\xd0\xb9\xd0\xbb\xd0\xbe\xd0\xb2 \xd0\xb1\xd0\xbe\xd1\x82\xd0\xb0 \xd0\xb2 " << panelDir.string()
+                       << " \xd0\xb2\xd1\x81\xd1\x82\xd1\x80\xd0\xbe\xd0\xb5\xd0\xbd\xd0\xbd\xd1\x8b\xd1\x85 \xd1\x84\xd0\xb0\xd0\xb9\xd0\xbb\xd0\xbe\xd0\xb2 \xd0\xb1\xd0\xbe\xd1\x82\xd0\xb0 \xd0\xb2 " << pathU8(panelDir)
                        << " (\xd0\xb8\xd0\xb7 \xd1\x81\xd0\xb0\xd0\xbc\xd0\xbe\xd0\xb3\xd0\xbe zevvoryn.exe). \xd0\x9e\xd1\x81\xd1\x82\xd0\xb0\xd1\x91\xd1\x82\xd1\x81\xd1\x8f \xd1\x82\xd0\xbe\xd0\xbb\xd1\x8c\xd0\xba\xd0\xbe npm install \xd0\xb4\xd0\xbb\xd1\x8f node_modules.\033[0m\n" << std::flush;
         } else {
-            std::cout << "\033[36m[AutoStart] Extracted " << written << " bundled bot files into " << panelDir.string()
+            std::cout << "\033[36m[AutoStart] Extracted " << written << " bundled bot files into " << pathU8(panelDir)
                        << " (from zevvoryn.exe itself). Only npm install for node_modules is still needed.\033[0m\n" << std::flush;
         }
     }
 }
 
-// RCONENV_V1: DiscrordBotRcon/.env must have RCON_HOST/RCON_PORT/RCON_PASSWORD matching
+// RCONENV_V1: DiscordBotRcon/.env must have RCON_HOST/RCON_PORT/RCON_PASSWORD matching
 // settings.properties, or the web panel/Discord bot's RCON connection silently stays
 // "disconnected". Users should never have to hand-sync two separate config files for
 // this to work, so we do it automatically every time the panel (re)starts.
@@ -148,10 +155,10 @@ static void syncPanelEnvFile(const std::filesystem::path& panelDir, const nc::Se
     for (auto& l : lines) out << l << "\r\n";
     out.close();
     if (ru) {
-        std::cout << "\033[36m[AutoStart] " << (existed ? "\xd0\x9e\xd0\xb1\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbb\xd1\x91\xd0\xbd " : "\xd0\xa1\xd0\xbe\xd0\xb7\xd0\xb4\xd0\xb0\xd0\xbd ") << envPath.string()
+        std::cout << "\033[36m[AutoStart] " << (existed ? "\xd0\x9e\xd0\xb1\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbb\xd1\x91\xd0\xbd " : "\xd0\xa1\xd0\xbe\xd0\xb7\xd0\xb4\xd0\xb0\xd0\xbd ") << pathU8(envPath)
                    << " \xd1\x81 RCON-\xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd0\xb5\xd0\xbc \xd0\xb8\xd0\xb7 settings.properties (\xd1\x87\xd1\x82\xd0\xbe\xd0\xb1\xd1\x8b \xd0\xb2\xd0\xb5\xd0\xb1-\xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd1\x8c/\xd0\xb1\xd0\xbe\xd1\x82 \xd0\xbc\xd0\xbe\xd0\xb3\xd0\xbb\xd0\xb8 \xd0\xbf\xd0\xbe\xd0\xb4\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb8\xd1\x82\xd1\x8c\xd1\x81\xd1\x8f \xd0\xba RCON \xd0\xb1\xd0\xb5\xd0\xb7 \xd1\x80\xd1\x83\xd1\x87\xd0\xbd\xd0\xbe\xd0\xb9 \xd0\xbf\xd1\x80\xd0\xb0\xd0\xb2\xd0\xba\xd0\xb8).\033[0m\n" << std::flush;
     } else {
-        std::cout << "\033[36m[AutoStart] " << (existed ? "Updated " : "Created ") << envPath.string()
+        std::cout << "\033[36m[AutoStart] " << (existed ? "Updated " : "Created ") << pathU8(envPath)
                    << " with the RCON password from settings.properties (so the web panel/bot can connect to RCON without manual editing).\033[0m\n" << std::flush;
     }
 }
@@ -268,15 +275,20 @@ static void spawnPanelProcess(const nc::ServerConfig& cfg) {
     namespace fs = std::filesystem;
     const bool ru = (cfg.language == "rus");
     // AUTOSTARTPANEL_V2: рабочая папка процесса может отличаться от папки проекта
-    // (например, exe запущен из build-ninja) — ищем DiscrordBotRcon сначала рядом с
+    // (например, exe запущен из build-ninja) — ищем DiscordBotRcon сначала рядом с
     // текущей рабочей папкой, потом рядом с самим zevvoryn.exe, и всегда логируем результат.
-    fs::path panelDir = "DiscrordBotRcon";
+    // PANELDIR_V2: the folder shipped with the server is DiscordBotRcon (historic typo);
+    // accept the correctly spelled DiscordBotRcon too, so renaming it does not break autostart.
+    fs::path panelDir = fs::exists(fs::path("DiscordBotRcon") / "index.js") ? fs::path("DiscordBotRcon")
+                        : (fs::exists(fs::path("DiscordBotRcon") / "index.js") ? fs::path("DiscordBotRcon")
+                                                                               : fs::path("DiscordBotRcon"));
     if (!fs::exists(panelDir / "index.js")) {
         wchar_t exeBuf[MAX_PATH]{};
         if (GetModuleFileNameW(nullptr, exeBuf, MAX_PATH) > 0) {
             fs::path exeDir = fs::path(exeBuf).parent_path();
-            if (fs::exists(exeDir / "DiscrordBotRcon" / "index.js")) panelDir = exeDir / "DiscrordBotRcon";
-            else if (fs::exists(exeDir / "DiscrordBotRcon")) panelDir = exeDir / "DiscrordBotRcon";
+            if (fs::exists(exeDir / "DiscordBotRcon" / "index.js")) panelDir = exeDir / "DiscordBotRcon";
+            else if (fs::exists(exeDir / "DiscordBotRcon" / "index.js")) panelDir = exeDir / "DiscordBotRcon";
+            else if (fs::exists(exeDir / "DiscordBotRcon")) panelDir = exeDir / "DiscordBotRcon";
         }
     }
     // AUTOEXTRACT_V1: не нашли index.js ни в одной из папок-кандидатов — досыпаем недостающие
@@ -289,28 +301,28 @@ static void spawnPanelProcess(const nc::ServerConfig& cfg) {
         bool folderExists = fs::exists(panelDir, dirEc) && fs::is_directory(panelDir, dirEc);
         if (ru) {
             if (folderExists) {
-                std::cout << "\033[33m[AutoStart] \xd0\x9f\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb0 " << panelDir.string()
-                           << " \xd0\xbd\xd0\xb0\xd0\xb9\xd0\xb4\xd0\xb5\xd0\xbd\xd0\xb0 (" << fs::current_path(cwdEc).string()
+                std::cout << "\033[33m[AutoStart] \xd0\x9f\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb0 " << pathU8(panelDir)
+                           << " \xd0\xbd\xd0\xb0\xd0\xb9\xd0\xb4\xd0\xb5\xd0\xbd\xd0\xb0 (" << pathU8(fs::current_path(cwdEc))
                            << "), \xd0\xbd\xd0\xbe \xd0\xb2 \xd0\xbd\xd0\xb5\xd0\xb9 \xd0\xbd\xd0\xb5\xd1\x82 index.js \xe2\x80\x94 \xd0\xbf\xd0\xbe\xd1\x85\xd0\xbe\xd0\xb6\xd0\xb5, \xd1\x8d\xd1\x82\xd0\xb0 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb0 \xd0\xb1\xd1\x8b\xd0\xbb\xd0\xb0 \xd1\x81\xd0\xbe\xd0\xb7\xd0\xb4\xd0\xb0\xd0\xbd\xd0\xb0 \xd0\xbc\xd0\xb0\xd1\x81\xd1\x82\xd0\xb5\xd1\x80\xd0\xbe\xd0\xbc \xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xba\xd0\xb8 \xd1\x82\xd0\xbe\xd0\xbb\xd1\x8c\xd0\xba\xd0\xbe \xd0\xb4\xd0\xbb\xd1\x8f .env. \xd0\xa1\xd0\xba\xd0\xbe\xd0\xbf\xd0\xb8\xd1\x80\xd1\x83\xd0\xb9 \xd1\x82\xd1\x83\xd0\xb4\xd0\xb0 index.js, webpanel.js, package.json, rcon.js, commands.js \xd0\xb8 node_modules \xd0\xb8\xd0\xb7 \xd0\xb8\xd1\x81\xd1\x85\xd0\xbe\xd0\xb4\xd0\xbd\xd0\xb8\xd0\xba\xd0\xbe\xd0\xb2 \xd0\xbf\xd1\x80\xd0\xbe\xd0\xb5\xd0\xba\xd1\x82\xd0\xb0. \xd0\x90\xd0\xb2\xd1\x82\xd0\xbe\xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba \xd0\xbf\xd1\x80\xd0\xbe\xd0\xbf\xd1\x83\xd1\x89\xd0\xb5\xd0\xbd.\033[0m\n" << std::flush;
             } else {
-                std::cout << "\033[33m[AutoStart] " << (panelDir / "index.js").string()
-                           << " \xd0\xbd\xd0\xb5 \xd0\xbd\xd0\xb0\xd0\xb9\xd0\xb4\xd0\xb5\xd0\xbd (\xd1\x82\xd0\xb5\xd0\xba\xd1\x83\xd1\x89\xd0\xb0\xd1\x8f \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb0: " << fs::current_path(cwdEc).string()
-                           << "). \xd0\x9f\xd0\xbe\xd0\xbb\xd0\xbe\xd0\xb6\xd0\xb8 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd1\x83 DiscrordBotRcon \xd1\x80\xd1\x8f\xd0\xb4\xd0\xbe\xd0\xbc \xd1\x81 zevvoryn.exe \xd0\xb8\xd0\xbb\xd0\xb8 \xd0\xb2 \xd1\x82\xd0\xb5\xd0\xba\xd1\x83\xd1\x89\xd0\xb5\xd0\xb9 \xd1\x80\xd0\xb0\xd0\xb1\xd0\xbe\xd1\x87\xd0\xb5\xd0\xb9 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb5. \xd0\x90\xd0\xb2\xd1\x82\xd0\xbe\xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba \xd0\xbf\xd1\x80\xd0\xbe\xd0\xbf\xd1\x83\xd1\x89\xd0\xb5\xd0\xbd.\033[0m\n" << std::flush;
+                std::cout << "\033[33m[AutoStart] " << pathU8(panelDir / "index.js")
+                           << " \xd0\xbd\xd0\xb5 \xd0\xbd\xd0\xb0\xd0\xb9\xd0\xb4\xd0\xb5\xd0\xbd (\xd1\x82\xd0\xb5\xd0\xba\xd1\x83\xd1\x89\xd0\xb0\xd1\x8f \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb0: " << pathU8(fs::current_path(cwdEc))
+                           << "). \xd0\x9f\xd0\xbe\xd0\xbb\xd0\xbe\xd0\xb6\xd0\xb8 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd1\x83 DiscordBotRcon \xd1\x80\xd1\x8f\xd0\xb4\xd0\xbe\xd0\xbc \xd1\x81 zevvoryn.exe \xd0\xb8\xd0\xbb\xd0\xb8 \xd0\xb2 \xd1\x82\xd0\xb5\xd0\xba\xd1\x83\xd1\x89\xd0\xb5\xd0\xb9 \xd1\x80\xd0\xb0\xd0\xb1\xd0\xbe\xd1\x87\xd0\xb5\xd0\xb9 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb5. \xd0\x90\xd0\xb2\xd1\x82\xd0\xbe\xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba \xd0\xbf\xd1\x80\xd0\xbe\xd0\xbf\xd1\x83\xd1\x89\xd0\xb5\xd0\xbd.\033[0m\n" << std::flush;
             }
         } else {
             if (folderExists) {
-                std::cout << "\033[33m[AutoStart] Folder " << panelDir.string()
-                           << " was found (" << fs::current_path(cwdEc).string()
+                std::cout << "\033[33m[AutoStart] Folder " << pathU8(panelDir)
+                           << " was found (" << pathU8(fs::current_path(cwdEc))
                            << "), but it has no index.js \xe2\x80\x94 this folder was likely auto-created by the setup wizard, which only writes .env there. Copy index.js, webpanel.js, package.json, rcon.js, commands.js and node_modules from the project source into it. Auto-start skipped.\033[0m\n" << std::flush;
             } else {
-                std::cout << "\033[33m[AutoStart] " << (panelDir / "index.js").string()
-                           << " not found (current dir: " << fs::current_path(cwdEc).string()
-                           << "). Place the DiscrordBotRcon folder next to zevvoryn.exe or in the current working directory. Auto-start skipped.\033[0m\n" << std::flush;
+                std::cout << "\033[33m[AutoStart] " << pathU8(panelDir / "index.js")
+                           << " not found (current dir: " << pathU8(fs::current_path(cwdEc))
+                           << "). Place the DiscordBotRcon folder next to zevvoryn.exe or in the current working directory. Auto-start skipped.\033[0m\n" << std::flush;
             }
         }
         return;
     }
-    // RCONENV_V1: keep DiscrordBotRcon/.env's RCON_* values in sync with settings.properties
+    // RCONENV_V1: keep DiscordBotRcon/.env's RCON_* values in sync with settings.properties
     // on every launch attempt, before we even check for node_modules, so the panel/bot never
     // silently fail to authenticate with a stale or missing RCON password.
     syncPanelEnvFile(panelDir, cfg, ru);
@@ -320,15 +332,15 @@ static void spawnPanelProcess(const nc::ServerConfig& cfg) {
     if (!fs::exists(panelDir / "node_modules")) {
         // NPMPROMPT_V2: ask, then run npm install *inside* the panel folder.
         if (ru) {
-            std::cout << "\033[31m[AutoStart] " << panelDir.string() << "/node_modules \xd0\xbd\xd0\xb5 \xd0\xbd\xd0\xb0\xd0\xb9\xd0\xb4\xd0\xb5\xd0\xbd (\xd0\xb1\xd0\xb8\xd0\xb1\xd0\xbb\xd0\xb8\xd0\xbe\xd1\x82\xd0\xb5\xd0\xba\xd0\xb8 Node \xd0\xbd\xd0\xb5 \xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbb\xd0\xb5\xd0\xbd\xd1\x8b).\033[0m\n" << std::flush;
+            std::cout << "\033[31m[AutoStart] " << pathU8(panelDir) << "/node_modules \xd0\xbd\xd0\xb5 \xd0\xbd\xd0\xb0\xd0\xb9\xd0\xb4\xd0\xb5\xd0\xbd (\xd0\xb1\xd0\xb8\xd0\xb1\xd0\xbb\xd0\xb8\xd0\xbe\xd1\x82\xd0\xb5\xd0\xba\xd0\xb8 Node \xd0\xbd\xd0\xb5 \xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbb\xd0\xb5\xd0\xbd\xd1\x8b).\033[0m\n" << std::flush;
             std::cout << "\033[33m[AutoStart] \xd0\xa1\xd0\xba\xd0\xb0\xd1\x87\xd0\xb0\xd1\x82\xd1\x8c \xd0\xb8\xd1\x85 \xd1\x81\xd0\xb5\xd0\xb9\xd1\x87\xd0\xb0\xd1\x81 (npm install)? [Y/n]: \033[0m" << std::flush;
         } else {
-            std::cout << "\033[31m[AutoStart] " << panelDir.string() << "/node_modules not found (Node dependencies are missing).\033[0m\n" << std::flush;
+            std::cout << "\033[31m[AutoStart] " << pathU8(panelDir) << "/node_modules not found (Node dependencies are missing).\033[0m\n" << std::flush;
             std::cout << "\033[33m[AutoStart] Download them now (npm install)? [Y/n]: \033[0m" << std::flush;
         }
         if (!askYesNo()) {
-            if (ru) std::cout << "\033[33m[AutoStart] \xd0\x9e\xd0\xba, \xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xb8\xd1\x82\xd0\xb5 \xd1\x81\xd0\xb0\xd0\xbc\xd0\xb8: cd " << panelDir.string() << " && npm install\033[0m\n" << std::flush;
-            else    std::cout << "\033[33m[AutoStart] Fine, install them yourself: cd " << panelDir.string() << " && npm install\033[0m\n" << std::flush;
+            if (ru) std::cout << "\033[33m[AutoStart] \xd0\x9e\xd0\xba, \xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xb8\xd1\x82\xd0\xb5 \xd1\x81\xd0\xb0\xd0\xbc\xd0\xb8: cd " << pathU8(panelDir) << " && npm install\033[0m\n" << std::flush;
+            else    std::cout << "\033[33m[AutoStart] Fine, install them yourself: cd " << pathU8(panelDir) << " && npm install\033[0m\n" << std::flush;
             return;
         }
         if (ru) std::cout << "\033[36m[AutoStart] \xd0\x97\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba\xd0\xb0\xd1\x8e npm install \xd0\xb2 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb5 \xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd0\xb8, \xd1\x8d\xd1\x82\xd0\xbe \xd0\xbc\xd0\xbe\xd0\xb6\xd0\xb5\xd1\x82 \xd0\xb7\xd0\xb0\xd0\xbd\xd1\x8f\xd1\x82\xd1\x8c \xd0\xbc\xd0\xb8\xd0\xbd\xd1\x83\xd1\x82\xd1\x83...\033[0m\n" << std::flush;
@@ -342,8 +354,8 @@ static void spawnPanelProcess(const nc::ServerConfig& cfg) {
         const std::wstring panelDirW = fs::absolute(panelDir, npmEc).wstring();
         const int npmRc = runAndWait(npmCmdLine, panelDirW, true);
         if (npmRc != 0 || !fs::exists(panelDir / "node_modules")) {
-            if (ru) std::cout << "\033[31m[AutoStart] npm install \xd0\xbd\xd0\xb5 \xd1\x83\xd0\xb4\xd0\xb0\xd0\xbb\xd1\x81\xd1\x8f (\xd0\xba\xd0\xbe\xd0\xb4 " << npmRc << "). \xd0\x9c\xd0\xbe\xd0\xb6\xd0\xbd\xd0\xbe \xd0\xb2\xd1\x80\xd1\x83\xd1\x87\xd0\xbd\xd1\x83\xd1\x8e: cd " << panelDir.string() << " && npm install\033[0m\n" << std::flush;
-            else    std::cout << "\033[31m[AutoStart] npm install failed (code " << npmRc << "). Manual way: cd " << panelDir.string() << " && npm install\033[0m\n" << std::flush;
+            if (ru) std::cout << "\033[31m[AutoStart] npm install \xd0\xbd\xd0\xb5 \xd1\x83\xd0\xb4\xd0\xb0\xd0\xbb\xd1\x81\xd1\x8f (\xd0\xba\xd0\xbe\xd0\xb4 " << npmRc << "). \xd0\x9c\xd0\xbe\xd0\xb6\xd0\xbd\xd0\xbe \xd0\xb2\xd1\x80\xd1\x83\xd1\x87\xd0\xbd\xd1\x83\xd1\x8e: cd " << pathU8(panelDir) << " && npm install\033[0m\n" << std::flush;
+            else    std::cout << "\033[31m[AutoStart] npm install failed (code " << npmRc << "). Manual way: cd " << pathU8(panelDir) << " && npm install\033[0m\n" << std::flush;
             return;
         }
         if (ru) std::cout << "\033[32m[AutoStart] \xd0\x97\xd0\xb0\xd0\xb2\xd0\xb8\xd1\x81\xd0\xb8\xd0\xbc\xd0\xbe\xd1\x81\xd1\x82\xd0\xb8 \xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbb\xd0\xb5\xd0\xbd\xd1\x8b, \xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba\xd0\xb0\xd1\x8e \xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd1\x8c...\033[0m\n" << std::flush;
@@ -581,13 +593,35 @@ static void fatalSignalHandler(int sig) {
 // CONCLOSE_V1: перехват крестика консоли (CTRL_CLOSE_EVENT), выхода из системы и shutdown.
 // Windows даёт ~5 секунд до принудительного убийства процесса — успеваем сохранить
 // мир и игроков вместо мгновенной потери всего несохранённого.
+static bool serverLangRu() { // WINSAVE_V1
+    return g_server && g_server->getConfig().language == "rus";
+}
+
 static BOOL WINAPI consoleCtrlHandler(DWORD ctrlType) {
     if (ctrlType == CTRL_CLOSE_EVENT || ctrlType == CTRL_LOGOFF_EVENT || ctrlType == CTRL_SHUTDOWN_EVENT) {
-        std::cout << "\n\033[31m\033[1mВсе твои данные… будут потеряны если ты будешь меня закрывать принудительно\033[0m\n";
-        std::cout << "\033[33m...ладно, шучу. Экстренно сохраняю мир и игроков...\033[0m\n" << std::flush;
+        const bool ru = serverLangRu();
+        // WINSAVE_V1: Windows 11 / Windows Terminal убивает процесс быстрее, чем старая
+        // conhost, а окно исчезает сразу — поэтому всё дублируется в лог-файл, а у системы
+        // просим дополнительное время на завершение.
+        if (HWND consoleWnd = GetConsoleWindow())
+            ShutdownBlockReasonCreate(consoleWnd, ru ? L"Сохранение мира..." : L"Saving the world...");
+        std::cout << (ru
+            ? "\n\033[31m\033[1mВсе твои данные… будут потеряны если ты будешь меня закрывать принудительно\033[0m\n"
+            : "\n\033[31m\033[1mAll your data... will be lost if you keep killing me like that\033[0m\n") << std::flush;
+        std::cout << (ru
+            ? "\033[33m...ладно, шучу. Экстренно сохраняю мир и игроков...\033[0m\n"
+            : "\033[33m...okay, just kidding. Emergency-saving the world and players...\033[0m\n") << std::flush;
+        // те же строки в лог-файл: окно может уже закрыться, лог останется
+        if (ru) NC_INFO("Main", "Крестик консоли: экстренное сохранение мира и игроков");
+        else NC_INFO("Main", "Console close button: emergency world + player save");
         if (g_server) g_server->stop(); // сохранит мир + игроков и погасит сеть
         stopPanelProcess(); // AUTOSTARTPANEL_V1
-        std::cout << "\033[32mГотово, всё сохранено. Но лучше останавливай командой stop ;)\033[0m\n" << std::flush;
+        if (ru) NC_INFO("Main", "Готово, всё сохранено");
+        else NC_INFO("Main", "Done, everything is saved");
+        std::cout << (ru
+            ? "\033[32mГотово, всё сохранено. Но лучше останавливай командой stop ;)\033[0m\n"
+            : "\033[32mDone, everything is saved. Still, prefer the stop command ;)\033[0m\n") << std::flush;
+        if (HWND consoleWnd = GetConsoleWindow()) ShutdownBlockReasonDestroy(consoleWnd);
         return TRUE; // мы всё сделали — процесс может закрываться
     }
     return FALSE; // Ctrl+C / Ctrl+Break обрабатываются signalHandler'ом как раньше
@@ -599,6 +633,21 @@ void signalHandler(int signal) {
         NC_INFO("Main", "Received signal {}, stopping...", signal);
         g_server->stop();
     }
+}
+
+// EXITPAUSE_V1: при запуске двойным кликом Windows закрывает окно вместе с процессом,
+// и причину ошибки прочитать невозможно. Ждём любую клавишу — но только если
+// консоль наша собственная: в чужом терминале, .bat-е или CI пауза только мешает.
+static void pauseBeforeExit() {
+#ifdef _WIN32
+    DWORD pids[4] = {};
+    const DWORD owners = GetConsoleProcessList(pids, 4);
+    if (owners > 1) return; // окно переживёт наш выход — сообщение и так видно
+    std::cout << "\n\033[33mНажми любую клавишу, чтобы закрыть это окно...\033[0m\n"
+              << "\033[90mPress any key to close this window...\033[0m\n" << std::flush;
+    while (_kbhit()) (void)_getch(); // выгребаем случайные нажатия, иначе окно закроется сразу
+    (void)_getch();
+#endif
 }
 
 int main(int argc, char* argv[]) {
@@ -664,11 +713,14 @@ int main(int argc, char* argv[]) {
     g_server = &server;
 #ifdef _WIN32
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE); // CONCLOSE_V1: крестик = сохранить, потом закрыться
+    // WINSAVE_V1: просим Windows гасить нас ПОСЛЕДНИМИ при выходе/перезагрузке,
+    // чтобы успеть дописать мир (на Windows 11 окно закрывается агрессивнее).
+    SetProcessShutdownParameters(0x100, SHUTDOWN_NORETRY);
 #endif
     const bool started = nc::setup::needsSetup(configPath)
         ? server.startWithConfig(nc::setup::runWizard())
         : server.start(configPath);
-    if (!started) return 1;
+    if (!started) { pauseBeforeExit(); return 1; } // EXITPAUSE_V1
 
     if (server.getConfig().autoStartPanel) spawnPanelProcess(server.getConfig()); // AUTOSTARTPANEL_V1 / RCONENV_V1
 

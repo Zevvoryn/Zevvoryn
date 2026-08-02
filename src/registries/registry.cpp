@@ -250,6 +250,26 @@ void RegistryManager::registerStateVariants() {
     add("sea_pickle", {{"pickles", range(1, 4)}, {"waterlogged", kBool}});
     add("sniffer_egg", {{"hatch", range(0, 2)}});
 
+    // PORTALFIX_V1: без этого порталы были мертвы: запросы
+    // nether_portal[axis] и end_portal_frame[eye,facing] всегда давали nullopt.
+    // nether_portal: default = axis=x, диапазон ровно 2 состояния (5864..5865).
+    add("nether_portal", {{"axis", Values{"x", "z"}}});
+    // end_portal_frame: значение из таблицы = default = eye=false,facing=north
+    // (7411). Ванильный порядок bool — true, false, поэтому четвёрка eye=true
+    // лежит ПЕРЕД ней (в зазоре после end_portal), а не после — поэтому
+    // регистрируем руками, чтобы не заехать на ID end_stone.
+    {
+        const i32 frDef = baseOf("end_portal_frame");
+        if (frDef >= 4) {
+            for (int i = 0; i < 4; ++i) {
+                blockStates_.registerEntry({frDef - 4 + i, frDef,
+                    "minecraft:end_portal_frame", {{"eye", "true"}, {"facing", kHorizontal[i]}}});
+                blockStates_.registerEntry({frDef + i, frDef,
+                    "minecraft:end_portal_frame", {{"eye", "false"}, {"facing", kHorizontal[i]}}});
+            }
+        }
+    }
+
     // CANDLE_LANTERN_STATE_V1: needed so CANDLE_SUPPORT_V1 / LANTERN_SUPPORT_V1
     // (server.cpp) can read "hanging"/"lit"/"waterlogged" instead of always
     // getting an empty properties map.

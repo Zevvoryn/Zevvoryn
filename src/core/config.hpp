@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <sstream>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <algorithm>
@@ -52,6 +53,10 @@ struct ServerConfig {
     std::string levelName       = "world";
     std::string generator       = "DEFAULT";   // DEFAULT, FLAT, VOID // WORLDTYPE_DEFAULT_V1: стандартный мир теперь дефолт
     i64 levelSeed               = 0;
+    // DIMTOGGLE_V1: миры Ада и Энда можно вообще не создавать (спрашивает мастер установки).
+    // Выключено = нет генерации, порталы не зажигаются, /nether и /end отвечают отказом.
+    bool enableNether           = true;
+    bool enableEnd              = true;
 
     // ── Геймплей ──
     std::string gamemode        = "creative";
@@ -85,9 +90,9 @@ struct ServerConfig {
     i32  rconPort            = 25575;
     std::string rconPassword;
     i32  rconMaxClients      = 4;
-    bool rconLogCommands     = true;
+    bool rconLogCommands     = false; // RCONQUIET_V1: панель опрашивает сервер постоянно — по умолчанию молчим
 
-    // AUTOSTARTPANEL_V1: автозапуск Discord-бота/веб-панели (DiscrordBotRcon) вместе с zevvoryn.exe
+    // AUTOSTARTPANEL_V1: автозапуск Discord-бота/веб-панели (DiscordBotRcon) вместе с zevvoryn.exe
     bool autoStartPanel      = false;
 
     // ── Парсинг key=value ──
@@ -135,6 +140,8 @@ struct ServerConfig {
         else if (lk == "level-name")            levelName = val;
         else if (lk == "generator")            { generator = toLower(val); }
         else if (lk == "level-seed")            levelSeed = static_cast<i64>(std::stoll(val.empty() ? "0" : val));
+        else if (lk == "enable-nether")         enableNether = toBool(val); // DIMTOGGLE_V1
+        else if (lk == "enable-end")            enableEnd = toBool(val);    // DIMTOGGLE_V1
         else if (lk == "gamemode")              gamemode = toLower(val);
         else if (lk == "force-gamemode")        forceGamemode = toBool(val);
         else if (lk == "pvp")                   pvp = toBool(val);
@@ -237,6 +244,13 @@ struct ServerConfig {
         out << "generator=" << generator << "\n";
         out << (ru ? "# \xd0\xa1\xd0\xb8\xd0\xb4 \xd0\xbc\xd0\xb8\xd1\x80\xd0\xb0 (0 = \xd1\x81\xd0\xbb\xd1\x83\xd1\x87\xd0\xb0\xd0\xb9\xd0\xbd\xd0\xbe\xd0\xb5)\n" : "# World seed (0 = random)\n");
         out << "level-seed=" << levelSeed << "\n";
+        // DIMTOGGLE_V1
+        out << (ru ? "# Создавать мир Ада (Nether). false = измерения нет, порталы не зажигаются\n"
+                   : "# Generate the Nether. false = no such dimension, portals stay dead\n");
+        out << "enable-nether=" << boolToStr(enableNether) << "\n";
+        out << (ru ? "# Создавать мир Энда (End). false = измерения нет, око Эндера не сработает\n"
+                   : "# Generate the End. false = no such dimension, the eye of ender does nothing\n");
+        out << "enable-end=" << boolToStr(enableEnd) << "\n";
         out << "\n";
 
         out << (ru ? "# === \xd0\x93\xd0\xb5\xd0\xb9\xd0\xbc\xd0\xbf\xd0\xbb\xd0\xb5\xd0\xb9 ===\n" : "# === Gameplay ===\n");
@@ -463,6 +477,53 @@ inline SysInfo detectSysInfo() {
     return si;
 }
 
+// SINGLEPASS_V1: раньше установщик спрашивал три пароля: RCON, веб-панель и рут.
+// Пароль RCON человеку не нужен вообще — это внутренний токен между сервером
+// и панелью/ботом на той же машине, поэтому генерируем его сами.
+inline std::string makeSecret(std::size_t len = 24) {
+    static const char kAlphabet[] = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    std::random_device rd;
+    std::mt19937_64 gen(((u64)rd() << 32) ^ (u64)rd());
+    std::uniform_int_distribution<int> pick(0, (int)sizeof(kAlphabet) - 2);
+    std::string out;
+    out.reserve(len);
+    for (std::size_t i = 0; i < len; ++i) out.push_back(kAlphabet[pick(gen)]);
+    return out;
+}
+
+// SINGLEPASS_V1: если DiscordBotRcon/.env уже существует, подменяем в нём строку
+// RCON_PASSWORD, чтобы панель и сервер никогда не разъехались по токену.
+inline void syncEnvRconPassword(const std::string& password) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path envPath = fs::path("DiscordBotRcon") / ".env";
+    if (!fs::exists(envPath, ec)) return;
+    std::ifstream in(envPath, std::ios::binary);
+    if (!in.is_open()) return;
+    std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    std::string out;
+    out.reserve(all.size() + 64);
+    std::size_t pos = 0;
+    bool replaced = false;
+    while (pos <= all.size()) {
+        std::size_t nl = all.find('\n', pos);
+        std::string line = all.substr(pos, (nl == std::string::npos ? all.size() : nl) - pos);
+        if (line.rfind("RCON_PASSWORD=", 0) == 0) {
+            const bool crlf = (!line.empty() && line.back() == '\r');
+            line = "RCON_PASSWORD=" + password + (crlf ? "\r" : "");
+            replaced = true;
+        }
+        out += line;
+        if (nl == std::string::npos) break;
+        out += '\n';
+        pos = nl + 1;
+    }
+    if (!replaced) out += "\r\nRCON_PASSWORD=" + password + "\r\n";
+    std::ofstream ov(envPath, std::ios::binary | std::ios::trunc);
+    if (ov.is_open()) ov << out;
+}
+
 inline ServerConfig runWizard() { // WIZARD_BACK_V1
     ServerConfig cfg;
     // WIZARD_RCON_BOT_V1 / WIZARD_WEB_V1
@@ -472,7 +533,6 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
     i32  wizardWebPort    = 3000;
     std::string wizardWebPassword;
     std::string wizardWebHost = "127.0.0.1";  // WIZARD_WEBHOST_V3: 127.0.0.1 | 0.0.0.0 | a specific interface IP
-    std::string wizardWebRootPassword;      // WIZARD_WEBPASS_V2: второй (рут) пароль панели
     i32  wizardWebSessionTtl = 720;         // WIZARD_WEBPASS_V2: жизнь сессии, минут
     // WIZARD_WHITELIST_V1
     std::vector<std::string> wizardWhitelistNames;
@@ -517,6 +577,12 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
             std::string genChoice = readLine(ru ? "  \xd0\x93\xd0\xb5\xd0\xbd\xd0\xb5\xd1\x80\xd0\xb0\xd1\x82\xd0\xbe\xd1\x80" : "  Generator", "1");
             cfg.generator = (genChoice == "2") ? "FLAT" : "DEFAULT"; // WIZARD_WORLDTYPE_V1: DEFAULT теперь выбор по умолчанию (Enter)
             cfg.levelSeed = readInt64(ru ? "  \xd0\xa1\xd0\xb8\xd0\xb4 (0 = \xd1\x81\xd0\xbb\xd1\x83\xd1\x87\xd0\xb0\xd0\xb9\xd0\xbd\xd0\xbe\xd0\xb5)" : "  Seed (0 = random)", cfg.levelSeed);
+            // DIMTOGGLE_V1: спрашиваем, нужны ли вообще Ад и Энд.
+            cfg.enableNether = readBool(ru ? "  Создавать мир Ада (Nether) y/n" : "  Generate the Nether y/n", cfg.enableNether);
+            cfg.enableEnd = readBool(ru ? "  Создавать мир Энда (End) y/n" : "  Generate the End y/n", cfg.enableEnd);
+            if (!cfg.enableNether || !cfg.enableEnd)
+                std::cout << (ru ? "  Ок: выключенный мир не генерируется, его порталы не зажигаются, /nether и /end скажут, что мир выключен.\n"
+                                 : "  Ok: a disabled dimension is never generated, its portals stay dead, /nether and /end will refuse.\n");
             std::cout << "\n";
             break;
         }
@@ -644,14 +710,13 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
             cfg.enableRcon = readBool(ru ? "  \xd0\x92\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb8\xd1\x82\xd1\x8c RCON y/n" : "  Enable RCON y/n", false);
             if (cfg.enableRcon) {
                 cfg.rconPort = readInt(ru ? "  \xd0\x9f\xd0\xbe\xd1\x80\xd1\x82 RCON" : "  RCON port", cfg.rconPort);
-                cfg.rconPassword = readLine(ru ? "  \xd0\x9f\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c RCON (\xd0\xbd\xd0\xb5 \xd0\xbe\xd1\x81\xd1\x82\xd0\xb0\xd0\xb2\xd0\xbb\xd1\x8f\xd0\xb9\xd1\x82\xd0\xb5 \xd0\xbf\xd1\x83\xd1\x81\xd1\x82\xd1\x8b\xd0\xbc!)" : "  RCON password", "");
-                if (cfg.rconPassword.empty()) {
-                    std::cout << (ru ? "  ! \xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xbe\xd0\xb9 \xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c \xe2\x80\x94 RCON \xd0\xb2\xd1\x8b\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd.\n" : "  ! Empty password - RCON disabled.\n");
-                    cfg.enableRcon = false;
-                } else {
-                    cfg.rconMaxClients = readInt(ru ? "  \xd0\x9c\xd0\xb0\xd0\xba\xd1\x81. \xd0\xba\xd0\xbb\xd0\xb8\xd0\xb5\xd0\xbd\xd1\x82\xd0\xbe\xd0\xb2 RCON" : "  Max RCON clients", cfg.rconMaxClients);
-                    cfg.rconLogCommands = readBool(ru ? "  \xd0\x9b\xd0\xbe\xd0\xb3\xd0\xb8\xd1\x80\xd0\xbe\xd0\xb2\xd0\xb0\xd1\x82\xd1\x8c \xd0\xba\xd0\xbe\xd0\xbc\xd0\xb0\xd0\xbd\xd0\xb4\xd1\x8b RCON y/n" : "  Log RCON commands y/n", true);
-                }
+                // SINGLEPASS_V1: пароль RCON больше не спрашиваем: это внутренний токен,
+                // который человек всё равно никогда не вводит руками.
+                if (cfg.rconPassword.empty()) cfg.rconPassword = makeSecret(24);
+                std::cout << (ru ? "  Пароль RCON сгенерирован автоматически и попадёт в .env — запоминать его не нужно.\n"
+                                 : "  The RCON password was generated automatically and goes into .env - you never need it.\n");
+                cfg.rconMaxClients = readInt(ru ? "  Макс. клиентов RCON" : "  Max RCON clients", cfg.rconMaxClients);
+                cfg.rconLogCommands = readBool(ru ? "  Логировать команды RCON y/n" : "  Log RCON commands y/n", true);
             }
             std::cout << "\n";
             break;
@@ -696,7 +761,7 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
                 std::cout << (ru ? "    2) 0.0.0.0   \xe2\x80\x94 \xd0\xbb\xd1\x8e\xd0\xb1\xd0\xbe\xd0\xb9 IP: \xd0\xbb\xd0\xbe\xd0\xba\xd0\xb0\xd0\xbb\xd0\xba\xd0\xb0, \xd0\xb4\xd1\x80\xd1\x83\xd0\xb3\xd0\xbe\xd0\xb9 \xd0\x9f\xd0\x9a, \xd0\xb8\xd0\xbd\xd1\x82\xd0\xb5\xd1\x80\xd0\xbd\xd0\xb5\xd1\x82 (\xd0\xbd\xd1\x83\xd0\xb6\xd0\xb5\xd0\xbd \xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c!)\n" : "    2) 0.0.0.0   - any IP: LAN, another PC, the internet (password required!)\n");
                 const i32 webHostChoice = readInt((ru ? "  \xd0\x92\xd1\x8b\xd0\xb1\xd0\xbe\xd1\x80" : "  Choice"), 1);
                 wizardWebHost = (webHostChoice == 2) ? "0.0.0.0" : "127.0.0.1";
-                std::cout << (ru ? "  \xd0\x9d\xd1\x83\xd0\xb6\xd0\xb5\xd0\xbd \xd0\xba\xd0\xbe\xd0\xbd\xd0\xba\xd1\x80\xd0\xb5\xd1\x82\xd0\xbd\xd1\x8b\xd0\xb9 IP \xd0\xb8\xd0\xbd\xd1\x82\xd0\xb5\xd1\x80\xd1\x84\xd0\xb5\xd0\xb9\xd1\x81\xd0\xb0? \xd0\x92\xd0\xbf\xd0\xb8\xd1\x88\xd0\xb8\xd1\x82\xd0\xb5 \xd0\xb5\xd0\xb3\xd0\xbe \xd0\xbf\xd0\xbe\xd1\x82\xd0\xbe\xd0\xbc \xd0\xb2 DiscrordBotRcon/.env \xd0\xb2 WEB_HOST.\n" : "  Need a specific interface IP? Put it into WEB_HOST in DiscrordBotRcon/.env later.\n");
+                std::cout << (ru ? "  \xd0\x9d\xd1\x83\xd0\xb6\xd0\xb5\xd0\xbd \xd0\xba\xd0\xbe\xd0\xbd\xd0\xba\xd1\x80\xd0\xb5\xd1\x82\xd0\xbd\xd1\x8b\xd0\xb9 IP \xd0\xb8\xd0\xbd\xd1\x82\xd0\xb5\xd1\x80\xd1\x84\xd0\xb5\xd0\xb9\xd1\x81\xd0\xb0? \xd0\x92\xd0\xbf\xd0\xb8\xd1\x88\xd0\xb8\xd1\x82\xd0\xb5 \xd0\xb5\xd0\xb3\xd0\xbe \xd0\xbf\xd0\xbe\xd1\x82\xd0\xbe\xd0\xbc \xd0\xb2 DiscordBotRcon/.env \xd0\xb2 WEB_HOST.\n" : "  Need a specific interface IP? Put it into WEB_HOST in DiscordBotRcon/.env later.\n");
                 wizardWebPort = readInt((ru ? "  \xd0\x9f\xd0\xbe\xd1\x80\xd1\x82 \xd0\xb2\xd0\xb5\xd0\xb1-\xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd0\xb8" : "  Web panel port"), 3000);
                 std::cout << (ru ? "  \xd0\x9f\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c \xd0\xbd\xd1\x83\xd0\xb6\xd0\xb5\xd0\xbd \xd0\xb4\xd0\xbb\xd1\x8f \xd0\xb2\xd1\x85\xd0\xbe\xd0\xb4\xd0\xb0 \xd0\xb2 \xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd1\x8c \xd0\xb2 \xd0\xb1\xd1\x80\xd0\xb0\xd1\x83\xd0\xb7\xd0\xb5\xd1\x80\xd0\xb5. \xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xbe = \xd0\xb2\xd1\x85\xd0\xbe\xd0\xb4 \xd0\xb1\xd0\xb5\xd0\xb7 \xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8f.\n" : "  The password is used to log into the panel in a browser. Empty = no login required.\n");
                 wizardWebPassword = readLine((ru ? "  \xd0\x9f\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c \xd0\xb2\xd0\xb5\xd0\xb1-\xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd0\xb8 (Enter = \xd0\xb1\xd0\xb5\xd0\xb7 \xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8f)" : "  Web panel password (Enter = none)"), "");
@@ -707,8 +772,6 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
                 if (wizardWebPassword.empty()) {
                     std::cout << (ru ? "  ! \xd0\x91\xd0\xb5\xd0\xb7 \xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8f \xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd1\x8c \xd0\xbe\xd1\x82\xd0\xba\xd1\x80\xd0\xbe\xd0\xb5\xd1\x82 \xd0\xbb\xd1\x8e\xd0\xb1\xd0\xbe\xd0\xb9, \xd1\x83 \xd0\xba\xd0\xbe\xd0\xb3\xd0\xbe \xd0\xb5\xd1\x81\xd1\x82\xd1\x8c \xd0\xb4\xd0\xbe\xd1\x81\xd1\x82\xd1\x83\xd0\xbf \xd0\xba \xd1\x8d\xd1\x82\xd0\xbe\xd0\xb9 \xd0\xbc\xd0\xb0\xd1\x88\xd0\xb8\xd0\xbd\xd0\xb5.\n" : "  ! Without a password anyone with access to this machine can open the panel.\n");
                 }
-                std::cout << (ru ? "  \xd0\xa0\xd1\x83\xd1\x82-\xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c \xe2\x80\x94 \xd0\xb2\xd1\x82\xd0\xbe\xd1\x80\xd0\xbe\xd0\xb9, \xd0\xbd\xd0\xb5\xd0\xb7\xd0\xb0\xd0\xb2\xd0\xb8\xd1\x81\xd0\xb8\xd0\xbc\xd1\x8b\xd0\xb9 \xd0\xb2\xd1\x85\xd0\xbe\xd0\xb4 \xd1\x81 \xd0\xbf\xd0\xbe\xd0\xbb\xd0\xbd\xd1\x8b\xd0\xbc \xd0\xb4\xd0\xbe\xd1\x81\xd1\x82\xd1\x83\xd0\xbf\xd0\xbe\xd0\xbc. \xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xbe = \xd0\xb2\xd1\x8b\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd\xd0\xbe.\n" : "  Root password - a second, independent login with full access. Empty = disabled.\n");
-                wizardWebRootPassword = readLine((ru ? "  \xd0\xa0\xd1\x83\xd1\x82-\xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c (Enter = \xd0\xb2\xd1\x8b\xd0\xba\xd0\xbb)" : "  Root password (Enter = off)"), "");
                 wizardWebSessionTtl = readInt((ru ? "  \xd0\x96\xd0\xb8\xd0\xb7\xd0\xbd\xd1\x8c \xd1\x81\xd0\xb5\xd1\x81\xd1\x81\xd0\xb8\xd0\xb8 \xd0\xbf\xd0\xbe\xd1\x81\xd0\xbb\xd0\xb5 \xd0\xb2\xd1\x85\xd0\xbe\xd0\xb4\xd0\xb0, \xd0\xbc\xd0\xb8\xd0\xbd\xd1\x83\xd1\x82 (720 = 12 \xd1\x87\xd0\xb0\xd1\x81\xd0\xbe\xd0\xb2)" : "  Session lifetime after login, minutes (720 = 12 hours)"), wizardWebSessionTtl);
                 if (wizardWebSessionTtl <= 0) wizardWebSessionTtl = 720;
             }
@@ -756,11 +819,11 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
         }
     }
 
-    // WIZARD_RCON_BOT_V1 / WIZARD_WEB_V1: write DiscrordBotRcon/.env
+    // WIZARD_RCON_BOT_V1 / WIZARD_WEB_V1: write DiscordBotRcon/.env
     if ((wizardBotSetup && !wizardBotToken.empty()) || wizardWebEnabled) {
         std::error_code ec;
-        std::filesystem::create_directories("DiscrordBotRcon", ec);
-        std::ofstream ev("DiscrordBotRcon/.env", std::ios::trunc);
+        std::filesystem::create_directories("DiscordBotRcon", ec);
+        std::ofstream ev("DiscordBotRcon/.env", std::ios::trunc);
         if (ev.is_open()) {
             // WIZARD_ENVDOC_V1: .env пишется с комментариями на языке, выбранном на шаге 1
             const std::string envRule(75, '=');
@@ -799,21 +862,19 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
             ev << "WEB_PORT=" << wizardWebPort << "\r\n";
             ev << "# " << (ru ? "\xd0\x9f\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c \xd0\xb4\xd0\xbb\xd1\x8f \xd0\xb2\xd1\x85\xd0\xbe\xd0\xb4\xd0\xb0 \xd0\xb2 \xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd1\x8c. \xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xbe = \xd0\xb1\xd0\xb5\xd0\xb7 \xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8f (\xd0\xbd\xd0\xb5 \xd1\x80\xd0\xb5\xd0\xba\xd0\xbe\xd0\xbc\xd0\xb5\xd0\xbd\xd0\xb4\xd1\x83\xd0\xb5\xd1\x82\xd1\x81\xd1\x8f)." : "Login password for the panel. Empty = no password (not recommended).") << "\r\n";
             ev << "WEB_PASSWORD=" << wizardWebPassword << "\r\n";
-            ev << "# " << (ru ? "\xd0\x92\xd1\x82\xd0\xbe\xd1\x80\xd0\xbe\xd0\xb9 (\xd1\x80\xd1\x83\xd1\x82) \xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c \xd1\x81 \xd0\xbf\xd0\xbe\xd0\xbb\xd0\xbd\xd1\x8b\xd0\xbc \xd0\xb4\xd0\xbe\xd1\x81\xd1\x82\xd1\x83\xd0\xbf\xd0\xbe\xd0\xbc. \xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xbe = \xd0\xb2\xd1\x8b\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd\xd0\xbe." : "Second (root) password with full access. Empty = disabled.") << "\r\n";
-            ev << "WEB_ROOT_PASSWORD=" << wizardWebRootPassword << "\r\n";
             ev << "# " << (ru ? "\xd0\x96\xd0\xb8\xd0\xb7\xd0\xbd\xd1\x8c \xd1\x81\xd0\xb5\xd1\x81\xd1\x81\xd0\xb8\xd0\xb8 \xd0\xbf\xd0\xbe\xd1\x81\xd0\xbb\xd0\xb5 \xd0\xb2\xd1\x85\xd0\xbe\xd0\xb4\xd0\xb0, \xd0\xbc\xd0\xb8\xd0\xbd\xd1\x83\xd1\x82 (720 = 12 \xd1\x87\xd0\xb0\xd1\x81\xd0\xbe\xd0\xb2). \xd0\xa0\xd0\xb5\xd1\x81\xd1\x82\xd0\xb0\xd1\x80\xd1\x82 \xd1\x81\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80\xd0\xb0 \xd1\x80\xd0\xb0\xd0\xb7\xd0\xbb\xd0\xbe\xd0\xb3\xd0\xb8\xd0\xbd\xd0\xb8\xd0\xb2\xd0\xb0\xd0\xb5\xd1\x82 \xd0\xb2\xd1\x81\xd0\xb5\xd1\x85." : "Session lifetime after login, minutes (720 = 12 hours). A server restart logs everyone out.") << "\r\n";
             ev << "WEB_SESSION_TTL_MIN=" << wizardWebSessionTtl << "\r\n";
             ev << (ru ? "# \xd0\xaf\xd0\xb7\xd1\x8b\xd0\xba \xd0\xb8\xd0\xbd\xd1\x82\xd0\xb5\xd1\x80\xd1\x84\xd0\xb5\xd0\xb9\xd1\x81\xd0\xb0 \xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd0\xb8 \xd0\xbf\xd0\xbe \xd1\x83\xd0\xbc\xd0\xbe\xd0\xbb\xd1\x87\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x8e: ru \xd0\xb8\xd0\xbb\xd0\xb8 en (\xd0\xb2 \xd0\xb1\xd1\x80\xd0\xb0\xd1\x83\xd0\xb7\xd0\xb5\xd1\x80\xd0\xb5 \xd0\xb5\xd1\x81\xd1\x82\xd1\x8c \xd0\xbf\xd0\xb5\xd1\x80\xd0\xb5\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb0\xd1\x82\xd0\xb5\xd0\xbb\xd1\x8c).\r\n" : "# Default panel UI language: ru or en (there is a switch in the browser).\r\n");
             ev << "WEB_LANG=" << (ru ? "ru" : "en") << "\r\n";
             ev.close();
-            std::cout << "  [OK] DiscrordBotRcon/.env " << (ru ? "\xd1\x81\xd0\xbe\xd0\xb7\xd0\xb4\xd0\xb0\xd0\xbd" : "created") << "\n";
+            std::cout << "  [OK] DiscordBotRcon/.env " << (ru ? "\xd1\x81\xd0\xbe\xd0\xb7\xd0\xb4\xd0\xb0\xd0\xbd" : "created") << "\n";
             if (wizardBotSetup && !wizardBotToken.empty()) {
-                std::cout << (ru ? "  \xd0\x91\xd0\xbe\xd1\x82: cd DiscrordBotRcon && npm install && npm run deploy && npm start\n"
-                                 : "  Bot: cd DiscrordBotRcon && npm install && npm run deploy && npm start\n");
+                std::cout << (ru ? "  \xd0\x91\xd0\xbe\xd1\x82: cd DiscordBotRcon && npm install && npm run deploy && npm start\n"
+                                 : "  Bot: cd DiscordBotRcon && npm install && npm run deploy && npm start\n");
             }
             if (wizardWebEnabled) {
-                std::cout << (ru ? "  \xd0\x92\xd0\xb5\xd0\xb1: cd DiscrordBotRcon && npm install && npm start (\xd0\xb2\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb0 \xd0\xbf\xd0\xbe \xd1\x83\xd0\xbc\xd0\xbe\xd0\xbb\xd1\x87\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x8e)\n"
-                                 : "  Web: cd DiscrordBotRcon && npm install && npm start (auto-starts by default)\n");
+                std::cout << (ru ? "  \xd0\x92\xd0\xb5\xd0\xb1: cd DiscordBotRcon && npm install && npm start (\xd0\xb2\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb0 \xd0\xbf\xd0\xbe \xd1\x83\xd0\xbc\xd0\xbe\xd0\xbb\xd1\x87\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x8e)\n"
+                                 : "  Web: cd DiscordBotRcon && npm install && npm start (auto-starts by default)\n");
                 std::cout << "  URL: http://" << (wizardWebHost == "0.0.0.0" ? std::string("127.0.0.1") : wizardWebHost)
                           << ":" << wizardWebPort
                           << (wizardWebHost == "0.0.0.0" ? (ru ? "  (\xd0\xb0 \xd1\x82\xd0\xb0\xd0\xba\xd0\xb6\xd0\xb5 \xd0\xbf\xd0\xbe IP \xd1\x8d\xd1\x82\xd0\xbe\xd0\xb9 \xd0\xbc\xd0\xb0\xd1\x88\xd0\xb8\xd0\xbd\xd1\x8b \xd0\xb8\xd0\xb7 \xd1\x81\xd0\xb5\xd1\x82\xd0\xb8)" : "  (and from the network by this machine IP)") : "") << "\n";

@@ -1,5 +1,5 @@
-// AUTOEXTRACT_V1: embedded DiscrordBotRcon source files, auto-generated.
-// Do not hand-edit; regenerate from DiscrordBotRcon/*.js if the bot source changes.
+// AUTOEXTRACT_V1: embedded DiscordBotRcon source files, auto-generated.
+// Do not hand-edit; regenerate from DiscordBotRcon/*.js if the bot source changes.
 // NOTE: each file's content is split into small adjacent raw-string-literal chunks
 // (which the compiler concatenates at compile time) because MSVC's single raw
 // string literal token has a much lower practical limit than its documented
@@ -279,6 +279,7 @@ require('dotenv').config();
 const http    = require('http');
 const path    = require('path');
 const fs      = require('fs');
+const os      = require('os'); // LANHINT_V1
 const crypto  = require('crypto');
 const express = require('express');
 const { WebSocketServer } = require('ws');
@@ -293,8 +294,8 @@ const DEFAULT_LANG = String(process.env.WEB_LANG || 'en').trim().toLowerCase().s
 const PORT     = Number(process.env.WEB_PORT || 3000);
 const PASSWORD = process.env.WEB_PASSWORD || '';
 // AUTHFORM_V1: рут-пароль — второй независимый вход (полный доступ)
-const ROOT_PASSWORD  = process.env.ROOT_PASSWORD || process.env.WEB_ROOT_PASSWORD || '';
-const AUTH_ENABLED   = Boolean(PASSWORD || ROOT_PASSWORD);
+// SINGLEPASS_V1: рут-пароль убран. У панели ровно один пароль — WEB_PASSWORD.
+const AUTH_ENABLED   = Boolean(PASSWORD);
 const SESSION_TTL_MS = Number(process.env.WEB_SESSION_TTL_MIN || 720) * 60 * 1000;
 // секрет новый на каждый запуск => рестарт сервера разлогинивает всех
 const SESSION_SECRET = crypto.randomBytes(32).toString('hex');
@@ -385,7 +386,6 @@ function noteFail(ip) {
 
 const LOGIN_TABS = [];
 if (PASSWORD)      LOGIN_TABS.push('web');
-if (ROOT_PASSWORD) LOGIN_TABS.push('root');
 
 function loginPage() {
     return `<!DOCTYPE html>
@@ -615,7 +615,7 @@ var eulaLink = document.getElementById('eula-link');
         'If the Operator has no soul, a spare of comparable quality must be supplied within 30 days. Otherwise the Operator consents to being haunted by minor rendering glitches.',
         'The soul is stored in RAM and flushed to disk on restart. Please run save-all before rebooting the server.',
         'Creepers, lava, and your friend who typed /kill @a are expressly not covered by this agreement.',
-        'Support hours for soul-related claims: never o\'clock, on the second Tuesday of next week.'
+        'Support hours for soul-related claims: never o clock, on the second Tuesday of next week.'
       ],
       fine: 'Legal effect of this document: exactly zero. It is a joke. This panel talks only to your own server over RCON, stores nothing in the cloud, and your soul stays exactly where it was.',
       agree: 'I have read the above and hereby sell my soul (and agree that this is a joke).',
@@ -644,6 +644,7 @@ var eulaLink = document.getElementById('eula-link');
     }
   };
   var t = TXT[L];
+  window.EULA_TXT = t;
   var back = document.getElementById('eula-back');
   if (!back) return;
   document.getElementById('eula-title').textContent = t.title;
@@ -898,6 +899,7 @@ body {
     <div class="nav-item active" data-tab="dashboard-tab">📊 Дашборд</div>
     <div class="nav-item" data-tab="console-tab">💻 Консоль</div>
     <div class="nav-item" data-tab="settings-tab">⚙️ Настройки</div>
+    <div class="nav-item" data-tab="eula-tab">📜 Соглашение</div>
   </nav>
   <div class="footer">WEBPANEL_V3 &bull; ${HOST}:${PORT}</div>
 </div>
@@ -914,6 +916,8 @@ body {
       <div class="card stat"><div class="label"><span class="ico">🎮</span>Игроки онлайн</div><div class="value" id="card-players">${MAX_PLAYERS !== null ? '0 / ' + MAX_PLAYERS : '0 / ?'}</div><div class="sub" id="sub-players">Свободных слотов: —</div></div>
       <div class="card stat"><div class="label"><span class="ico">🛡️</span>Whitelist</div><div class="value" id="card-whitelist">—</div><div class="sub" id="sub-whitelist">Записей: —</div></div>
       <div class="card stat"><div class="label"><span class="ico">📡</span>Пинг WS</div><div class="value" id="card-ping">—</div><div class="sub" id="sub-ping">Обновлено: —</div></div>
+      <div class="card stat"><div class="label"><span class="ico">🧠</span>ЦП сервера</div><div class="value" id="card-cpu">—</div><div class="sub" id="sub-cpu">Ядер: —</div></div>
+      <div class="card stat"><div class="label"><span class="ico">💾</span>ОЗУ сервера</div><div class="value" id="card-ram">—</div><div class="sub" id="sub-ram">TPS: —</div></div>
     </div>
     <div class="dash-cols">
       <div class="card">
@@ -972,7 +976,7 @@ body {
   <div class="tab-panel" id="settings-tab">
     <div class="card">
       <div class="settings-row"><span class="k">RCON адрес</span><span id="set-rcon-addr">${RCON_CFG.host}:${RCON_CFG.port}</span></div>
-      <div class="settings-row"><span class="k">Защита паролем</span><span id="set-pass">${AUTH_ENABLED ? (PASSWORD && ROOT_PASSWORD ? 'Включена (пароль веба + рут)' : PASSWORD ? 'Включена (пароль веба)' : 'Включена (только рут-пароль)') : 'Отключена (WEB_PASSWORD и WEB_ROOT_PASSWORD не заданы)'}</span></div>
+      <div class="settings-row"><span class="k">Защита паролем</span><span id="set-pass">${AUTH_ENABLED ? 'Включена (пароль веба)' : 'Отключена (WEB_PASSWORD не задан)'}</span></div>
       <div class="settings-row"><span class="k">Макс. игроков</span><span>${MAX_PLAYERS !== null ? MAX_PLAYERS : 'не найдено в settings.properties'}</span></div>${AUTH_ENABLED ? '\n      <div class="settings-row"><span class="k">Сессия</span><span class="quick-actions"><button class="btn-logout" id="logout-btn">Выйти</button></span></div>' : ''}
       <div class="settings-row"><span class="k">Соглашение</span><span class="quick-actions"><button class="quick" id="eula-open">Открыть</button></span></div>
       <div class="settings-row"><span class="k">Доступ</span><span>${BIND_ALL ? 'любой IP (0.0.0.0)' : (LOCAL_ONLY ? 'только эта машина' : HOST)}</span></div>
@@ -983,6 +987,15 @@ body {
           <button class="quick" data-cmd="whitelist list">Список</button>
         </span>
       </div>
+    </div>
+  </div>
+  <div class="tab-panel" id="eula-tab">
+    <div class="card" style="max-width:860px">
+      <h2 id="eula-tab-title" style="margin:0 0 6px;font-size:18px">END USER SOUL AGREEMENT (v1.0)</h2>
+      <div id="eula-tab-sub" style="color:var(--text-secondary);font-size:13px;margin-bottom:12px">Please read carefully. Or do not. Nobody ever does.</div>
+      <ol id="eula-tab-list" style="padding-left:18px;line-height:1.7;font-size:13px;margin:0"><li>You receive a revocable licence to shout commands at your Minecraft server through this panel.</li><li>In exchange, RCON Panel receives one immortal soul, gently used, as-is, with no refunds.</li><li>If you have no soul, please supply a comparable spare within 30 days.</li><li>Creepers, lava, and /kill @a are not covered.</li></ol>
+      <div id="eula-tab-fine" style="color:var(--text-secondary);font-size:12px;margin-top:12px">Legal effect: zero. This is a joke. The panel only talks to your own server and stores nothing in the cloud.</div>
+      <div class="quick-actions" style="margin-top:14px"><button class="quick" id="eula-tab-open">Sign it in blood</button></div>
     </div>
   </div>
 </div>
@@ -1104,8 +1117,10 @@ inp.addEventListener('keydown', e => {
 btn.addEventListener('click', () => send());
 const logoutBtn = document.getElementById('logout-btn');   // AUTHFORM_V1
 if (logoutBtn) logoutBtn.addEventListener('click', () => { location.href = '/logout'; });
+// EULAFIX_V1: кнопка «Соглашение → Открыть» тоже имеет класс .quick, но без data-cmd —
+// раньше клик по ней уходил в send(undefined) и падал, так что окно не открывалось.
 document.querySelectorAll('.quick').forEach(b =>
-  b.addEventListener('click', () => { send(b.dataset.cmd); })
+  b.addEventListener('click', () => { if (b.dataset.cmd) send(b.dataset.cmd); })
 );
 
 // WEBPANEL_V2: переключение вкладок
@@ -1118,7 +1133,9 @@ document.querySelectorAll('.nav-item').forEach(item => {
     item.classList.add('active');
     const tab = item.dataset.tab;
     document.getElementById(tab).classList.add('active');
-    pageTitle.textContent = navTitles[tab] || '';
+    pageTitle.textContent = navTitles[tab] || (tab === 'eula-tab' ? 'Agreement' : '');
+    // EULATAB_V3: invoke the renderer from the only tab-switching code path.
+    if (tab === 'eula-tab' && typeof window.renderEulaTab === 'function') window.renderEulaTab();
     refreshOnTab(tab);   // QUIET_STATUS_V2: dashboard refresh on tab switch
     if (tab === 'console-tab') inp.focus();
   });
@@ -1133,6 +1150,11 @@ const cardPing      = document.getElementById('card-ping');
 function refreshOnTab(tabId) { if (tabId === 'dashboard-tab') pollStatus(); }
 // DASH_V4: extra dashboard widgets
 var subPlayers = document.getElementById('sub-players');
+// WEBRES_V1: карточки нагрузки сервера (ЦП/ОЗУ/TPS)
+var cardCpu = document.getElementById('card-cpu');
+var cardRam = document.getElementById('card-ram');
+var subCpu  = document.getElementById('sub-cpu');
+var subRam  = document.getElementById('sub-ram');
 var subWl      = document.getElementById('sub-whitelist');
 var subPing    = document.getElementById('sub-ping');
 var infoUptime = document.getElementById('info-uptime');
@@ -1203,6 +1225,12 @@ function pollStatus() {
       if (infoUptime && d.uptime !== undefined) infoUptime.textContent = fmtUptime(d.uptime);
       if (infoNode && d.node) infoNode.textContent = d.node;
       if (subPing) subPing.textContent = 'Обновлено: ' + new Date().toLocaleTimeString();
+      // WEBRES_V1: цифры нагрузки приходят из команды "stats" сервера
+      var LC = (localStorage.getItem('rcon_lang') || (window.PANEL_DEFAULT_LANG || 'en'));
+      if (cardCpu && d.cpu !== undefined && d.cpu !== null) cardCpu.textContent = Number(d.cpu).toFixed(0) + ' %';
+      if (subCpu && d.cores) subCpu.textContent = (LC === 'ru' ? 'Ядер: ' : 'Cores: ') + d.cores;
+      if (cardRam && d.ramMb !== undefined && d.ramMb !== null) cardRam.textContent = Number(d.ramMb).toFixed(0) + ' MB';
+      if (subRam && d.tps !== undefined && d.tps !== null) subRam.textContent = 'TPS: ' + Number(d.tps).toFixed(2);
       renderPlayers(d.list || []);
     }).catch(() => {});
   }
@@ -1225,13 +1253,14 @@ var PANEL_DEFAULT_LANG = ${JSON.stringify(DEFAULT_LANG)};
     'Доступ':'Access','Игроки на сервере':'Players on the server','Информация':'Information',
     'Сейчас никого нет онлайн':'Nobody is online right now','Адрес RCON':'RCON address',
     'Адрес панели':'Panel address','Аптайм панели':'Panel uptime','Версия Node':'Node version',
-    'Соглашение':'Agreement','Открыть':'Open','Защита паролем':'Password protection','Макс. игроков':'Max players','RCON адрес':'RCON address',
+    'ЦП сервера':'Server CPU','ОЗУ сервера':'Server RAM','Ядер: —':'Cores: —','Соглашение':'Agreement','📜 Соглашение':'📜 Agreement','Открыть':'Open','Защита паролем':'Password protection','Макс. игроков':'Max players','RCON адрес':'RCON address',
     'не найдено в settings.properties':'not found in settings.properties',
     'только эта машина':'this machine only','любой IP (0.0.0.0)':'any IP (0.0.0.0)',
     'Включена (пароль веба + рут)':'Enabled (web + root password)',
     'Включена (пароль веба)':'Enabled (web password)',
     'Включена (только рут-пароль)':'Enabled (root password only)',
-    'Отключена (WEB_PASSWORD и WEB_ROOT_PASSWORD не заданы)':'Disabled (WEB_PASSWORD and WEB_ROOT_PASSWORD are empty)'
+    'Включена (пароль веба)':'Enabled (web password)',
+    'Отключена (WEB_PASSWORD не задан)':'Disabled (WEB_PASSWORD is empty)'
   };
   var lang = localStorage.getItem('rcon_lang') || PANEL_DEFAULT_LANG;
   if (lang !== 'en' && lang !== 'ru') lang = 'en';
@@ -1294,7 +1323,7 @@ var PANEL_DEFAULT_LANG = ${JSON.stringify(DEFAULT_LANG)};
 )ZVRNBOT"
     R"ZVRNBOT(        'The soul is stored in RAM and flushed to disk on restart. Please run save-all before rebooting the server.',
         'Creepers, lava, and your friend who typed /kill @a are expressly not covered by this agreement.',
-        'Support hours for soul-related claims: never o\'clock, on the second Tuesday of next week.'
+        'Support hours for soul-related claims: never o clock, on the second Tuesday of next week.'
       ],
       fine: 'Legal effect of this document: exactly zero. It is a joke. This panel talks only to your own server over RCON, stores nothing in the cloud, and your soul stays exactly where it was.',
       agree: 'I have read the above and hereby sell my soul (and agree that this is a joke).',
@@ -1323,6 +1352,7 @@ var PANEL_DEFAULT_LANG = ${JSON.stringify(DEFAULT_LANG)};
     }
   };
   var t = TXT[L];
+  window.EULA_TXT = t;
   var back = document.getElementById('eula-back');
   if (!back) return;
   document.getElementById('eula-title').textContent = t.title;
@@ -1366,8 +1396,110 @@ var PANEL_DEFAULT_LANG = ${JSON.stringify(DEFAULT_LANG)};
 })();
 </script>
 <script>
-var eulaOpenBtn = document.getElementById('eula-open');
-if (eulaOpenBtn) eulaOpenBtn.addEventListener('click', function () { window.openEula(true); });
+// EULAFIX_V1: делегированный обработчик — работает даже если вкладка настроек
+// перерисована или кнопка появилась позже скрипта.
+document.addEventListener('click', function (e) {
+  var hit = e.target && e.target.closest ? e.target.closest('#eula-open, #eula-tab-open') : null;
+  if (!hit) return;
+  e.preventDefault();
+  if (typeof window.openEula === 'function') window.openEula(true);
+});
+
+// EULATAB_V1: то же соглашение отдельной вкладкой — читается без модалки.
+window.renderEulaTab = function () {
+  var t = window.EULA_TXT;
+  var ttl = document.getElementById('eula-tab-title');
+  if (!t || !ttl) return;
+  ttl.textContent = t.title;
+  var sub = document.getElementById('eula-tab-sub');
+  if (sub) sub.textContent = t.sub;
+  var ol = document.getElementById('eula-tab-list');
+  if (ol) {
+    ol.innerHTML = '';
+    t.list.forEach(function (item) {
+      var li = document.createElement('li');
+      li.textContent = item;
+      ol.appendChild(li);
+    });
+  }
+  var fine = document.getElementById('eula-tab-fine');
+  if (fine) fine.textContent = t.fine;
+  var b = document.getElementById('eula-tab-open');
+  if (b) b.textContent = t.yes;
+};
+window.renderEulaTab();
+(function () {
+  // EULATAB_V2: the tab used to rely on the modal script publishing EULA_TXT.
+  // If the modal markup is missing on this page the old script bailed out early
+  // and the tab stayed empty. Now the tab carries its own copy of the text and
+  // repaints itself on every tab switch and language change.
+  function txt() {
+    var L = (localStorage.getItem("rcon_lang") || (window.PANEL_DEFAULT_LANG || "en"));
+    if (L !== "ru") L = "en";
+    var T = {
+      en: {
+        title: "END USER SOUL AGREEMENT (v1.0)",
+        sub: "Please read carefully. Or do not. Nobody ever does.",
+        list: [
+          "You (the Operator) receive a non-exclusive, revocable licence to shout commands at a Minecraft server through this panel.",
+          "In exchange, the Operator assigns to RCON Panel one (1) immortal soul, gently used, sold as-is, no refunds, no warranty, no exorcisms.",
+          "If the Operator has no soul, a spare of comparable quality must be supplied within 30 days. Otherwise the Operator consents to being haunted by minor rendering glitches.",
+          "The soul is stored in RAM and flushed to disk on restart. Please run save-all before rebooting the server.",
+          "Creepers, lava, and your friend who typed /kill @a are expressly not covered by this agreement.",
+          "Support hours for soul-related claims: never o clock, on the second Tuesday of next week."
+        ],
+        fine: "Legal effect of this document: exactly zero. It is a joke. This panel talks only to your own server over RCON, stores nothing in the cloud, and your soul stays exactly where it was.",
+        yes: "Sign it in blood"
+      },
+      ru: {
+        title: "СОГЛАШЕНИЕ О ПРОДАЖЕ ДУШИ (v1.0)",
+        sub: "Внимательно прочитайте. Или нет. Всё равно никто не читает.",
+        list: [
+          "Вы («Оператор») получаете неисключительную отзываемую лицензию кричать команды на Minecraft-сервер через эту панель.",
+          "Взамен Оператор передаёт RCON Panel одну (1) бессмертную душу, б/у, в состоянии «как есть», без возврата, гарантии и экзорцизма.",
+          "Если души нет, в течение 30 дней предоставляется запасная сопоставимого качества. Иначе Оператор соглашается на преследование мелкими графическими багами.",
+          "Душа хранится в оперативной памяти и сбрасывается на диск при рестарте. Перед перезагрузкой выполните save-all.",
+          "Криперы, лава и друг, написавший /kill @a, этим соглашением не покрываются.",
+          "Поддержка по вопросам души: никогда:00, во второй вторник следующей недели."
+        ],
+        fine: "Юридическая сила документа: ровно нулевая. Это шутка. Панель общается только с вашим сервером, ничего не отправляет в облако, душа остаётся при вас.",
+        yes: "Подписать кровью"
+      }
+    };
+    return T[L];
+  }
+  function paint() {
+    var t = window.EULA_TXT && window.EULA_TXT.list ? window.EULA_TXT : txt();
+    var ttl = document.getElementById("eula-tab-title");
+    if (!ttl) return;
+    var cur = txt();
+    t = cur || t;
+    ttl.textContent = t.title;
+    var sub = document.getElementById("eula-tab-sub");
+    if (sub) sub.textContent = t.sub;
+    var ol = document.getElementById("eula-tab-list");
+    if (ol) {
+      ol.innerHTML = "";
+      t.list.forEach(function (item) {
+        var li = document.createElement("li");
+        li.textContent = item;
+        ol.appendChild(li);
+      });
+    }
+    var fine = document.getElementById("eula-tab-fine");
+    if (fine) fine.textContent = t.fine;
+    var b = document.getElementById("eula-tab-open");
+    if (b) b.textContent = t.yes;
+  }
+  window.renderEulaTab = paint;
+  paint();
+  document.addEventListener("click", function (e) {
+    if (!e.target || !e.target.closest) return;
+    if (e.target.closest('[data-tab="eula-tab"]') || e.target.closest("#lang-btn, #langBtn, .lang-btn"))
+      setTimeout(paint, 0);
+  });
+  document.addEventListener("DOMContentLoaded", paint);
+})();
 </script>
 </body>
 </html>`;
@@ -1411,7 +1543,7 @@ if (AUTH_ENABLED) {
 
         const mode  = String((req.body && req.body.mode) || '');
         const given = String((req.body && req.body.password) || '');
-        const real  = mode === 'root' ? ROOT_PASSWORD : PASSWORD;
+        const real  = PASSWORD; // SINGLEPASS_V1: единственный пароль панели
 
         if (!real || !given || !pwEqual(given, real)) {
             noteFail(ip);
@@ -1439,8 +1571,7 @@ if (AUTH_ENABLED) {
         res.redirect('/login');
     });
 
-    console.log('[WebPanel] Password protection enabled'
-        + (PASSWORD ? ' [web]' : '') + (ROOT_PASSWORD ? ' [root]' : ''));
+    console.log('[WebPanel] Password protection enabled [web]');
 }
 
 app.get('/', (_req, res) => res.send(PAGE));
@@ -1457,7 +1588,8 @@ const WL_TTL_MS     = Math.max(30, Number(process.env.WEB_WHITELIST_TTL_SEC || 6
 let wlCache = { at: 0, value: null, count: null };
 
 async function fetchStatus() {
-    const st = { players: null, whitelist: null, count: null, max: MAX_PLAYERS, list: [], wlCount: null };
+    const st = { players: null, whitelist: null, count: null, max: MAX_PLAYERS, list: [], wlCount: null,
+                 tps: null, ramMb: null, cpu: null, cores: null }; // WEBRES_V1
     if (!statusBridge) statusBridge = new RconBridge(RCON_CFG);
     try {
         const listResp = stripColors(String(await statusBridge.send('list') || ''));
@@ -1481,6 +1613,23 @@ async function fetchStatus() {
             st.list = namesPart.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean).slice(0, 60);
         }
         if (st.count === null && st.list.length) st.count = st.list.length;
+        // WEBRES_V1: одна команда 'stats' отдаёт TPS, ОЗУ, ЦП, ядра и пинги игроков.
+        // Старый сервер без этой команды просто оставит карточки пустыми.
+        try {
+            const statsResp = stripColors(String(await statusBridge.send('stats') || ''));
+            const jm = statsResp.match(/STATS\s*(\{[\s\S]*\})/);
+            if (jm) {
+                const s = JSON.parse(jm[1]);
+                st.tps = s.tps; st.ramMb = s.ramMb; st.cpu = s.cpu; st.cores = s.cores;
+                if (Array.isArray(s.players) && s.players.length) {
+                    st.list = s.players.map(function (p) {
+                        return (p.ping >= 0) ? (p.name + ' (' + p.ping + 'ms)') : p.name;
+                    }).slice(0, 60);
+                }
+                if (st.count === null && s.online !== undefined) st.count = s.online;
+                if (st.players === null && s.max) st.players = s.online + ' / ' + s.max;
+            }
+        } catch (e) { /* нет команды stats или битый ответ — не ломаем остальной статус */ }
         // QUIET_STATUS_V2: the whitelist almost never changes on its own, so it is
         // polled once every WL_TTL_MS instead of on every status refresh.
         if (Date.now() - wlCache.at < WL_TTL_MS) {
@@ -1584,17 +1733,46 @@ wss.on('connection', (ws, req) => {
 });
 
 function start() {
+    // TLSHINT_V1: телефоны часто сами подставляют https:// — панель говорит только по http,
+    // и браузер показывает "сайт не отправил данных". Ловим это и отвечаем по-человечески.
+    server.on('clientError', function (err, socket) {
+        const tlsTried = !!(err && (err.code === 'HPE_INVALID_METHOD' || err.code === 'HPE_INVALID_CONSTANT'));
+        if (tlsTried)
+            console.warn('[WebPanel] A client tried HTTPS. The panel is plain HTTP - open http://<ip>:' + PORT + ' (type http:// by hand)');
+        if (!socket || socket.destroyed || !socket.writable) return;
+        socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n'
+            + (tlsTried ? 'This panel speaks plain HTTP. Open http://<ip>:' + PORT + ' instead of https://.' : 'Bad request') + '\r\n');
+    });
     server.listen(PORT, HOST, () => {
         const displayHost = BIND_ALL ? 'localhost' : HOST;
         console.log(`[WebPanel] http://${displayHost}:${PORT}`
             + (BIND_ALL ? '  (also reachable on your LAN / public IP, WEB_HOST=0.0.0.0)' : '  (WEB_HOST=' + HOST + ')'));
         if (AUTH_ENABLED)
-            console.log('[WebPanel] Login form:'
-                + (PASSWORD ? ' web password' : '')
-                + (PASSWORD && ROOT_PASSWORD ? ' +' : '')
-                + (ROOT_PASSWORD ? ' root password' : ''));
+            console.log('[WebPanel] Login form: web password');
         else
-            console.log('[WebPanel] No password set - add WEB_PASSWORD or WEB_ROOT_PASSWORD to .env');
+            console.log('[WebPanel] No password set - add WEB_PASSWORD to .env');
+        // LANHINT_V1: самый частый вопрос — «почему с телефона не открывается».
+        // Панель сама печатает готовый адрес или говорит, что именно мешает.
+        try {
+            const nets = os.networkInterfaces();
+            const lan = [];
+            Object.keys(nets).forEach(function (k) {
+                (nets[k] || []).forEach(function (ni) {
+                    if (ni && ni.family === 'IPv4' && !ni.internal) lan.push(ni.address);
+                });
+            });
+            if (BIND_ALL && lan.length)
+                console.log('[WebPanel] Phone / LAN: ' + lan.map(function (a) {
+                    return 'http://' + a + ':' + PORT;
+                }).join('   '));
+            if (LOCAL_ONLY)
+                console.log('[WebPanel] WEB_HOST=' + HOST + ' - phones and other devices CANNOT connect. '
+                    + 'Set WEB_HOST=0.0.0.0 in DiscordBotRcon/.env and restart the panel'
+                    + (lan.length ? ', then open http://' + lan[0] + ':' + PORT + ' on the phone' : '') + '.');
+            if (BIND_ALL)
+                console.log('[WebPanel] Blocked by Windows Firewall? Run once as admin: '
+                    + 'netsh advfirewall firewall add rule name="Zevvoryn Panel" dir=in action=allow protocol=TCP localport=' + PORT);
+        } catch (e) { /* нет доступа к списку интерфейсов — не критично */ }
         if (BIND_ALL && !AUTH_ENABLED)
             console.warn('[WebPanel] WARNING: the panel is open to the network without a password. Set WEB_PASSWORD in .env now.');
         if (MAX_PLAYERS === null)
@@ -1892,7 +2070,7 @@ if (!token || !clientId || !guildId) {
 
 inline const char* kBotFile_package_json =
     R"ZVRNBOT({
-  "name": "discrordbotrcon",
+  "name": "discordbotrcon",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",

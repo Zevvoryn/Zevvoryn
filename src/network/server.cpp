@@ -38,9 +38,17 @@ bool Server::start(u16 port, i32 backlog) {
         return false;
     }
 
+    // PORTLOCK_V1: на Windows SO_REUSEADDR РАЗРЕШАЕТ второму процессу сесть на тот же порт
+    // (и перехватить чужие подключения) — именно так два сервера из разных папок уживались
+    // на 25565. SO_EXCLUSIVEADDRUSE запирает ПОРТ, а не папку: другие порты свободно поднимаются.
     int reuse = 1;
+#if defined(_WIN32) && defined(SO_EXCLUSIVEADDRUSE)
+    setsockopt(listenSocket_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+#else
     setsockopt(listenSocket_, SOL_SOCKET, SO_REUSEADDR,
         reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+#endif
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;

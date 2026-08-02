@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>      // FLUID_V1
 #include <string>
+#include <vector> // SPAWNCFG_V1
 #include <mutex>
 #include <atomic>
 #include <deque>
@@ -90,6 +91,19 @@ private:
     void sendPlayerEquipment(const std::shared_ptr<entity::Player>& viewer, const std::shared_ptr<entity::Player>& target); // EQUIP_V1
     void broadcastHeldEquipment(const std::shared_ptr<entity::Player>& player); // EQUIP_V1
     void broadcastEntityMeta(const std::shared_ptr<entity::Player>& player); // PLAYER_VIS_V1
+    void sendTitleTimes(const std::shared_ptr<entity::Player>& player, i32 fadeIn, i32 stay, i32 fadeOut);
+    void sendTitleText(const std::shared_ptr<entity::Player>& player, std::string_view text);
+    void sendSubtitleText(const std::shared_ptr<entity::Player>& player, std::string_view text);
+    void sendActionBarText(const std::shared_ptr<entity::Player>& player, std::string_view text);
+    void sendClearTitles(const std::shared_ptr<entity::Player>& player, bool reset);
+    void sendStopSound(const std::shared_ptr<entity::Player>& player);
+    void sendCameraPacket(const std::shared_ptr<entity::Player>& player, i32 entityId);
+    void sendSimulationDistance(const std::shared_ptr<entity::Player>& player);
+    void sendInitialWorldBorder(const std::shared_ptr<entity::Player>& player);
+    void sendFacePlayer(const std::shared_ptr<entity::Player>& player, const std::shared_ptr<entity::Player>& target);
+    void broadcastEnterCombat(const std::shared_ptr<entity::Player>& player);
+    void broadcastEndCombat(const std::shared_ptr<entity::Player>& player, i32 durationTicks);
+    void broadcastBlockBreakAnimation(i32 entityId, i32 x, i32 y, i32 z, i8 stage);
     void despawnPlayerFor(const std::shared_ptr<entity::Player>& viewer, const std::shared_ptr<entity::Player>& target); // PLAYER_VIS_V2
     void spawnItemDrop(f64 x, f64 y, f64 z, i32 itemId, i32 count, f64 vx, f64 vy, f64 vz, i32 pickupDelay = 10); // ITEMDROP_V1
     void tickItemDrops(); // ITEMDROP_V1
@@ -161,6 +175,20 @@ private:
     world::World& worldFor(i32 dim);                                       // MULTIWORLD_V1
     world::World& worldOf(const std::shared_ptr<entity::Player>& player);  // MULTIWORLD_V1
     void ensureDimensionReady(i32 dim);
+    void prepareAllDimensions(); // WORLDPREP_V1
+    void tickSpawnWarmups();     // SPAWNCFG_V1: обратный отсчёт перед телепортом на спавн
+    struct SpawnWarmup {         // SPAWNCFG_V1
+        std::string name;
+        i32 ticksLeft = 0;
+        i32 lastShown = -1;
+        f64 sx = 0.0, sy = 0.0, sz = 0.0;
+        bool standStill = true;
+        bool forceLang = false;
+        bool forceRu = false;
+        std::string color;
+        std::string textCountdown, textDone, textCancelled;
+    };
+    std::vector<SpawnWarmup> spawnWarmups_; // SPAWNCFG_V1
     void saveWorlds();                                                     // DIMSAVE_V1                                    // MULTIWORLD_V1
     bool travelToDimension(const std::shared_ptr<entity::Player>& player, i32 dim, f64 tx, f64 ty, f64 tz); // MULTIWORLD_V1
     void refreshSpectatorVisibility(const std::shared_ptr<entity::Player>& player, bool wasSpectator, bool isSpectator); // PLAYER_VIS_V2
@@ -203,6 +231,7 @@ private:
     void sendContainerContent(const std::shared_ptr<entity::Player>& player); // CHEST_V1
     int countChestViewers(u64 key, bool ender); // CHEST_V2: сколько игроков смотрит в сундук с данным ключом
     void broadcastChestLid(i32 bx, i32 by, i32 bz, i32 blockState, i32 viewers); // CHEST_V2: анимация крышки (Block Action 0x08)
+    void extinguishPortalNear(i32 dim, i32 bx, i32 by, i32 bz, i32 brokenState); // PORTALBREAK_V1
     void broadcastBlockIn(i32 dim, i32 x, i32 y, i32 z, i32 state); // PORTAL_V1: ставит блок в СВОЁМ измерении
     void broadcastBlockSound(const char* name, i32 bx, i32 by, i32 bz, f32 volume, f32 pitch); // CHEST_V2: звук (Sound Effect 0x68)
     void handleChestWindowClosed(const std::shared_ptr<entity::Player>& player); // CHEST_V2: игрок закрыл окно сундука
@@ -261,6 +290,7 @@ private:
     struct FallingBlockMotion {
         i32 eid; i32 state; f64 x; f64 y; f64 z; f64 vx; f64 vy; f64 vz;
         i32 time; f64 startY;
+        i32 dim = 0; // DIMPHYS_V1: в каком измерении падает блок
     };
     std::vector<FallingBlockMotion> fallingBlocks_;
     std::multimap<i32, u64> fallingQueue_;       // dueTick -> packed BlockPos
@@ -337,6 +367,16 @@ private:
     void scheduleFluidUpdate(i32 x, i32 y, i32 z, i32 delay = -1); // -1 = delay по типу жидкости
     void scheduleFluidNeighbors(i32 x, i32 y, i32 z); // FLUID_V1: клетка + 6 соседей
     void tickFluids();                                // FLUID_V1: обработать пачку клеток за тик
+    void tickFluidsIn(i32 dimIndex, const std::vector<u64>& batch);   // DIMPHYS_V1
+    void tickFireIn(i32 dimIndex, const std::vector<u64>& batch);     // DIMPHYS_V1
+    void tickRandomBlockUpdatesIn(i32 dimIndex);                      // DIMPHYS_V1
+    // PORTAL_V2 / ENDPORTAL_V1: рабочие порталы в Ад и Энд.
+    bool tryLightNetherPortal(i32 dim, i32 bx, i32 by, i32 bz, bool dryRun = false);
+    bool tryPlaceEnderEye(i32 dim, i32 bx, i32 by, i32 bz);
+    void tryCompleteEndPortal(i32 dim, i32 bx, i32 by, i32 bz);
+    bool findOrCreateNetherPortal(i32 dim, i32 cx, i32 cy, i32 cz, f64& outX, f64& outY, f64& outZ);
+    void buildEndSpawnPlatform();
+    void tickPortals();
     void scheduleFireUpdate(i32 x, i32 y, i32 z, i32 delay = 30); // FIRE_V2
     void tickFire();                                      // FIRE_V2: decay/spread/burning blocks
     void tickPlayerEnvironment();                     // ENV_V1: заморозка в снегу + урон лавой по тикам

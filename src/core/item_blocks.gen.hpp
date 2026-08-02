@@ -31,4 +31,36 @@ inline std::int32_t doorUpperState(std::int32_t lowerState) { // DOORS_V1
     auto it = m.find(lowerState);
     return it == m.end() ? -1 : it->second;
 }
+
+// DOORS_V2: returns the other half for either a lower or upper door state.
+// The small runtime registry deliberately does not expand all 64 door properties,
+// so property-based matching leaves the upper half behind when a door is broken.
+struct DoorStateRange { std::int32_t first; bool wooden; };
+inline const DoorStateRange* doorStateRange(std::int32_t state) {
+    // first = default lower state - 11. Every Java 1.21.1 door owns 64 IDs.
+    static const DoorStateRange r[] = {
+        {4590,true},{5652,false},{11822,true},{11886,true},{11950,true},{12014,true},{12078,true},{12142,true},{12206,true},{12270,true},{19148,true},{19212,true},
+        {23652,false},{23716,false},{23780,false},{23844,false},{23908,false},{23972,false},{24036,false},{24100,false}
+    };
+    for (const auto& x : r) if (state >= x.first && state < x.first + 64) return &x;
+    return nullptr;
+}
+inline std::int32_t doorPartnerState(std::int32_t state) {
+    const auto* r = doorStateRange(state);
+    if (!r) return -1;
+    const std::int32_t off = state - r->first;
+    // half is the second property and therefore has a state-ID weight of 8.
+    return ((off & 15) < 8) ? state + 8 : state - 8;
+}
+inline std::int32_t doorToggleOpenState(std::int32_t state) {
+    const auto* r = doorStateRange(state);
+    if (!r) return -1;
+    const std::int32_t off = state - r->first;
+    // Boolean values are ordered true,false; `open` has a weight of two.
+    return ((off / 2) & 1) ? state - 2 : state + 2;
+}
+inline bool isWoodenDoorState(std::int32_t state) {
+    const auto* r = doorStateRange(state);
+    return r && r->wooden;
+}
 } }

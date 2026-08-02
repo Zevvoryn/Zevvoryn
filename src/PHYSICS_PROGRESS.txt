@@ -1415,17 +1415,17 @@ WIZARD_RCON_BOT_V1 — core/config.hpp runWizard(): мастер расшире�
   запрашивает token/Client ID/Guild ID).
   Шаг 8 — веб-панель (предупреждение: открыта только на 127.0.0.1, для VPS нужен SSH-туннель;
   запрашивает порт и пароль).
-  После сохранения settings.properties мастер пишет DiscrordBotRcon/.env со всеми полями
+  После сохранения settings.properties мастер пишет DiscordBotRcon/.env со всеми полями
   (DISCORD_TOKEN/CLIENT_ID/GUILD_ID/RCON_*/WEB_*), если пользователь согласился на бота или веб.
 
-DSBOT_V2 — DiscrordBotRcon/: Discord-бот на discord.js с полной поддержкой команд
+DSBOT_V2 — DiscordBotRcon/: Discord-бот на discord.js с полной поддержкой команд
   (list/say/cmd/tp/give/kick/gamemode/weather/time/difficulty/stop/whitelist/save/status),
   автокомплит для /cmd по QUICK_CMDS, разграничение прав через ADMIN_ROLE_ID/Administrator.
   rcon.js — RconBridge (очередь команд на одном сокете, автопереподключение при разрыве).
   rcon-test.js — самопроверка RCON без Discord (TCP-пробник, логин, help/list, проверка отказа
   неверному паролю).
 
-WEBPANEL_V2 (заход 53) — DiscrordBotRcon/webpanel.js полностью переделан с терминал-стиля (V1)
+WEBPANEL_V2 (заход 53) — DiscordBotRcon/webpanel.js полностью переделан с терминал-стиля (V1)
   на панель с сайдбаром: вкладки Дашборд/Консоль/Настройки, карточки статуса (RCON/игроки/
   whitelist/пинг), быстрые действия, /api/status эндпоинт (парсит list + whitelist list через
   RconBridge, отдаёт JSON {players, whitelist}). Доступ по-прежнему только с 127.0.0.1

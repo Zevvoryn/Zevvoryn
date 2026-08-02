@@ -37,7 +37,6 @@ const L = {
         qWebEnabled: 'Enable the web panel?',
         qWebPort: 'Web panel port (always bound to 127.0.0.1)',
         qWebPass: 'Web panel password',
-        qWebRootPass: 'Root password for privileged actions. Empty = disabled',
         qWebTtl: 'Session lifetime, minutes',
         qTestRcon: 'Test the RCON port now?',
         testOk: 'Port is reachable.',
@@ -102,7 +101,6 @@ const L = {
         qWebEnabled: 'Включить веб-панель?',
         qWebPort: 'Порт веб-панели (всегда слушает 127.0.0.1)',
         qWebPass: 'Пароль веб-панели',
-        qWebRootPass: 'Рут-пароль для привилегированных действий. Пусто = выключено',
         qWebTtl: 'Время жизни сессии, минут',
         qTestRcon: 'Проверить доступность порта RCON сейчас?',
         testOk: 'Порт доступен.',
@@ -295,7 +293,6 @@ function renderEnv(v, lang) {
         '# ' + h.webPass,
         'WEB_PASSWORD=' + v.WEB_PASSWORD,
         '# ' + h.webRoot,
-        'WEB_ROOT_PASSWORD=' + v.WEB_ROOT_PASSWORD,
         '# ' + h.webTtl,
         'WEB_SESSION_TTL_MIN=' + v.WEB_SESSION_TTL_MIN,
         '',
@@ -366,13 +363,11 @@ const mask = (s) => (s ? s.slice(0, 3) + '*'.repeat(Math.max(3, s.length - 3)) :
     if (webOn) {
         v.WEB_PORT            = await askText(t.qWebPort, old.WEB_PORT || '3000', vPort(t));
         v.WEB_PASSWORD        = await askText(t.qWebPass, old.WEB_PASSWORD || '');
-        v.WEB_ROOT_PASSWORD   = await askText(t.qWebRootPass, old.WEB_ROOT_PASSWORD || '');
         v.WEB_SESSION_TTL_MIN = await askText(t.qWebTtl, old.WEB_SESSION_TTL_MIN || '720', vPosNum(t));
-        if (!v.WEB_PASSWORD && !v.WEB_ROOT_PASSWORD) console.log('  ' + C.y + t.warnNoPass + C.x);
+        if (!v.WEB_PASSWORD) console.log('  ' + C.y + t.warnNoPass + C.x);
     } else {
         v.WEB_PORT            = old.WEB_PORT || '3000';
         v.WEB_PASSWORD        = old.WEB_PASSWORD || '';
-        v.WEB_ROOT_PASSWORD   = old.WEB_ROOT_PASSWORD || '';
         v.WEB_SESSION_TTL_MIN = old.WEB_SESSION_TTL_MIN || '720';
     }
 
