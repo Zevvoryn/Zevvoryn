@@ -21,7 +21,7 @@ Server::~Server() {
     stop();
 }
 
-bool Server::start(u16 port, i32 backlog) {
+bool Server::start(u16 port, i32 backlog, bool enableIpv6) { // IPV6_V1
 #ifdef _WIN32
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -32,7 +32,33 @@ bool Server::start(u16 port, i32 backlog) {
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    listenSocket_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    // IPV6_V1: при enable-ipv6=true открываем AF_INET6 с выключенным IPV6_V6ONLY — такой
+    // сокет принимает И IPv6, И обычные IPv4-подключения на том же порту.
+    // Если система IPv6 не даёт — тихо откатываемся на чистый IPv4.
+    bool usingV6 = false;
+    if (enableIpv6) {
+        listenSocket_ = ::socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+        if (listenSocket_ != INVALID_SOCK) {
+            int v6only = 0;
+            if (setsockopt(listenSocket_, IPPROTO_IPV6, IPV6_V6ONLY,
+                    reinterpret_cast<const char*>(&v6only), sizeof(v6only)) == 0) {
+                usingV6 = true;
+            } else {
+#ifdef _WIN32
+                ::closesocket(listenSocket_);
+#else
+                ::close(listenSocket_);
+#endif
+                listenSocket_ = INVALID_SOCK;
+                NC_WARN("Net", "IPv6 dual-stack unavailable, falling back to IPv4");
+            }
+        } else {
+            NC_WARN("Net", "IPv6 socket unavailable, falling back to IPv4");
+        }
+    }
+    if (!usingV6) {
+        listenSocket_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    }
     if (listenSocket_ == INVALID_SOCK) {
         NC_FATAL("Net", "Failed to create socket"); // LANGFIX_V1
         return false;
@@ -50,12 +76,26 @@ bool Server::start(u16 port, i32 backlog) {
         reinterpret_cast<const char*>(&reuse), sizeof(reuse));
 #endif
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
+    // IPV6_V1: адрес привязки зависит от семейства сокета
+    sockaddr_in  addr4{};
+    sockaddr_in6 addr6{};
+    const sockaddr* bindAddr = nullptr;
+    socklen_t bindLen = 0;
+    if (usingV6) {
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_addr   = in6addr_any;
+        addr6.sin6_port   = htons(port);
+        bindAddr = reinterpret_cast<const sockaddr*>(&addr6);
+        bindLen  = static_cast<socklen_t>(sizeof(addr6));
+    } else {
+        addr4.sin_family      = AF_INET;
+        addr4.sin_addr.s_addr = INADDR_ANY;
+        addr4.sin_port        = htons(port);
+        bindAddr = reinterpret_cast<const sockaddr*>(&addr4);
+        bindLen  = static_cast<socklen_t>(sizeof(addr4));
+    }
 
-    if (::bind(listenSocket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    if (::bind(listenSocket_, bindAddr, bindLen) != 0) {
         NC_FATAL("Net", "Failed to bind port {} (порт занят другой программой? / port already in use?)", port); // LANGFIX_V1
         return false;
     }
@@ -76,7 +116,8 @@ void Server::stop() {
     bool expected = true;
     if (!running_.compare_exchange_strong(expected, false)) return;
 
-    NC_INFO("Net", "Stopping network listener..."); // LANGFIX_V1
+    if (ruLang_) NC_INFO("Net", "Остановка сетевого прослушивателя..."); // LANGFIX_V1
+    else NC_INFO("Net", "Stopping network listener..."); // LANGFIX_V1
 
     // Закрываем сокет прослушивания
     if (listenSocket_ != INVALID_SOCK) {
@@ -110,7 +151,8 @@ void Server::stop() {
     WSACleanup();
 #endif
 
-    NC_INFO("Net", "Network listener stopped"); // LANGFIX_V1
+    if (ruLang_) NC_INFO("Net", "Сетевой прослушиватель остановлен"); // LANGFIX_V1
+    else NC_INFO("Net", "Network listener stopped"); // LANGFIX_V1
 }
 
 // CRASHNET_V1: см. комментарий в server.hpp. Максимально самодостаточно и без
@@ -152,7 +194,8 @@ void Server::run() {
 
 void Server::acceptLoop() {
     while (isRunning()) {
-        sockaddr_in clientAddr{};
+        // IPV6_V1: в dual-stack режиме адрес клиента может быть и v4, и v6
+        sockaddr_storage clientAddr{};
         socklen_t addrLen = sizeof(clientAddr);
 
         socket_t clientSocket = ::accept(listenSocket_,

@@ -24,7 +24,7 @@ public:
     Server& operator=(const Server&) = delete;
 
     // Запуск на порту. Блокирующий!
-    bool start(u16 port, i32 backlog = 512); // STRESS_V2: очередь accept под штурм 300 ботов (было 128 — WinError 10054 у клиентов)
+    bool start(u16 port, i32 backlog = 512, bool enableIpv6 = false); // STRESS_V2 // IPV6_V1: очередь accept под штурм 300 ботов (было 128 — WinError 10054 у клиентов)
     void stop();
     void run(); // Основной цикл
 
@@ -39,6 +39,10 @@ public:
     void onConnection(ConnectionHandler handler) { onConnect_ = std::move(handler); }
     void onPacket(PacketHandler handler) { onPacket_ = std::move(handler); }
     void onDisconnect(DisconnectHandler handler) { onDisconnect_ = std::move(handler); }
+
+    // LANGFIX_V1 (перевод): сетевой модуль не знает язык сам по себе — ядро
+    // (core/server.cpp) сообщает выбранный язык явно перед network_.start().
+    void setLanguage(bool ru) { ruLang_ = ru; }
 
     // Управление соединениями
     void removeConnection(u64 id);
@@ -55,6 +59,7 @@ private:
     void acceptLoop();
 
     socket_t listenSocket_ = INVALID_SOCK;
+    bool ruLang_ = false; // LANGFIX_V1: язык собственных строк лога ("stop"/"stopped")
     std::atomic<bool> running_{false};
     std::atomic<u64> nextConnectionId_{1};
     std::atomic<u64> connectionCount_{0};

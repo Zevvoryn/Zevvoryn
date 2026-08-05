@@ -253,4 +253,186 @@ bool BanManager::save() const {
     return !ec;
 }
 
+// ---------------------------------------------------------------------------
+// IPBAN_V1 - banned-ips.json (see ban_manager.hpp)
+// ---------------------------------------------------------------------------
+
+IpBanManager& IpBanManager::instance() {
+    static IpBanManager inst;
+    return inst;
+}
+
+std::string IpBanManager::normalize(const std::string& ip) {
+    std::string s = ip;
+    // strip a leading slash left by socket address formatting
+    if (!s.empty() && s.front() == '/') s.erase(0, 1);
+    // bracketed IPv6 with port: [::1]:25565
+    if (!s.empty() && s.front() == '[') {
+        const size_t close = s.find(']');
+        if (close != std::string::npos) s = s.substr(1, close - 1);
+    } else {
+        // IPv4 with port: 1.2.3.4:52134 (a bare IPv6 has more than one colon)
+        const size_t colon = s.find(':');
+        if (colon != std::string::npos && s.find(':', colon + 1) == std::string::npos)
+            s = s.substr(0, colon);
+    }
+    // IPv4-mapped IPv6
+    std::string lowered;
+    lowered.reserve(s.size());
+    for (unsigned char c : s) lowered.push_back(static_cast<char>(std::tolower(c)));
+    if (lowered.rfind("::ffff:", 0) == 0) lowered = lowered.substr(7);
+    return lowered;
+}
+
+void IpBanManager::init(const std::filesystem::path& serverRoot) {
+    {
+        std::unique_lock lk(mutex_);
+        path_ = serverRoot.empty() ? std::filesystem::path("banned-ips.json")
+                                   : (serverRoot / "banned-ips.json");
+    }
+    load();
+}
+
+bool IpBanManager::isBanned(const std::string& ip) const {
+    const std::string key = normalize(ip);
+    if (key.empty()) return false;
+    std::shared_lock lk(mutex_);
+    for (const auto& e : entries_) if (normalize(e.ip) == key) return true;
+    return false;
+}
+
+std::optional<IpBanEntry> IpBanManager::find(const std::string& ip) const {
+    const std::string key = normalize(ip);
+    std::shared_lock lk(mutex_);
+    for (const auto& e : entries_) if (normalize(e.ip) == key) return e;
+    return std::nullopt;
+}
+
+std::vector<IpBanEntry> IpBanManager::list() const {
+    std::shared_lock lk(mutex_);
+    return entries_;
+}
+
+bool IpBanManager::ban(const std::string& ip, const std::string& source, const std::string& reason) {
+    const std::string key = normalize(ip);
+    if (key.empty()) return false;
+    {
+        std::unique_lock lk(mutex_);
+        for (const auto& e : entries_) if (normalize(e.ip) == key) return false;
+        IpBanEntry e;
+        e.ip      = key;
+        e.created = nowStamp();
+        e.source  = source.empty() ? std::string("Console") : source;
+        e.expires = "forever";
+        e.reason  = reason.empty() ? std::string("Banned by an operator.") : reason;
+        entries_.push_back(std::move(e));
+    }
+    save();
+    return true;
+}
+
+bool IpBanManager::pardon(const std::string& ip) {
+    const std::string key = normalize(ip);
+    {
+        std::unique_lock lk(mutex_);
+        const size_t before = entries_.size();
+        entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                      [&](const IpBanEntry& e) { return normalize(e.ip) == key; }),
+                       entries_.end());
+        if (entries_.size() == before) return false;
+    }
+    save();
+    return true;
+}
+
+bool IpBanManager::load() {
+    std::filesystem::path p;
+    { std::shared_lock lk(mutex_); p = path_; }
+    std::vector<IpBanEntry> parsed;
+    std::error_code ec;
+    if (std::filesystem::exists(p, ec)) {
+        std::ifstream in(p, std::ios::binary);
+        if (!in) return false;
+        std::stringstream ss; ss << in.rdbuf();
+        std::string text = ss.str();
+        if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+            static_cast<unsigned char>(text[1]) == 0xBB && static_cast<unsigned char>(text[2]) == 0xBF)
+            text.erase(0, 3);
+        MiniJson j(text);
+        if (j.eat('[')) {
+            j.ws();
+            if (!j.eat(']')) {
+                do {
+                    if (!j.eat('{')) break;
+                    IpBanEntry e;
+                    do {
+                        std::string key;
+                        if (!j.str(key)) break;
+                        if (!j.eat(':')) break;
+                        j.ws();
+                        if (j.i < text.size() && text[j.i] == '"') {
+                            std::string val; j.str(val);
+                            if (key == "ip") e.ip = val;
+                            else if (key == "created") e.created = val;
+                            else if (key == "source") e.source = val;
+                            else if (key == "expires") e.expires = val;
+                            else if (key == "reason") e.reason = val;
+                        } else {
+                            (void)j.scalar();
+                        }
+                    } while (j.eat(','));
+                    j.eat('}');
+                    if (!e.ip.empty()) parsed.push_back(std::move(e));
+                } while (j.eat(','));
+            }
+        }
+    }
+    std::unique_lock lk(mutex_);
+    entries_ = std::move(parsed);
+    return true;
+}
+
+std::string IpBanManager::serialize() const {
+    std::string out = "[\n";
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        const auto& e = entries_[i];
+        out += "  {\n";
+        out += "    \"ip\": \""      + jsonEscape(e.ip)      + "\",\n";
+        out += "    \"created\": \"" + jsonEscape(e.created) + "\",\n";
+        out += "    \"source\": \""  + jsonEscape(e.source)  + "\",\n";
+        out += "    \"expires\": \"" + jsonEscape(e.expires) + "\",\n";
+        out += "    \"reason\": \""  + jsonEscape(e.reason)  + "\"\n";
+        out += (i + 1 < entries_.size()) ? "  },\n" : "  }\n";
+    }
+    out += "]\n";
+    return out;
+}
+
+bool IpBanManager::save() const {
+    std::string json;
+    std::filesystem::path p;
+    {
+        std::shared_lock lk(mutex_);
+        json = serialize();
+        p = path_;
+    }
+    std::error_code ec;
+    if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
+    std::filesystem::path tmp = p; tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        out << json;
+        out.flush();
+        if (!out) return false;
+    }
+    std::filesystem::remove(p, ec);
+    std::filesystem::rename(tmp, p, ec);
+    if (ec) {
+        std::filesystem::copy_file(tmp, p, std::filesystem::copy_options::overwrite_existing, ec);
+        std::filesystem::remove(tmp, ec);
+    }
+    return !ec;
+}
+
 } // namespace nc

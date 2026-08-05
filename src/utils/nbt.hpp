@@ -108,6 +108,17 @@ public:
         }
     }
 
+    // PLAYERCONV_V1: TAG_List of TAG_Float - vanilla player .dat stores
+    // Rotation as two floats (Pos/Motion stay doubles).
+    void writeFloatList(const std::vector<f32>& values, std::string_view name) {
+        writeTagHeader(TagType::List, name);
+        buffer_.writeByte(static_cast<u8>(TagType::Float));
+        buffer_.writeI32(static_cast<i32>(values.size()));
+        for (auto v : values) {
+            buffer_.writeF32(v);
+        }
+    }
+
     std::vector<u8> toVector() const {
         return std::vector<u8>(buffer_.writtenSpan().begin(), buffer_.writtenSpan().end());
     }

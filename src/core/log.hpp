@@ -123,9 +123,16 @@ inline std::string wallTime() {
 // CONUTF8_V1: печатаем целую строку за один вызов. На Windows — через WriteConsoleW
 // (переводим UTF-8 -> UTF-16), чтобы консоль не ломала многобайтные символы.
 // Если вывод перенаправлен в файл/pipe — честно пишем UTF-8 байты.
+// GUIQUIET_V1: в gui-режиме единственный приёмник — окно-терминал, в conhost не пишем.
+inline std::atomic<bool> g_consoleQuiet{false};
+
 inline void writeConsole(const std::string& s) {
+    if (g_consoleQuiet.load(std::memory_order_relaxed)) return; // GUIQUIET_V1
 #ifdef _WIN32
-    static HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    // NOCONHOST_V1: было `static HANDLE hOut = GetStdHandle(...)`, кэшировавшееся один раз навсегда.
+    // С /SUBSYSTEM:WINDOWS консоль может появиться позже первого вызова (AllocConsole в main.cpp),
+    // поэтому хендл теперь читаем заново каждый раз — иначе он навсегда оставался бы невалидным.
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD mode = 0;
     if (hOut != INVALID_HANDLE_VALUE && hOut != nullptr && GetConsoleMode(hOut, &mode)) {
         const int wlen = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
@@ -140,6 +147,34 @@ inline void writeConsole(const std::string& s) {
 #endif
     std::fwrite(s.data(), 1, s.size(), stdout);
     std::fflush(stdout);
+}
+
+// GUICON_V1: приёмник строк для собственного окна-терминала. Обычный указатель на
+// функцию, а не включение console/gui_console.hpp: логгер не должен знать о Win32.
+// Никто не зарегистрировался — нулевая стоимость, классический режим не затронут.
+using GuiSink = void (*)(int level, const char* tag, const char* text);
+inline std::atomic<GuiSink> g_guiSink{nullptr};
+
+// GUIBACKLOG_V1: окно-терминал поднимается уже после старта сервера, поэтому весь
+// вывод копится здесь и проигрывается в окно при регистрации приёмника. Иначе
+// баннер и лог запуска остаются только в classic-консоли.
+struct BacklogLine { int level; std::string tag; std::string text; };
+inline std::vector<BacklogLine> g_backlog;
+// GUIBACKLOG_V2: буфер живёт только между стартом процесса и появлением окна
+// (это доли секунды), поэтому потолок щедрый — обрезка на практике не наступает.
+inline constexpr std::size_t kBacklogMax = 50000;
+inline std::atomic<bool> g_backlogClosed{false}; // после реплея копить больше не нужно
+inline std::atomic<bool> g_backlogEnabled{false}; // в classic-режиме не копим вообще
+
+// Вызывать только под g_mutex.
+inline void emitGui(int level, std::string_view tag, std::string text) {
+    if (auto sink = g_guiSink.load(std::memory_order_relaxed))
+        sink(level, std::string(tag).c_str(), text.c_str());
+    if (!g_backlogEnabled.load(std::memory_order_relaxed)) return;
+    if (g_backlogClosed.load(std::memory_order_relaxed)) return;
+    if (g_backlog.size() >= kBacklogMax)
+        g_backlog.erase(g_backlog.begin(), g_backlog.begin() + static_cast<std::ptrdiff_t>(kBacklogMax / 8));
+    g_backlog.push_back(BacklogLine{level, std::string(tag), std::move(text)});
 }
 
 inline void doLog(Level lv, std::string_view tag, const std::string& msg)
@@ -171,7 +206,11 @@ inline void doLog(Level lv, std::string_view tag, const std::string& msg)
     line += "\n";
     writeConsole(line); // CONUTF8_V1
 
-    // WORLDSAVE_V1: дублируем в файл (без ANSI-цветов)
+    // GUICON_V1: в окно отдаём чистый текст без ANSI — цвет там свой, по уровню.
+    emitGui(static_cast<int>(lv), tag,
+            "[" + wallTime() + "] [Server thread/" + levelTag(lv) + "] " + msg); // GUIBACKLOG_V1
+
+    // WORLDSAVE_V1: Дублируем в файл (без ANSI-цветов)
     if (g_file.is_open()) {
         g_file << "[" << wallTime() << "] [Server thread/" << levelTag(lv) << "] " << msg << "\n";
         g_file.flush();
@@ -205,8 +244,60 @@ inline std::vector<std::string>& pendingRawLines() {
     static std::vector<std::string> v;
     return v;
 }
+// GUICON_V1: регистрация окна-терминала как второго приёмника лога. nullptr = отключить.
+// GUIBACKLOG_V1: при подключении сразу проигрываем всё, что было напечатано до старта окна.
+// GUIBACKLOG_V2: включается в самом начале main, если console-mode=gui. В classic
+// режиме буфер не заводится вовсе — ноль лишней памяти.
+inline void enableBacklog(bool on) {
+    std::lock_guard<std::mutex> lock(detail::g_mutex);
+    detail::g_backlogEnabled.store(on, std::memory_order_relaxed);
+    if (!on) { detail::g_backlog.clear(); detail::g_backlog.shrink_to_fit(); }
+}
+
+inline void setGuiSink(detail::GuiSink sink) {
+    std::lock_guard<std::mutex> lock(detail::g_mutex);
+    detail::g_guiSink.store(sink, std::memory_order_relaxed);
+    if (!sink) return;
+    for (const auto& l : detail::g_backlog) sink(l.level, l.tag.c_str(), l.text.c_str());
+    detail::g_backlogClosed.store(true, std::memory_order_relaxed);
+    detail::g_backlog.clear();
+    detail::g_backlog.shrink_to_fit();
+}
+
+// GUIBACKLOG_V1: сырая строка только для окна/бэклога (в consol'ь её печатает вызывающий,
+// например баннер через std::cout с ANSI-цветами).
+inline void guiLine(const std::string& s, int level = 2) { // GUIQUIET_V1: level задаёт цвет в окне
+    std::lock_guard<std::mutex> lock(detail::g_mutex);
+    detail::emitGui(level, "", s);
+}
+
+// GUIQUIET_V1: заглушить дублирующий вывод в системную консоль (gui-режим).
+inline void setConsoleQuiet(bool on) {
+    detail::g_consoleQuiet.store(on, std::memory_order_relaxed);
+}
+
+// GUIWIZARD_V1: мост между мастером первого запуска (core/config.hpp) и окном-терминалом
+// (console/gui_console.cpp), без прямого include между ними: обычный указатель на функцию,
+// как и GuiSink выше. nullptr = читать из std::cin, как раньше.
+namespace detail {
+using GuiReadLine = std::string (*)();
+inline std::atomic<GuiReadLine> g_guiReadLine{nullptr};
+} // namespace detail
+
+inline void setGuiReadLine(detail::GuiReadLine fn) {
+    detail::g_guiReadLine.store(fn, std::memory_order_relaxed);
+}
+inline bool hasGuiReadLine() {
+    return detail::g_guiReadLine.load(std::memory_order_relaxed) != nullptr;
+}
+inline std::string guiReadLine() {
+    auto fn = detail::g_guiReadLine.load(std::memory_order_relaxed);
+    return fn ? fn() : std::string();
+}
+
 inline void rawLine(const std::string& s) {
     std::lock_guard<std::mutex> lock(detail::g_mutex);
+    detail::emitGui(2, "", s); // GUICON_V1 + GUIBACKLOG_V1
     if (detail::g_file.is_open()) {
         detail::g_file << s << "\n";
         detail::g_file.flush();
@@ -219,8 +310,36 @@ inline void rawLine(const std::string& s) {
 // (чтобы переписка игроков не засоряла logs/*.log).
 inline void chatLine(const std::string& s) {
     std::lock_guard<std::mutex> lock(detail::g_mutex);
+    detail::emitGui(7, "CHAT", "[" + detail::wallTime() + "] [Server thread/CHAT] " + s); // GUICON_V1: уровень 7 = Chat
     // CONUTF8_V1
     detail::writeConsole("[" + detail::wallTime() + "] [Server thread/CHAT] " + s + "\n");
+}
+
+// CMDLOG_V2: команды (/op и прочие) нигде не попадали в файл: игровые глушились
+// нарочно (CMDLOG_QUIET_V1), а консольные просто никто не писал. Только файл:
+// в окне/терминале эхо и так есть, дублировать его незачем.
+inline void commandLine(const std::string& who, const std::string& cmd) {
+    std::lock_guard<std::mutex> lock(detail::g_mutex);
+    const std::string line = "[" + detail::wallTime() + "] [Server thread/CMD] <" + who + "> " + cmd;
+    if (detail::g_file.is_open()) {
+        detail::g_file << line << "\n";
+        detail::g_file.flush();
+    } else {
+        pendingRawLines().push_back(line);
+    }
+}
+
+// CMDLOG_V1: console/window commands were echoed straight into the window buffer,
+// bypassing the logger entirely - so nothing a human typed ever reached logs/*.log.
+// File only: the window already prints the echo itself.
+inline void fileLine(const std::string& s) {
+    std::lock_guard<std::mutex> lock(detail::g_mutex);
+    if (detail::g_file.is_open()) {
+        detail::g_file << s << "\n";
+        detail::g_file.flush();
+    } else {
+        pendingRawLines().push_back(s);
+    }
 }
 
 inline void initFileLog(const std::string& language = "rus") {

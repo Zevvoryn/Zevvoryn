@@ -210,9 +210,14 @@ public:
     i32 experienceLevel = 0;      // XP_BOTTLE_V2: текущий уровень
     f32 experienceProgress = 0.0f; // XP_BOTTLE_V2: прогресс 0..1 до следующего уровня
     bool openIsDouble = false; // CHEST_V3: открыт двойной сундук (54 слота)
+    i32 openContSlots = 27;    // CONTAINER_V1: слотов у открытого контейнера (27 сундук/бочка, 3 печка, 5 воронка, 9 раздатчик)
+    i32 openContKind = 0;      // CONTAINER_V1: тип открытого контейнера (ContainerKind в server.cpp)
     u64 openContainerKey2 = 0; // CHEST_V3: ключ второй половины двойного сундука
     i32 enderItemId[27] = {};  // содержимое эндер-сундука
     i32 enderCount[27] = {};
+    bool vehicleSneakLatched = false; // VEHSHIFT_V1
+    i64 lastPortalWarnMs = 0;         // PORTALMSG_V1
+    i64 lastRailWarnMs   = 0;         // RAILSPAM_V1
 
     // FALLDMG_V1: вершина текущего падения и предыдущее состояние земли.
     f64 fallPeakY = 4.0;

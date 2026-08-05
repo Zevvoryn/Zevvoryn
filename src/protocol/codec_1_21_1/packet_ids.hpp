@@ -41,7 +41,7 @@ inline const PacketMapping packetTable[] = {
     {0x03, PacketId::ConfigurationFinishAcknowledged, PacketDirection::Serverbound, ConnectionState::Configuration},
 
     // === Play (Clientbound) — 1.21.1 — ТОЛЬКО нужные пакеты ===
-    {0x2B, PacketId::PlayKeepAlive,                 PacketDirection::Clientbound, ConnectionState::Play},
+    {0x26, PacketId::PlayKeepAlive,                 PacketDirection::Clientbound, ConnectionState::Play}, // PKTFIX_V1: было 0x2B — это Login-пакет, а не KeepAlive
     {0x27, PacketId::PlayChunkDataAndUpdateLight,  PacketDirection::Clientbound, ConnectionState::Play},
     {0x21, PacketId::PlayUnloadChunk,               PacketDirection::Clientbound, ConnectionState::Play},
     {0x40, PacketId::PlayPositionAndLook,           PacketDirection::Clientbound, ConnectionState::Play},
@@ -56,7 +56,7 @@ inline const PacketMapping packetTable[] = {
     {0x09, PacketId::PlayBlockUpdate,               PacketDirection::Clientbound, ConnectionState::Play},
     {0x49, PacketId::PlayMultiBlockChange,          PacketDirection::Clientbound, ConnectionState::Play},
     {0x01, PacketId::PlaySpawnEntity,               PacketDirection::Clientbound, ConnectionState::Play},
-    {0x02, PacketId::PlaySpawnPlayer,               PacketDirection::Clientbound, ConnectionState::Play},
+    {0x01, PacketId::PlaySpawnPlayer,               PacketDirection::Clientbound, ConnectionState::Play}, // PKTFIX_V1: в 1.21.1 отдельного SpawnPlayer нет — игрок спавнится обычным SpawnEntity (0x02 = шарик опыта)
     {0x03, PacketId::PlayEntityAnimation,           PacketDirection::Clientbound, ConnectionState::Play},
     {0x2E, PacketId::PlayEntityPosition,            PacketDirection::Clientbound, ConnectionState::Play},
     {0x30, PacketId::PlayEntityRotation,            PacketDirection::Clientbound, ConnectionState::Play},

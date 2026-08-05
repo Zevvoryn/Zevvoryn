@@ -166,6 +166,7 @@ struct BiomeBuilder {
         return maybeWindsweptSavanna(i, j, wd, rk);
     }
     int pickBeach(int i, int j) {
+        (void)j; // WARNFIX_V1: пляж зависит только от температурной полосы i
         if (i == 0) return B_SNOWY_BEACH;
         if (i == 4) return B_DESERT;
         return B_BEACH;

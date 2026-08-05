@@ -1,5 +1,15 @@
 #include "server.hpp"
+
+// WARNFIX_V1: в этом файле локальный world_ специально перекрывает член класса
+// (MULTIWORLD_V1 / DIMPHYS_V1), чтобы весь блок работал с измерением игрока,
+// а длинные обработчики переиспользуют имена вроде ddx/ddz/want в разных case-ветках.
+#if defined(_MSC_VER)
+#  pragma warning(disable: 4456) // перекрытие локальной переменной
+#  pragma warning(disable: 4458) // перекрытие члена класса
+#endif
 #include "log.hpp"
+#include "crash_trace.hpp" // CRASHTRACE_V1: отметки «что делали перед крашем»
+#include "hang_watch.hpp" // HANGDIAG_V1: сторож зависаний со снятием стека
 #include "command_registry.hpp" // PLUGINCMD_V1
 #include "op_manager.hpp"       // OPMGR_V1: ops.json + /op + /deop
 #include "ban_manager.hpp"      // BANMGR_V1: banned-players.json + /ban + /pardon
@@ -7,10 +17,14 @@
 #include "../registries/registry.hpp"
 #include "../utils/nbt.hpp"
 #include "../world/anvil.hpp" // ANVIL_CONVERT_V1
+#include "../world/playerconv.hpp" // PLAYERCONV_V1
+#include "../world/worldextra.hpp" // WORLDEXTRA_V1: playerdata + player lists <-> vanilla
+#include "../console/gui_console.hpp" // TITLESTATS_V1: живая статистика в заголовке окна
 
 #include <nlohmann/json.hpp>
 #include <set>
 #include <array>
+#include <span>   // CAPECLICK_V1: NBT text component в System Chat
 #include <vector>
 #include <cstdlib>
 #include <format>
@@ -34,8 +48,17 @@
 #include "../crypto/mc_crypto.hpp" // ONLINE_V1
 #include <random> // SPAWN_V1
 #include "crash_context.hpp" // CRASHCTX_V1
+#include "../packets/clientbound_play.hpp" // PACKETS_V9: сборка байт пакетов вынесена в /src/packets
 
 namespace nc {
+
+static int ncCapeCount(); // CAPEEULA_V1: количество плащей нужно в стартовом логе, а таблица ниже
+
+// FLATFLAG_V1: флаг «is flat» в Login/Respawn должен совпадать с реальным генератором:
+// от него зависят туман, цвет неба и высота горизонта на клиенте.
+static bool isFlatGenerator(const std::string& generator) {
+    return generator == "FLAT" || generator == "flat";
+}
 
 // STARTPROF_V1: сколько времени съел каждый этап запуска. Пишется в DEBUG, чтобы не
 // мешать обычному логу: log-level=DEBUG в settings.properties — и таблица появится.
@@ -273,7 +296,7 @@ bool NetherCraftServer::startWithConfig(const ServerConfig& cfg) {
     return startCommon();
 }
 
-// SPAWN_V1: мировая точка спавна (общая), персистится в world/spawn.dat
+// SPAWN_V1: мировая точка спавна (общая); V56_DATKILL_V1: теперь персистится в world/level.dat, а не в отдельном world/spawn.dat
 static i32 g_spawnX = 0, g_spawnY = 4, g_spawnZ = 0; // FLATNATIVE_V1: родная высота — ноги игрока на Y=4 (трава на Y=3)
 
 // WEATHER_SYNC_V1: единое состояние погоды для всех клиентов.
@@ -282,29 +305,18 @@ static i32 g_weather = 0;
 static void sendWeatherState(const std::shared_ptr<entity::Player>& player) {
     if (!player || !player->isAlive()) return;
     auto sendEvent = [&](u8 eventId, f32 value) {
-        net::Buffer event;
-        event.writeByte(eventId);
-        event.writeF32(value);
-        player->getConnection()->sendPacket(0x22,
-            std::vector<u8>(event.writtenSpan().begin(), event.writtenSpan().end()));
+        packets::sendGameEvent(player, static_cast<u8>(eventId), value); /* PACKETS_V10 */
     };
     sendEvent(g_weather == 0 ? 1 : 2, 0.0f); // stop/start raining
     sendEvent(7, g_weather == 0 ? 0.0f : 1.0f); // rain level
     sendEvent(8, g_weather == 2 ? 1.0f : 0.0f); // thunder level
 }
 
-static void writeWorldSpawn(i32 x, i32 y, i32 z) {
-    std::error_code ec; std::filesystem::create_directories("world", ec);
-    std::ofstream f("world/spawn.dat", std::ios::trunc);
-    if (f) f << x << " " << y << " " << z << "\n";
-}
-static bool readWorldSpawn(i32& x, i32& y, i32& z) {
-    std::ifstream f("world/spawn.dat");
-    return bool(f >> x >> y >> z);
-}
+// V56_DATKILL_V1: spawn.dat retired — the world spawn point now round-trips
+// through world/level.dat (see readLevelDatSeedSpawn / buildLevelDatNbt).
 
 // CLEANEXIT_V2: logs/last-exit.txt теперь понятен человеку, открывшему его вручную:
-// первая строка — машинный статус (её ����������������итает сервер), ниже — пояснение и время обновления.
+// первая строка — машинный статус (её читает сервер), ниже — пояснение и время обновления.
 static void writeLastExitFile(const char* status, bool ru) {
     try {
         std::filesystem::create_directories("logs");
@@ -312,7 +324,16 @@ static void writeLastExitFile(const char* status, bool ru) {
         char ts[32] = "?";
         std::time_t now = std::time(nullptr);
         if (std::tm* tmv = std::localtime(&now)) std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tmv);
-        const bool clean = std::string(status) == "clean";
+        const std::string st(status); // CLEANEXIT_V3
+        const bool clean = st == "clean";
+        const char* howRu = clean          ? " (корректная остановка через stop)"
+                          : st == "closed" ? " (окно закрыто крестиком — мир сохранён экстренно)"
+                          : st == "signal" ? " (остановка по Ctrl+C — мир сохранён)"
+                                           : " (запуск сервера)";
+        const char* howEn = clean          ? " (clean stop)"
+                          : st == "closed" ? " (console window closed - world emergency-saved)"
+                          : st == "signal" ? " (Ctrl+C - world saved)"
+                                           : " (server startup)";
         f << status << "\n\n";
         if (ru) {
             f << "# Служебный файл сервера Zevvoryn: как завершился последний сеанс.\n";
@@ -321,8 +342,10 @@ static void writeLastExitFile(const char* status, bool ru) {
             f << "#   running = сервер работает прямо сейчас, ЛИБО был закрыт аварийно\n";
             f << "#             (краш, диспетчер задач, принудительное закрытие окна) — см. logs/crash-last.txt\n";
             f << "#   clean   = сервер остановлен корректно командой stop, всё сохранено\n";
+            f << "#   closed  = окно консоли закрыли крестиком — мир сохранён экстренно\n"; // CLEANEXIT_V3
+            f << "#   signal  = остановка по Ctrl+C — мир сохранён\n";
             f << "#\n";
-            f << "# Обновлено: " << ts << (clean ? " (корректная остановка через stop)" : " (запуск сервера)") << "\n";
+            f << "# Обновлено: " << ts << howRu << "\n"; // WARNFIX_V2
         } else {
             f << "# Zevvoryn server status file: how the last session ended.\n";
             f << "# The first line is read by the server on startup - do not edit this file.\n";
@@ -330,8 +353,10 @@ static void writeLastExitFile(const char* status, bool ru) {
             f << "#   running = the server is running right now, OR it was terminated\n";
             f << "#             abnormally (crash, task manager, force-closed window) - see logs/crash-last.txt\n";
             f << "#   clean   = the server was stopped properly with the stop command\n";
+            f << "#   closed  = the console window was closed - the world was emergency-saved\n"; // CLEANEXIT_V3
+            f << "#   signal  = stopped with Ctrl+C - the world was saved\n";
             f << "#\n";
-            f << "# Updated: " << ts << (clean ? " (clean stop)" : " (server startup)") << "\n";
+            f << "# Updated: " << ts << howEn << "\n"; // WARNFIX_V2
         }
     } catch (...) {}
 }
@@ -345,6 +370,7 @@ bool NetherCraftServer::startCommon() {
         nc::OpManager::instance().init(std::filesystem::current_path(__ec));
         nc::OpManager::instance().importLegacyCsv(config_.ops); // миграция ops= из settings.properties
         nc::BanManager::instance().init(std::filesystem::current_path(__ec)); // BANMGR_V1
+        nc::IpBanManager::instance().init(std::filesystem::current_path(__ec)); // IPBAN_V1
 
         // Мгновенно перерисовываем интерфейс игрока при /op и /deop:
         // Entity Event 24+level переключает доступность команд и F3+F4.
@@ -352,10 +378,7 @@ bool NetherCraftServer::startCommon() {
             for (auto& p : getAllPlayersCopy()) {
                 if (!p || !p->isAlive() || p->getName() != who) continue;
                 if (p->getState() != entity::PlayerState::Play) continue;
-                net::Buffer ev;
-                ev.writeI32(static_cast<i32>(p->getEntityId()));
-                ev.writeByte(static_cast<u8>(24 + std::clamp(lvl, 0, 4)));
-                p->getConnection()->sendPacket(0x1F, std::vector<u8>(ev.writtenSpan().begin(), ev.writtenSpan().end()));
+                packets::sendEntityEvent(p, static_cast<i32>(p->getEntityId()), static_cast<u8>(static_cast<u8>(24 + std::clamp(lvl, 0, 4)))); /* PACKETS_V10 */
                 p->sendSystemMessage(lvl > 0
                     ? std::format("§aВы получили права оператора (уровень {})", lvl)
                     : std::string("§cВы больше не оператор"));
@@ -369,7 +392,14 @@ bool NetherCraftServer::startCommon() {
 
             // /op <player> [level] — level 1..4, по умолчанию 4 (полный оператор)
             __reg.registerCommand({"op", true, "core", "/op <player> [1-4]", [this](nc::cmd::CommandContext& ctx) {
-                if (ctx.args.size() < 2) { ctx.reply("§cUsage: /op <player> [1-4]"); return; }
+                if (ctx.args.size() < 2) {
+                    // LANGFIX_V1: было зашито только по-английски.
+                    // C7744_V1: \xa7 сразу после себя съедал бы следующий гекс-символ 'c' (\xa7c > 0xFF) —
+                    // разбиваем на два соседних строковых литерала, чтобы разорвать escape-последовательность.
+                    ctx.reply(config_.language == "rus" ? "\xc2\xa7" "c\xd0\x98\xd1\x81\xd0\xbf\xd0\xbe\xd0\xbb\xd1\x8c\xd0\xb7\xd0\xbe\xd0\xb2\xd0\xb0\xd0\xbd\xd0\xb8\xd0\xb5: /op <\xd0\xb8\xd0\xb3\xd1\x80\xd0\xbe\xd0\xba> [1-4]"
+                                                          : "\xc2\xa7" "cUsage: /op <player> [1-4]");
+                    return;
+                }
                 const std::string who = ctx.args[1];
                 int lvl = 4; // OPMGR_V1: ванильный дефолт
                 if (ctx.args.size() >= 3) { try { lvl = std::stoi(ctx.args[2]); } catch (...) { lvl = 4; } }
@@ -674,12 +704,14 @@ bool NetherCraftServer::startCommon() {
     }
 
     // ── Баннер запуска ──
+    // BANNERBACK_V1: логотип ZEVVORYN и рамка-плашка возвращены на своё родное место —
+    // убирать их было ошибкой, проблема была в качестве рендера шрифта, а не в самом баннере.
     std::cout << "\n";
     std::cout << "\033[36m[Starting server...]\033[0m\n\n";
     log::rawLine("[Starting server...]"); // LOGBANNER_V1: баннер запуска дублируется в файл лога
     log::rawLine("");
 
-    std::cout << "\033[32m\033[1m";
+    std::cout << "\033[92m\033[1m"; // BANNERBACK_V1: bright green — было тускловато
     std::cout << "  ███████╗███████╗██╗   ██╗██╗   ██╗ ██████╗ ██████╗ ██╗   ██╗███╗   ██╗\n";
     std::cout << "  ╚══███╔╝██╔════╝██║   ██║██║   ██║██╔═══██╗██╔══██╗╚██╗ ██╔╝████╗  ██║\n";
     std::cout << "    ███╔╝ █████╗  ██║   ██║██║   ██║██║   ██║██████╔╝ ╚████╔╝ ██╔██╗ ██║\n";
@@ -691,7 +723,7 @@ bool NetherCraftServer::startCommon() {
         static const char* kBannerArt[] = {
             "  ███████╗███████╗██╗   ██╗██╗   ██╗ ██████╗ ██████╗ ██╗   ██╗███╗   ██╗",
             "  ╚══███╔╝██╔════╝██║   ██║██║   ██║██╔═══██╗██╔══██╗╚██╗ ██╔╝████╗  ██║",
-            "    ███╔╝ █���███╗  ██║   ██║██║   ██║██║   ██║██████╔╝ ╚████╔╝ ██╔██╗ ██║",
+            "    ███╔╝ █████╗  ██║   ██║██║   ██║██║   ██║██████╔╝ ╚████╔╝ ██╔██╗ ██║",
             "   ███╔╝  ██╔══╝  ╚██╗ ██╔╝╚██╗ ██╔╝██║   ██║██╔══██╗  ╚██╔╝  ██║╚██╗██║",
             "  ███████╗███████╗ ╚████╔╝  ╚████╔╝ ╚██████╔╝██║  ██║   ██║   ██║ ╚████║",
             "  ╚══════╝╚══════╝  ╚═══╝    ╚═══╝   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═══╝",
@@ -701,43 +733,45 @@ bool NetherCraftServer::startCommon() {
     }
 
     std::cout << "\n";
-    const char* tl = "\xe2\x95\x94"; // ╔
-    const char* tr = "\xe2\x95\x97"; // ╗
-    const char* bl = "\xe2\x95\x9a"; // ╚
-    const char* br = "\xe2\x95\x9d"; // ╝
-    const char* h  = "\xe2\x95\x90"; // ═
-    const char* v  = "\xe2\x95\x91"; // ║
-    int bw = 52; // ширина внутренней области
-    auto line = [&](const char* l, const char* r) {
-        std::string s = "  "; s += l;
-        for (int i = 0; i < bw; ++i) s += h;
-        s += r;
-        std::cout << s << "\n";
-        log::rawLine(s); // LOGBANNER_V1
-    };
-    auto row = [&](const std::string& content, int displayWidth) {
-        (void)displayWidth; // WIZARD_UI_V1: считаем реальную ширину по UTF-8
-        int cols = 0;
-        for (unsigned char uch : content) if ((uch & 0xC0) != 0x80) ++cols;
-        int pad = bw - cols;
-        if (pad < 0) pad = 0;
-        int leftPad = pad / 2;
-        int rightPad = pad - leftPad;
-        std::string s = "  "; s += v;
-        s.append(static_cast<size_t>(leftPad), ' ');
-        s += content;
-        s.append(static_cast<size_t>(rightPad), ' ');
-        s += v;
-        std::cout << s << "\n";
-        log::rawLine(s); // LOGBANNER_V1
-    };
-    std::cout << "\033[36m\033[1m";
-    line(tl, tr);
-    row("Minecraft Java Edition 1.21.1", 30);
-    row("High Performance C++20", 22);
-    row("No JVM | No JNI | No Wrappers", 30);
-    line(bl, br);
-    std::cout << "\033[0m\n";
+    { // BANNERBACK_V1: рамка-плашка вернулась сразу под логотип, как было раньше
+        const char* tl = "\xe2\x95\x94"; // ╔
+        const char* tr = "\xe2\x95\x97"; // ╗
+        const char* bl = "\xe2\x95\x9a"; // ╚
+        const char* br = "\xe2\x95\x9d"; // ╝
+        const char* h  = "\xe2\x95\x90"; // ═
+        const char* v  = "\xe2\x95\x91"; // ║
+        int bw = 52; // ширина внутренней области
+        auto line = [&](const char* l, const char* r) {
+            std::string s = "  "; s += l;
+            for (int i = 0; i < bw; ++i) s += h;
+            s += r;
+            std::cout << s << "\n";
+            log::rawLine(s); // LOGBANNER_V1
+        };
+        auto row = [&](const std::string& content, int displayWidth) {
+            (void)displayWidth; // WIZARD_UI_V1: считаем реальную ширину по UTF-8
+            int cols = 0;
+            for (unsigned char uch : content) if ((uch & 0xC0) != 0x80) ++cols;
+            int pad = bw - cols;
+            if (pad < 0) pad = 0;
+            int leftPad = pad / 2;
+            int rightPad = pad - leftPad;
+            std::string s = "  "; s += v;
+            s.append(static_cast<size_t>(leftPad), ' ');
+            s += content;
+            s.append(static_cast<size_t>(rightPad), ' ');
+            s += v;
+            std::cout << s << "\n";
+            log::rawLine(s); // LOGBANNER_V1
+        };
+        std::cout << "\033[96m\033[1m";
+        line(tl, tr);
+        row("Minecraft Java Edition 1.21.1", 30);
+        row("High Performance C++20", 22);
+        row("No JVM | No JNI | No Wrappers", 30);
+        line(bl, br);
+        std::cout << "\033[0m\n";
+    }
 
     // Создаём структуру директорий
     std::filesystem::create_directories(config_.levelName);
@@ -745,7 +779,10 @@ bool NetherCraftServer::startCommon() {
     log::initFileLog(config_.language); // LOGNAME_V1: logs/log-ДД.ММ.ГГ.log (eng: ММ.ДД.ГГ), 15 последних
     log::setLevelFromString(config_.logLevel); // LOGLEVEL_V1: apply configured verbosity (default INFO) so startup logs are visible
 
-    NC_INFO("Server", "Loading server configuration");
+    // LANGALL_V1: весь стартовый вывод теперь на языке из конфига: rus — всё по-русски, eng — всё по-английски.
+    const bool ruLog = (config_.language == "rus");
+    if (ruLog) NC_INFO("Server", "Загрузка конфигурации сервера");
+    else       NC_INFO("Server", "Loading server configuration");
 
     // Определяем язык
     if (config_.language == "rus") {
@@ -774,31 +811,31 @@ bool NetherCraftServer::startCommon() {
         }
     }
 
-    { // CLEANEXIT_V1: сообщаем, как завершился прошлый сеанс, и ставим маркер «running»
+    // SESSIONLINE_V1: строка о том, как завершился прошлый сеанс, печатается не здесь,
+    // а ниже — сразу после ссылки на GitHub. Здесь только читаем маркер и ставим «running».
+    std::string prevExit;
+    { // CLEANEXIT_V1
         const bool ruExit = (config_.language == "rus");
-        std::string prevExit;
         try { std::ifstream f("logs/last-exit.txt"); std::getline(f, prevExit); } catch (...) {}
-        if (prevExit == "clean") {
-            NC_INFO("Server", ruExit ? "Прошлый сеанс завершён корректно (через stop)" : "Previous session ended cleanly (stop)");
-        } else if (prevExit == "running") {
-            NC_WARN("Server", ruExit ? "Прошлый сеанс завершился АВАРИЙНО (краш или принудительное закрытие) — подробности в logs/crash-last.txt" : "Previous session ended ABNORMALLY (crash or force close) - see logs/crash-last.txt");
-        }
         writeLastExitFile("running", ruExit); // CLEANEXIT_V2
     }
 
-    NC_INFO("Server", "Starting Minecraft: Java Edition server v1.21.1");
-    NC_INFO("Server", "Online mode: {}", config_.xboxAuth ? "enabled" : "disabled");
+    if (ruLog) NC_INFO("Server", "Запуск сервера Minecraft: Java Edition v1.21.1"); // LANGALL_V1
+    else       NC_INFO("Server", "Starting Minecraft: Java Edition server v1.21.1");
+    if (ruLog) NC_INFO("Server", "Онлайн-режим: {}", config_.xboxAuth ? "включён" : "выключен"); // LANGALL_V1
+    else       NC_INFO("Server", "Online mode: {}", config_.xboxAuth ? "enabled" : "disabled");
     // ONLINE_V1: online-mode uses RSA/AES + Mojang sessionserver
     if (config_.xboxAuth) {
         if (crypto::ServerKey::instance().valid()) {
-            NC_INFO("Server", "Mojang authentication enabled.");
+            if (ruLog) NC_INFO("Server", "Авторизация Mojang включена."); // LANGALL_V1
+            else       NC_INFO("Server", "Mojang authentication enabled.");
         } else {
             NC_ERROR("Server", "Online mode requested but crypto init failed; running offline");
             config_.xboxAuth = false;
         }
     }
     if (false) { // AUTHWARN_V1 (dead: superseded by ONLINE_V1)
-        NC_WARN("Server", "Онлайн режим (Mojang auth) пока не реализован: нужны RSA/AES-шифрование и session-сервер Mojang. С��р��ер работает как offline.");
+        NC_WARN("Server", "Онлайн режим (Mojang auth) пока не реализован: нужны RSA/AES-шифрование и session-сервер Mojang. Сервер работает как offline.");
     }
 
     g_startProfile.lap("Config"); // STARTPROF_V1
@@ -808,45 +845,73 @@ bool NetherCraftServer::startCommon() {
     i32 radius = config_.viewDistance / 16 + 1;
     const bool ru = (config_.language == "rus"); // SPAWN_V1
     const bool isDefault = (config_.generator == "DEFAULT" || config_.generator == "default"); // WORLDGEN_V1
-    const bool worldExists = std::filesystem::exists("world/world.dat"); // SEED_V1
+    const bool worldExists = std::filesystem::exists("world/region")
+                          || std::filesystem::exists("world/level.dat"); // V56_VANILLAONLY_V1: ванильный сейв в корне world/
 
-    // SEED_V1: сид 0 = случайный; фиксируем и переиспользуем (для существующего мира читаем world/seed.dat)
-    if (worldExists) {
-        i64 savedSeed = 0; std::ifstream sf("world/seed.dat");
-        if (sf >> savedSeed) config_.levelSeed = savedSeed;
-    } else {
-        if (config_.levelSeed == 0) {
+    // V56_DATKILL_V1: seed.dat и spawn.dat больше не нужны как отдельные файлы —
+    // то же самое (сид и точка спавна) уже лежит в world/level.dat, который
+    // перезаписывается на каждом сохранении (saveVanillaMirror -> exportToVanilla
+    // -> buildLevelDatNbt). Приоритет: явный level-seed из settings.properties >
+    // сохранённый в level.dat > новый случайный.
+    bool haveLevelDatSeedSpawn = false;
+    {
+        i64 savedSeed = 0;
+        i32 lx = g_spawnX, ly = g_spawnY, lz = g_spawnZ;
+        haveLevelDatSeedSpawn = world::anvil::readLevelDatSeedSpawn("world", savedSeed, lx, ly, lz);
+        if (config_.levelSeed != 0) {
+            // Сид явно задан в конфиге — он главнее сохранённого.
+            if (haveLevelDatSeedSpawn && savedSeed != config_.levelSeed) {
+                if (ru) NC_WARN("Server", "level-seed в settings.properties ({}) отличается от сида уже созданного мира ({}); старые чанки останутся как есть",
+                                  (long long)config_.levelSeed, (long long)savedSeed);
+                else    NC_WARN("Server", "level-seed in settings.properties ({}) differs from the existing world seed ({}); already generated chunks stay as they are",
+                                  (long long)config_.levelSeed, (long long)savedSeed);
+            }
+        } else if (haveLevelDatSeedSpawn) {
+            config_.levelSeed = savedSeed;
+            g_spawnX = lx; g_spawnY = ly; g_spawnZ = lz; // V56_DATKILL_V1: спавн тоже читаем из level.dat
+        } else {
             std::random_device rd;
             std::mt19937_64 g(((u64)rd() << 32) ^ (u64)rd());
             config_.levelSeed = (i64)g();
             if (config_.levelSeed == 0) config_.levelSeed = 1;
+            if (worldExists) {
+                if (ru) NC_WARN("Server", "Мир есть, а world/level.dat не прочитан — завёл новый сид {}, новые чанки могут не сойтись со старыми", (long long)config_.levelSeed);
+                else    NC_WARN("Server", "World exists but world/level.dat is unreadable — generated a new seed {}, new chunks may not match the old ones", (long long)config_.levelSeed);
+            }
         }
-        std::error_code ec; std::filesystem::create_directories("world", ec);
-        std::ofstream sf("world/seed.dat", std::ios::trunc);
-        if (sf) sf << config_.levelSeed << "\n";
     }
     world_.setLanguageRu(ru); // LANGFIX_V1: язык логов модуля мира
-    if (ru) NC_INFO("Server", "Сид мира: {}", (long long)config_.levelSeed); // SPAWN_FIX_V1
-    else    NC_INFO("Server", "World seed: {}", (long long)config_.levelSeed);
-
-    { // DIMSAVE_V1: world/ = родитель, внутри overworld/ nether/ end/
-        std::error_code dsec;
-        std::filesystem::create_directories("world/overworld", dsec);
-        std::filesystem::create_directories("world/nether", dsec);
-        std::filesystem::create_directories("world/end", dsec);
-        if (std::filesystem::exists("world/world.dat", dsec) &&
-            !std::filesystem::exists("world/overworld/world.dat", dsec))
-            std::filesystem::rename("world/world.dat", "world/overworld/world.dat", dsec);
+    // FLATLOG_V1: у плоского и пустого мира сид ни на что не влияет — не мозолим глаза в логе.
+    if (isDefault) {
+        if (ru) NC_INFO("Server", "Сид мира: {}", (long long)config_.levelSeed); // SPAWN_FIX_V1
+        else    NC_INFO("Server", "World seed: {}", (long long)config_.levelSeed);
+    } else if (isFlatGenerator(config_.generator)) {
+        if (ru) NC_INFO("Server", "Тип мира: плоский (FLAT), сид не используется");
+        else    NC_INFO("Server", "World type: superflat (FLAT), the seed is not used");
+    } else {
+        if (ru) NC_INFO("Server", "Тип мира: {}, сид не используется", config_.generator);
+        else    NC_INFO("Server", "World type: {}, the seed is not used", config_.generator);
     }
-    // WORLDSAVE_V1: сначала пробуем загрузить сохранённый мир
-    if (world_.startBackgroundLoad("world/overworld/world.dat")) { // FASTBOOT_V1: header on main thread, bodies stream in background
+
+    { // V56_VANILLAONLY_V1: world/ = корень ванильного сейва (level.dat + region/), Ад/Энд в DIM-1/DIM1
+        std::error_code dsec;
+        std::filesystem::create_directories("world", dsec);
+    }
+    // V56_VANILLAONLY_V1: единственный источник истины — ванильный сейв. Загрузка теперь
+    // синхронная: чанки читаются из .mca напрямую в World, а сундуки/таблички/
+    // печи/спавнеры/баннеры — из block_entities тех же чанков, а мобы/дроп/транспорт —
+    // из entities/*.mca.
+    world::extra::Snapshot bootExtras;
+    std::string importErr;
+    const bool importedFromVanilla =
+        world::anvil::importFromVanilla(world_, "world", &importErr, &bootExtras);
+    if (importedFromVanilla) {
         if (isDefault) world_.initDefaultGenerator(config_.levelSeed, ru); // WORLDGEN_V1
         else world_.initFlatGenerator(); // FLATWORLD_V1: новые чанки генерятся на лету
-        if (ru) NC_INFO("Server", "Мир загружается с диска в фоне (старт не ждёт)...");
-        else    NC_INFO("Server", "World loading from disk in background (startup won't block)...");
-        if (!readWorldSpawn(g_spawnX, g_spawnY, g_spawnZ) && isDefault) { // SPAWN_V1
+        if (ru) NC_INFO("Server", "Мир загружен из world/region ({} блок-сущностей восстановлено)", bootExtras.total());
+        else    NC_INFO("Server", "World loaded from world/region ({} block entities recovered)", bootExtras.total());
+        if (!haveLevelDatSeedSpawn && isDefault) { // спавн уже подтянут из level.dat выше; иначе ищем как раньше
             world_.findWorldSpawn(config_.levelSeed, g_spawnX, g_spawnY, g_spawnZ);
-            writeWorldSpawn(g_spawnX, g_spawnY, g_spawnZ);
         }
     } else {
         if (isDefault) { // WORLDGEN_V1
@@ -856,28 +921,37 @@ bool NetherCraftServer::startCommon() {
         }
         if (isDefault) world_.findWorldSpawn(config_.levelSeed, g_spawnX, g_spawnY, g_spawnZ); // SPAWN_V1
         else { g_spawnX = 0; g_spawnY = 4; g_spawnZ = 0; } // FLATNATIVE_V1
-        writeWorldSpawn(g_spawnX, g_spawnY, g_spawnZ);
         saveWorlds(); // DIMSAVE_V1
-        if (ru) NC_INFO("Server", "Новый мир создан и сохранён в world/world.dat");
-        else    NC_INFO("Server", "New world created and saved to world/world.dat");
-        if (ru) NC_INFO("Server", "Мировой спавн: {} {} {}", g_spawnX, g_spawnY, g_spawnZ);
-        else    NC_INFO("Server", "World spawn: {} {} {}", g_spawnX, g_spawnY, g_spawnZ);
+        if (ru) NC_INFO("Server", "Новый мир создан и сохранён в world/region");
+        else    NC_INFO("Server", "New world created and saved to world/region");
     }
+
+    // SPAWNLOG_V1: точку спавна печатаем всегда, а не только для нового мира.
+    // При загрузке готового сейва строка раньше просто пропадала из лога.
+    if (ru) NC_INFO("Server", "Мировой спавн: {} {} {}", g_spawnX, g_spawnY, g_spawnZ);
+    else    NC_INFO("Server", "World spawn: {} {} {}", g_spawnX, g_spawnY, g_spawnZ);
 
     g_startProfile.lap("World snapshot"); // STARTPROF_V1
     prepareAllDimensions(); // WORLDPREP_V1: Ад и Энд готовы до приёма игроков
+    restoreExtras(bootExtras); // V56_VANILLAONLY_V1: сундуки/таблички/мобы/дроп/транспорт из прошлой сессии
     g_startProfile.lap("Spawn prep"); // STARTPROF_V1
 
     network_.onConnection([this](auto conn) { onPlayerConnect(conn); });
     network_.onDisconnect([this](auto conn) { onPlayerDisconnect(conn); });
     network_.onPacket([this](auto conn, auto& data, auto id) { onPacketReceived(conn, data, id); });
 
-    if (!network_.start(static_cast<u16>(config_.port))) {
+    // PKTLIMIT_V1: ключ max-packet-size был мёртвым — в сети стоял хардкод 2 МБ.
+    net::Connection::setMaxPacketSize(config_.maxPacketSize);
+    // IPV6_V1: dual-stack слушатель по enable-ipv6 (раньше ключ тоже ни на что не влиял).
+    // LANGFIX_V1 (перевод): сообщаем сетевому модулю язык до старта, иначе его строки
+    // stop/stopped оставались английскими, хотя всё остальное уже на русском.
+    network_.setLanguage(ru);
+    if (!network_.start(static_cast<u16>(config_.port), 512, config_.enableIpv6)) {
         // PORTLOCK_V1: второй сервер на ТОМ ЖЕ порту не запускается. Другие порты — сколько угодно.
         if (ru) {
             NC_FATAL("Server", "Порт {} уже занят — сервер не запущен", config_.port);
             NC_FATAL("Server", "Скорее всего уже запущен другой сервер на этом же порту.");
-            NC_FATAL("Server", "Закрой его или поменя�� port= в settings.properties (например {}).", config_.port + 1);
+            NC_FATAL("Server", "Закрой его или поменяй port= в settings.properties (например {}).", config_.port + 1);
         } else {
             NC_FATAL("Server", "Port {} is already in use — server not started", config_.port);
             NC_FATAL("Server", "Another server is most likely already running on this port.");
@@ -900,7 +974,8 @@ bool NetherCraftServer::startCommon() {
 
     // Информация о сервере (как PMMP)
     std::cout << "\n";
-    NC_INFO("Server", "Network interface listening on 0.0.0.0:{}", config_.port);
+    if (ruLog) NC_INFO("Server", "Сетевой интерфейс слушает 0.0.0.0:{}", config_.port); // LANGALL_V1
+    else       NC_INFO("Server", "Network interface listening on 0.0.0.0:{}", config_.port);
     // WHITELIST_V1
     {
         std::filesystem::path wlPath = "whitelist.txt";
@@ -910,7 +985,8 @@ bool NetherCraftServer::startCommon() {
         }
         whitelist_.setPath(wlPath.string());
         whitelist_.load();
-        NC_INFO("Server", "WHITELIST_V1: {} entries:{}", config_.whiteList ? "on" : "off", whitelist_.size());
+        if (ruLog) NC_INFO("Server", "Белый список: {}, записей: {}", config_.whiteList ? "вкл" : "выкл", whitelist_.size()); // LANGALL_V1
+        else       NC_INFO("Server", "Whitelist: {}, entries: {}", config_.whiteList ? "on" : "off", whitelist_.size());
     }
 
     // RCON_BRIDGE_V1: core/rcon.hpp::RconServer был полностью написан, но никогда не запускался —
@@ -935,21 +1011,56 @@ bool NetherCraftServer::startCommon() {
             else NC_WARN("Server", "RCON is enabled in config but failed to start (see RCON log above)");
         }
     }
-    NC_INFO("Server", "Default gamemode: {}", config_.gamemode);
-    NC_INFO("Server", "Difficulty: {} ({})", config_.difficulty,
-        config_.difficulty == 0 ? "Peaceful" :
-        config_.difficulty == 1 ? "Easy" :
-        config_.difficulty == 2 ? "Normal" : "Hard");
-    NC_INFO("Server", "Language: {}", lang);
-    NC_INFO("Server", "View distance: {} chunks", config_.viewDistance);
+    // LANGALL_V1
+    if (ruLog) {
+        NC_INFO("Server", "Режим игры по умолчанию: {}", config_.gamemode);
+        NC_INFO("Server", "Сложность: {} ({})", config_.difficulty,
+            config_.difficulty == 0 ? "Мирная" :
+            config_.difficulty == 1 ? "Лёгкая" :
+            config_.difficulty == 2 ? "Нормальная" : "Сложная");
+        NC_INFO("Server", "Язык: {}", lang);
+        NC_INFO("Server", "Дальность прорисовки: {} чанков", config_.viewDistance);
+    } else {
+        NC_INFO("Server", "Default gamemode: {}", config_.gamemode);
+        NC_INFO("Server", "Difficulty: {} ({})", config_.difficulty,
+            config_.difficulty == 0 ? "Peaceful" :
+            config_.difficulty == 1 ? "Easy" :
+            config_.difficulty == 2 ? "Normal" : "Hard");
+        NC_INFO("Server", "Language: {}", lang);
+        NC_INFO("Server", "View distance: {} chunks", config_.viewDistance);
+    }
+    // CAPEEULA_V1: плащи — только в offline-режиме: выдавать чужие плащи лицензионным
+    // аккаунтам нельзя — это прямое нарушение Minecraft EULA.
+    if (config_.xboxAuth) {
+        if (ruLog) NC_WARN("Server", "Плащи (/cape, /capes): ВЫКЛЮЧЕНЫ — online-mode=true (выдача плащей лицензионным аккаунтам нарушает Minecraft EULA)");
+        else       NC_WARN("Server", "Capes (/cape, /capes): DISABLED - online-mode=true (granting capes to licensed accounts violates the Minecraft EULA)");
+    } else {
+        if (ruLog) NC_INFO("Server", "Плащи (/cape, /capes): включены, доступно {} шт. (online-mode=false)", ncCapeCount());
+        else       NC_INFO("Server", "Capes (/cape, /capes): enabled, {} available (online-mode=false)", ncCapeCount());
+    }
     g_startProfile.lap("Network"); // STARTPROF_V1
-    NC_INFO("Server", "Max players: {}", config_.maxPlayers);
+    if (ruLog) NC_INFO("Server", "Максимум игроков: {}", config_.maxPlayers); // LANGALL_V1
+    else       NC_INFO("Server", "Max players: {}", config_.maxPlayers);
     std::cout << "\n";
 
     // Ссылки
     std::cout << "\033[36m";
     std::cout << "  - GitHub:     https://github.com/Zevvoryn/Zevvoryn\n";
+    log::guiLine("  - GitHub:     https://github.com/Zevvoryn/Zevvoryn"); // GUIBACKLOG_V1
     std::cout << "\033[0m\n";
+
+    { // SESSIONLINE_V1: статус прошлого сеанса — сразу после ссылки на GitHub и своим цветом (тег Session)
+        const bool ruExit = (config_.language == "rus");
+        if (prevExit == "clean") {
+            NC_INFO("Session", ruExit ? "Прошлый сеанс завершён корректно (через stop)" : "Previous session ended cleanly (stop)");
+        } else if (prevExit == "closed") { // CLEANEXIT_V3: крестик больше не выдаёт себя за команду stop
+            NC_INFO("Session", ruExit ? "Прошлый сеанс завершён закрытием окна — мир был сохранён экстренно" : "Previous session ended by closing the console window - the world was emergency-saved");
+        } else if (prevExit == "signal") { // CLEANEXIT_V3
+            NC_INFO("Session", ruExit ? "Прошлый сеанс остановлен по Ctrl+C — мир сохранён" : "Previous session was stopped with Ctrl+C - world saved");
+        } else if (prevExit == "running") {
+            NC_WARN("Session", ruExit ? "Прошлый сеанс завершился АВАРИЙНО (краш или принудительное закрытие) — подробности в logs/crash-last.txt" : "Previous session ended ABNORMALLY (crash or force close) - see logs/crash-last.txt");
+        }
+    }
 
     g_startProfile.lap("Plugins"); // STARTPROF_V1
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1006,12 +1117,18 @@ void NetherCraftServer::chatWorkerLoop() {
     }
 }
 
-void NetherCraftServer::stop() {
+void NetherCraftServer::stop(const char* exitStatus) {
     // STOPONCE_V1: stop() зовут из консольной команды stop, из main() после join
     // и из деструктора — мир сохранялся ТРИЖДЫ. Теперь работает только первый вызов.
     bool expectedStop = false;
     if (!stoppedOnce_.compare_exchange_strong(expectedStop, true)) return;
-    NC_INFO("Server", "Stopping server..."); // STOPLOG_V1: печатается ровно один раз (после guard)
+    // WINSAVE_V2: при крестике/сигнале Windows даёт всего ~5 секунд — режем паузы,
+    // чтобы гарантированно успеть записать мир, а не ждать досылки Disconnect'ов.
+    const bool fastExit = std::string(exitStatus) != "clean"; // CLEANEXIT_V3
+    // STOPLOG_V1: печатается ровно один раз (после guard)
+    // CRASHSAFE_V1: было всегда по-английски, хотя весь остальной остановочный вывод локализован
+    if (config_.language == "rus") NC_INFO("Server", "Остановка сервера...");
+    else NC_INFO("Server", "Stopping server...");
     // ASYNCSAVE_V1: дождаться фонового автосейва, чтобы не писать world.dat из двух потоков
     // KICKFIRST_V1: кикаем игроков ДО сохранения. До этого stop() шёл saveWorlds() (~10+ сек),
     // потом kick — но Windows даёт CTRL_CLOSE_EVENT всего ~5 сек: процесс убивался до кика.
@@ -1020,7 +1137,7 @@ void NetherCraftServer::stop() {
         for (auto& p : getAllPlayersCopy()) {
             if (p) p->kick(ruStop ? "§cСервер остановлен" : "§cServer closed");
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(300)); // даём writer-потокам дослать Disconnect
+        std::this_thread::sleep_for(std::chrono::milliseconds(fastExit ? 120 : 300)); // WINSAVE_V2: даём writer-потокам дослать Disconnect
     }
     // ASYNCSAVE_V1: дождаться фонового автосейва
     if (saveThread_.joinable()) saveThread_.join();
@@ -1035,27 +1152,31 @@ void NetherCraftServer::stop() {
             if (ruSave) NC_INFO("Server", "Сохранение мира... ({} чанков, не закрывайте окно)", chunkCount);
             else NC_INFO("Server", "Saving world... ({} chunks, do not close the window)", chunkCount);
             const auto tSave0 = std::chrono::steady_clock::now();
-            saveWorlds(); // DIMSAVE_V1
-            for (auto& p2 : getAllPlayersCopy()) savePlayerData(p2);
+            NC_CTRACE("stop: saveWorlds() старт, чанков %d", static_cast<int>(chunkCount)); // CRASHTRACE_V1
+            // HANGDIAG_V1: сторож зависшего сохранения. В CRASHSAFE_V1 он писал через логер и поэтому
+            // молчал: логер берёт свой мьютекс и кучу, а именно их держит зависший поток.
+            // Теперь отчёт пишется НАПРЯМУЮ в logs/hang-*.txt и содержит стек зависшего
+            // потока; через 40 секунд процесс закрывается принудительно, чтобы окно не висело.
+            {
+                nc::crash::HangWatch saveDog("остановка: сохранение мира (saveWorlds)", 10, 40);
+                saveWorlds(); // DIMSAVE_V1
+                NC_CTRACE("stop: saveWorlds() готово, сохраняем игроков"); // CRASHTRACE_V1
+                for (auto& p2 : getAllPlayersCopy()) savePlayerData(p2);
+                NC_CTRACE("stop: игроки сохранены"); // CRASHTRACE_V1
+            }
             const f64 saveMs = std::chrono::duration<f64, std::milli>(
                 std::chrono::steady_clock::now() - tSave0).count();
-            if (ruSave) NC_INFO("Server", "Мир сохранён в world/overworld/world.dat за {:.0f} мс", saveMs);
-            else NC_INFO("Server", "World saved to world/overworld/world.dat in {:.0f} ms", saveMs);
+            // V57_LOGFMT_V1: world.dat больше нет, сохраняемся прямо в ванильный сейв.
+            if (ruSave) NC_INFO("Server", "Мир сохранён в world/level.dat + region за {:.0f} мс", saveMs);
+            else NC_INFO("Server", "World saved to world/level.dat + region in {:.0f} ms", saveMs);
         } else if (ruSave) {
             NC_WARN("Server", "Сохранять нечего: ни один чанк не загружен (старый world.dat остался как был)");
         } else {
             NC_WARN("Server", "Nothing to save: no chunks loaded (existing world.dat left untouched)");
         }
     }
-    // STOPKICK_V1->KICKFIRST_V1: кик уже выше, запоминаем заголовок для истории маркеров
-    // дослать Disconnect до закрытия сети — игрок видит «Сервер остановлен».
-    {
-        const bool ruStop = (config_.language == "rus");
-        for (auto& p : getAllPlayersCopy()) {
-            if (p) p->kick(ruStop ? "§cСервер остановлен" : "§cServer closed");
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    }
+    // STOPFAST_V1: повторный кик + 300 мс сна были дублём KICKFIRST_V1 выше — убраны,
+    // выход по /stop и по крестику короче на 300 мс.
     network_.stop();
     rcon_.stop(); // RCON_BRIDGE_V1
 
@@ -1065,8 +1186,8 @@ void NetherCraftServer::stop() {
     chatCv_.notify_all();
     if (chatThread_.joinable()) chatThread_.join();
 
-    // CLEANEXIT_V1: пом��тка «завершились штатно» — читается на следующем старте
-    writeLastExitFile("clean", config_.language == "rus"); // CLEANEXIT_V2
+    // CLEANEXIT_V1: пометка «завершились штатно» — читается на следующем старте
+    writeLastExitFile(exitStatus, config_.language == "rus"); // CLEANEXIT_V3: реальная причина, а не всегда clean
 }
 
 void NetherCraftServer::queueConsoleCommand(std::string command, std::shared_ptr<std::promise<std::string>> result) {
@@ -1121,7 +1242,7 @@ void NetherCraftServer::run() {
         if (_tp_gap > _tp_gapMax) _tp_gapMax = _tp_gap;
         if (++_tp_gapWin >= 100) { // ~раз в 5с
             if (_tp_gapMax > 52.0)
-                NC_DEBUG("TickProf", "макс. интервал МЕЖДУ тиками за 5с: {:.1f}мс (цель 50). Если tick() при этом быстрый — виноват планировщик/ОС, а не наш код", _tp_gapMax);
+                NC_DEBUG("TickProf", "Макс. интервал МЕЖДУ тиками за 5с: {:.1f}мс (цель 50). Если tick() при этом быстрый — виноват планировщик/ОС, а не наш код", _tp_gapMax);
             _tp_gapMax = 0.0; _tp_gapWin = 0;
         }
 
@@ -1135,7 +1256,7 @@ void NetherCraftServer::run() {
             // the measured rate down to ~19.96. Sleep until ~1.2ms before the
             // deadline, then busy-spin the remainder for sub-ms accuracy.
             // SCHEDFIX_V1: раньше busy-spin был 1.2мс и жёг ядро (CPU ~57%% в соло),
-            // делая поток мишенью для вытеснения. Стабильность тепер������ даёт приоритет
+            // делая поток мишенью для вытеснения. Стабильность теперь даёт приоритет
             // потока + timeBeginPeriod(1); микро-spin остаётся коротким (300мкс) для sub-ms точности.
             const auto spinFrom = nextTick - microseconds(300);
             if (now < spinFrom) {
@@ -1202,7 +1323,7 @@ void NetherCraftServer::onPlayerDisconnect(std::shared_ptr<net::Connection> conn
         players_.erase(conn->getId());
     }
     network_.removeConnection(conn->getId());
-    tabListDirty_.store(true, std::memory_order_relaxed); // STRESS_FIX_V1: раньше слали пакет мгновенно на каждый выход — шторм при churn
+    tabListDirty_.store(true, std::memory_order_relaxed); // STRESS_FIX_V1: раньше слали пакет мгновенно на каждый вход — шторм при churn
     // MEMFIX_V1: разорвать цикл shared_ptr Player <-> Connection.
     // Connection держит Player через userData_, Player держит Connection через connection_ —
     // без этого оба объекта (инвентарь, sentChunks_, буферы сокета) живут вечно после дисконнекта.
@@ -1240,33 +1361,62 @@ void NetherCraftServer::onPacketReceived(std::shared_ptr<net::Connection> conn, 
 // ============================================================
 
 void NetherCraftServer::handleHandshake(std::shared_ptr<entity::Player> player, net::Buffer& data) {
-    i32 protocolVersion = data.readVarInt();
-    std::string serverAddress = data.readString();
-    u16 serverPort = data.readU16();
-    i32 nextState = data.readVarInt();
-
-    // nextState: 1=Status, 2=Login — показываем только Login
-    if (nextState == 2) {
-        NC_DEBUG("Server", "Handshake: protocol={}, login", protocolVersion);
-    }
-
-    if (protocolVersion != 767) {
-        if (config_.language == "rus") NC_WARN("Server", "Неподдерживаемая версия: {}", protocolVersion);
-        else NC_WARN("Server", "Unsupported protocol version: {}", protocolVersion); // LANGFIX_V1
-        net::Buffer discBuf;
-        nlohmann::json discJson;
-        if (config_.language == "rus") discJson["text"] = std::format("Поддерживается только 1.21.1 (767). Версия: {}", protocolVersion);
-        else discJson["text"] = std::format("Only 1.21.1 (767) is supported. Your version: {}", protocolVersion); // LANGFIX_V1
-        discBuf.writeString(discJson.dump());
-        player->getConnection()->sendPacket(0x00, std::vector<u8>(discBuf.writtenSpan().begin(), discBuf.writtenSpan().end()));
+    // PINGFIX_V1: обрезанный или пустой handshake больше не роняет обработчик исключением.
+    if (data.readableBytes() < 4) {
+        if (config_.language == "rus") NC_WARN("Server", "Обрезанный handshake, соединение закрыто");
+        else NC_WARN("Server", "Truncated handshake, closing connection");
+        player->getConnection()->closeAfterFlush();
         return;
     }
 
+    const i32 protocolVersion = data.readVarInt();
+    const std::string serverAddress = data.readString();
+    const u16 serverPort = data.readU16();
+    (void)serverAddress; // WARNFIX_V1: поля обязательно читаются из потока, но серверу не нужны
+    (void)serverPort;
+    const i32 nextState = data.readVarInt();
+
+    // nextState: 1 = Status (пинг из списка серверов), 2 = Login, 3 = Transfer
     if (nextState == 1) {
+        // PINGFIX_V1: на статус отвечаем ЛЮБОЙ версии — так делает ваниль.
+        // Клиент сам сравнит protocol из ответа со своим и покажет «устаревший сервер».
+        // Раньше чужая версия обрывала handshake, состояние оставалось Handshaking,
+        // и следующий Status Request (пустой пакет 0x00) падал на чтении VarInt.
         player->getConnection()->setConnectionState(ConnectionState::Status);
-    } else if (nextState == 2) {
-        player->getConnection()->setConnectionState(ConnectionState::Login);
+        return;
     }
+
+    NC_DEBUG("Server", "Handshake: protocol={}, login", protocolVersion);
+
+    // Версия проверяется только на входе в игру, а не при пинге.
+    if (protocolVersion != 767) {
+        // DISCMSG_V1: strict-version-check=false — никого не вышвыриваем насильно.
+        // Если впереди поставят прокси или плагин вроде ViaVersion, он сам переведёт
+        // протокол, а жёсткая проверка только сломала бы такую связку.
+        if (!config_.strictVersionCheck) {
+            if (config_.language == "rus") NC_WARN("Server", "Клиент с версией {} пропущен: strict-version-check=false", protocolVersion);
+            else NC_WARN("Server", "Client with protocol {} allowed in: strict-version-check=false", protocolVersion);
+        } else {
+            if (config_.language == "rus") NC_WARN("Server", "Неподдерживаемая версия: {}", protocolVersion);
+            else NC_WARN("Server", "Unsupported protocol version: {}", protocolVersion); // LANGFIX_V1
+            // PINGFIX_V1: Disconnect должен уйти уже в состоянии Login,
+            // иначе клиент не разберёт пакет 0x00 и покажет просто обрыв связи.
+            player->getConnection()->setConnectionState(ConnectionState::Login);
+            net::Buffer discBuf;
+            nlohmann::json discJson;
+            discJson["color"] = "red"; // DISCMSG_V1: сообщение красным на экране отключения
+            if (config_.language == "rus")
+                discJson["text"] = std::format("Извините, ваша версия ({}) не поддерживается.\nЗайдите с Minecraft 1.21.1 (протокол 767) — и всё заработает.", protocolVersion);
+            else
+                discJson["text"] = std::format("Sorry, your version ({}) is not supported.\nJoin with Minecraft 1.21.1 (protocol 767) and you are good to go.", protocolVersion); // LANGFIX_V1
+            discBuf.writeString(discJson.dump());
+            player->getConnection()->sendPacket(0x00, std::vector<u8>(discBuf.writtenSpan().begin(), discBuf.writtenSpan().end()));
+            player->getConnection()->gracefulShutdown(); // GRACECLOSE_V2: дать клиенту прочитать причину
+            return;
+        }
+    }
+
+    player->getConnection()->setConnectionState(ConnectionState::Login);
 }
 
 // ============================================================
@@ -1275,21 +1425,16 @@ void NetherCraftServer::handleHandshake(std::shared_ptr<entity::Player> player, 
 
 void NetherCraftServer::handleStatus(std::shared_ptr<entity::Player> player, net::Buffer& data, i32 wireId) {
     if (wireId == 0x00) {
-        // Status Request — отправляем JSON ответ
+        // Status Request — пакет без тела, читать из data нельзя. Отвечаем JSON.
         sendStatusResponse(player);
     } else if (wireId == 0x01) {
-        // Ping — эхо обратно
-        if (data.readableBytes() >= 8) {
-            i64 payload = data.readI64();
-            net::Buffer pongBuf;
-            pongBuf.writeI64(payload);
-            player->getConnection()->sendPacket(0x01, std::vector<u8>(pongBuf.writtenSpan().begin(), pongBuf.writtenSpan().end()));
-        } else {
-            // Пустой ping — отправляем 0
-            net::Buffer pongBuf;
-            pongBuf.writeI64(0);
-            player->getConnection()->sendPacket(0x01, std::vector<u8>(pongBuf.writtenSpan().begin(), pongBuf.writtenSpan().end()));
-        }
+        // Ping Request — эхо того же 8-байтного long обратно как Pong.
+        net::Buffer pongBuf;
+        pongBuf.writeI64(data.readableBytes() >= 8 ? data.readI64() : 0);
+        player->getConnection()->sendPacket(0x01, std::vector<u8>(pongBuf.writtenSpan().begin(), pongBuf.writtenSpan().end()));
+        // PINGFIX_V1: после Pong ванильный сервер закрывает соединение — лаунчер
+        // сразу получает цифру пинга, а мы не держим пустые status-сокеты.
+        player->getConnection()->closeAfterFlush();
     }
 }
 
@@ -1311,7 +1456,10 @@ void NetherCraftServer::sendStatusResponse(std::shared_ptr<entity::Player> playe
     response["players"]["max"] = config_.maxPlayers;
     response["players"]["online"] = onlineCount;
     response["players"]["sample"] = nlohmann::json::array();
-    response["description"]["text"] = config_.motd;
+    // SETTINGS_V10: sub-motd теперь реально работает — вторая строка описания в списке серверов.
+    response["description"]["text"] = config_.subMotd.empty()
+        ? config_.motd
+        : (config_.motd + "\n" + config_.subMotd);
     if (!iconFavicon_.empty()) response["favicon"] = iconFavicon_; // ICON_V1: иконка 64x64 в списке серверов
 
     net::Buffer buf;
@@ -1368,6 +1516,176 @@ static void fetchOfflineSkin(std::shared_ptr<entity::Player> player) {
     if (!player) return;
     if (fetchSkinTextures(player->getName(), player->texturesValue, player->texturesSignature))
         NC_DEBUG("Server", "{}: offline skin fetched", player->getName());
+}
+
+// ============================================================
+// CAPE_V1: /cape, /capes -- official minecraft.net capes
+// ============================================================
+// The client fetches cape textures only from textures.minecraft.net, so we ship
+// the real texture ids. online-mode=off means the profile "textures" property is
+// accepted unsigned, so we can rewrite it and drop the Mojang signature.
+struct NcCape { const char* id; const char* title; const char* hash; };
+static const NcCape kNcCapes[] = {
+    { "15th", "15th Anniversary Cape", "cd9d82ab17fd92022dbd4a86cde4c382a7540e117fae7b9a2853658505a80625" },
+    { "bacon", "Bacon Cape", "fd14214cd8073059e93d9c626260f5df85e5a959181537119df56cadaf5002cc" },
+    { "birthday", "Birthday Cape", "2056f2eebd759cce93460907186ef44e9192954ae12b227d817eb4b55627a7fc" },
+    { "blueprint", "Blueprint Cape", "fdcf48f01ec480d1d7cbec27f7ddce48c9da2be6724641109444dae58d4cd013" },
+    { "builder", "Builder Cape", "2c579968c64c1719740fd8c2a451461879b238002574fce48f7d1a7c36a1c7d4" },
+    { "cheapsh0t", "cheapsh0t's Cape", "ca29f5dd9e94fb1748203b92e36b66fda80750c87ebc18d6eafdb0e28cc1d05f" },
+    { "cherry", "Cherry Blossom Cape", "afd553b39358a24edfe3b8a9a939fa5fa4faa4d9a9c3d6af8eafb377fa05c2bb" },
+    { "common", "Common Cape", "5ec930cdd2629c8771655c60eebeb867b4b6559b0e6d3bc71c40c96347fa03f0" },
+    { "copper", "Copper Cape", "5e6f3193e74cd16cdd6637d9bae5484e3a37ff2a14c2d157c659a07810b1bdca" },
+    { "crafter", "Crafter Cape", "479eacefa3cdd7aca94207f36c0dd449653ddf259daf40544a5866baf05eee22" },
+    { "db", "dB Cape", "bcfbe84c6542a4a5c213c1cacf8979b5e913dcb4ad783a8b80e3c4a7d5c8bdac" },
+    { "follower", "Follower's Cape", "569b7f2a1d00d26f30efe3f9ab9ac817b1e6d35f4f3cfb0324ef2d328223d350" },
+    { "founder", "Founder's Cape", "99aba02ef05ec6aa4d42db8ee43796d6cd50e4b2954ab29f0caeb85f96bf52a1" },
+    { "home", "Home Cape", "1de21419009db483900da6298a1e6cbf9f1bc1523a0dcdc16263fab150693edd" },
+    { "mcc15", "MCC 15th Year Cape", "56c35628fe1c4d59dd52561a3d03bfa4e1a76d397c8b9c476c2f77cb6aebb1df" },
+    { "menace", "Menace Cape", "dbc21e222528e30dc88445314f7be6ff12d3aeebc3c192054fba7e3b3f8c77b1" },
+    { "millionth", "Millionth Customer Cape", "70efffaf86fe5bc089608d3cb297d3e276b9eb7a8f9f2fe6659c23a2d8b18edf" },
+    { "minecon2011", "MineCon 2011 Cape", "953cac8b779fe41383e675ee2b86071a71658f2180f56fbce8aa315ea70e2ed6" },
+    { "minecon2012", "MineCon 2012 Cape", "a2e8d97ec79100e90a75d369d1b3ba81273c4f82bc1b737e934eed4a854be1b6" },
+    { "minecon2013", "MineCon 2013 Cape", "153b1a0dfcbae953cdeb6f2c2bf6bf79943239b1372780da44bcbb29273131da" },
+    { "minecon2015", "MineCon 2015 Cape", "b0cc08840700447322d953a02b965f1d65a13a603bf64b17c803c21446fe1635" },
+    { "minecon2016", "MineCon 2016 Cape", "e7dfea16dc83c97df01a12fabbd1216359c0cd0ea42f9999b6e97c584963e980" },
+    { "experience", "Minecraft Experience Cape", "7658c5025c77cfac7574aab3af94a46a8886e3b7722a895255fbf22ab8652434" },
+    { "migrator", "Migrator Cape", "2340c0e03dd24a11b15a8b33c2a7e9e32abb2051b2481d0ba7defd635ca7a933" },
+    { "moderator", "Moderator Cape", "ae677f7d98ac70a533713518416df4452fe5700365c09cf45d0d156ea9396551" },
+    { "mojang", "Mojang Cape", "5786fe99be377dfb6858859f926c4dbc995751e91cee373468c5fbf4865e7151" },
+    { "mojang-classic", "Classic Mojang Cape", "8f120319222a9f4a104e2f5cb97b2cda93199a2ee9e1585cb8d09d6f687cb761" },
+    { "mojang-office", "Mojang Office Cape", "5c29410057e32abec02d870ecb52ec25fb45ea81e785a7854ae8429d7236ca26" },
+    { "mojang-studios", "Mojang Studios Cape", "9e507afc56359978a3eb3e32367042b853cddd0995d17d0da995662913fb00f7" },
+    { "moonlight", "Moonlight Trail Cape", "fe8a02dfe9e390e44ff33d69feef9d3943f76d3901015bbd50f0b67722d288bd" },
+    { "oxeye", "Oxeye Cape", "7706b5f5fc90329691e59277dcc66ba20572219fa8e5da472afd5235fad12cc8" },
+    { "pan", "Pan Cape", "28de4a81688ad18b49e735a273e086c18f1e3966956123ccb574034c06f5d336" },
+    { "prismarine", "Prismarine Cape", "d8f8d13a1adf9636a16c31d47f3ecc9bb8d8533108aa5ad2a01b13b1a0c55eac" },
+    { "purpleheart", "Purple Heart Cape", "cb40a92e32b57fd732a00fc325e7afb00a7ca74936ad50d8e860152e482cfbde" },
+    { "mapmaker", "Realms MapMaker Cape", "17912790ff164b93196f08ba71d0e62129304776d0f347334f8a6eae509f8a56" },
+    { "scrolls", "Scrolls Champion Cape", "3efadf6510961830f9fcc077f19b4daf286d502b5f5aafbd807c7bbffcaca245" },
+    { "snowman", "Snowman Cape", "23ec737f18bfe4b547c95935fc297dd767bb84ee55bfd855144d279ac9bfd9fe" },
+    { "spade", "Spade Cape", "2e002d5e1758e79ba51d08d92a0f3a95119f2f435ae7704916507b6c565a7da8" },
+    { "translator", "Translator Cape", "1bf91499701404e21bd46b0191d63239a4ef76ebde88d27e4d430ac211df681e" },
+    { "translator-cn", "Chinese Translator Cape", "2262fb1d24912209490586ecae98aca8500df3eff91f2a07da37ee524e7e3cb6" },
+    { "turtle", "Turtle Cape", "5048ea61566353397247d2b7d946034de926b997d5e66c86483dfb1e031aee95" },
+    { "valentine", "Valentine Cape", "e578ef995fabcf0a94768f9651ac3aaba30c59ef85d2438e9b3e0cc1d810652b" },
+    { "vanilla", "Vanilla Cape", "f9a76537647989f9a0b6d001e320dac591c359e9e61a31f4ce11c88f207f0ad4" },
+    { "yearn", "Yearn Cape", "308b32a9e303155a0b4262f9e5483ad4a22e3412e84fe8385a0bdd73dc41fa89" },
+    { "zombiehorse", "Zombie Horse Cape", "a3f6e4f14801f3ea55e3d95b9b4ef3b5e8802d947f669de93d6ec4b9354a436b" },
+};
+static int ncCapeCount() { return static_cast<int>(sizeof(kNcCapes) / sizeof(kNcCapes[0])); } // CAPEEULA_V1
+static std::mutex g_ncCapeMutex;
+static std::unordered_map<std::string, std::string> g_ncCapeByPlayer;      // ник -> id плаща
+static std::unordered_map<std::string, std::chrono::steady_clock::time_point> g_ncSkinResetPending; // /skin reset: подтверждение
+
+static const char* kNcB64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static std::string ncBase64Encode(const std::string& in) {
+    std::string out; out.reserve(((in.size() + 2) / 3) * 4);
+    size_t i = 0;
+    for (; i + 3 <= in.size(); i += 3) {
+        const u32 v = (static_cast<u32>(static_cast<u8>(in[i])) << 16)
+                    | (static_cast<u32>(static_cast<u8>(in[i + 1])) << 8)
+                    |  static_cast<u32>(static_cast<u8>(in[i + 2]));
+        out += kNcB64[(v >> 18) & 63]; out += kNcB64[(v >> 12) & 63];
+        out += kNcB64[(v >> 6) & 63];  out += kNcB64[v & 63];
+    }
+    const size_t rest = in.size() - i;
+    if (rest == 1) {
+        const u32 v = static_cast<u32>(static_cast<u8>(in[i])) << 16;
+        out += kNcB64[(v >> 18) & 63]; out += kNcB64[(v >> 12) & 63]; out += "==";
+    } else if (rest == 2) {
+        const u32 v = (static_cast<u32>(static_cast<u8>(in[i])) << 16)
+                    | (static_cast<u32>(static_cast<u8>(in[i + 1])) << 8);
+        out += kNcB64[(v >> 18) & 63]; out += kNcB64[(v >> 12) & 63]; out += kNcB64[(v >> 6) & 63]; out += '=';
+    }
+    return out;
+}
+static std::string ncBase64Decode(const std::string& in) {
+    std::array<int, 256> rev{}; rev.fill(-1);
+    for (int k = 0; k < 64; ++k) rev[static_cast<u8>(kNcB64[k])] = k;
+    std::string out; out.reserve(in.size() * 3 / 4 + 4);
+    u32 acc = 0; int bits = 0;
+    for (char c : in) {
+        const int d = rev[static_cast<u8>(c)];
+        if (d < 0) continue;
+        acc = (acc << 6) | static_cast<u32>(d); bits += 6;
+        if (bits >= 8) { bits -= 8; out += static_cast<char>((acc >> bits) & 0xFF); }
+    }
+    return out;
+}
+static const NcCape* ncFindCape(const std::string& id) {
+    std::string low; low.reserve(id.size());
+    for (char c : id) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (const auto& c : kNcCapes) if (low == c.id) return &c;
+    return nullptr;
+}
+static std::string ncCapeOf(const std::string& playerName) {
+    std::lock_guard<std::mutex> lk(g_ncCapeMutex);
+    auto it = g_ncCapeByPlayer.find(playerName);
+    return it == g_ncCapeByPlayer.end() ? std::string() : it->second;
+}
+static std::string ncCapeUrl(const NcCape& c) {
+    return std::string("http://textures.minecraft.net/texture/") + c.hash;
+}
+// Вписывает/убирает CAPE в base64-JSON текстур профиля, скин при этом сохраняется.
+static std::string ncApplyCapeToTextures(const std::string& current, const std::string& capeUrl,
+                                        const std::string& profileName) {
+    nlohmann::json j = nlohmann::json::object();
+    if (!current.empty()) {
+        try { j = nlohmann::json::parse(ncBase64Decode(current)); } catch (...) { j = nlohmann::json::object(); }
+    }
+    if (!j.is_object()) j = nlohmann::json::object();
+    if (!j.contains("profileName")) j["profileName"] = profileName;
+    if (!j.contains("timestamp"))
+        j["timestamp"] = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    if (!j.contains("textures") || !j["textures"].is_object()) j["textures"] = nlohmann::json::object();
+    if (capeUrl.empty()) j["textures"].erase("CAPE");
+    else j["textures"]["CAPE"] = nlohmann::json{ { "url", capeUrl } };
+    return ncBase64Encode(j.dump());
+}
+
+// CAPECLICK_V1: кликабельный список плащей. sendSystemMessage шлёт простую NBT-строку,
+// а clickEvent требует полноценный text component, поэтому собираем System Chat (0x6C) сами.
+struct NcClickPart { std::string text; std::string color; std::string command; std::string hover; };
+static void ncSendClickableLine(const std::shared_ptr<entity::Player>& player,
+                                const std::string& prefix, const std::vector<NcClickPart>& parts) {
+    if (!player || !player->getConnection()) return;
+    nbt::TagWriter w;
+    w.beginRootCompound();                 // сетевой NBT: корень без имени
+    w.writeString(prefix, "text");
+    if (!parts.empty()) {
+        w.beginList("extra", nbt::TagType::Compound, static_cast<i32>(parts.size()));
+        for (const auto& p : parts) {
+            w.beginListElementCompound();
+            w.writeString(p.text, "text");
+            if (!p.color.empty()) w.writeString(p.color, "color");
+            if (!p.command.empty()) {
+                w.beginCompound("clickEvent");
+                w.writeString("run_command", "action");
+                w.writeString(p.command, "value");
+                w.endCompound();
+            }
+            if (!p.hover.empty()) {
+                w.beginCompound("hoverEvent");
+                w.writeString("show_text", "action");
+                w.beginCompound("contents");
+                w.writeString(p.hover, "text");
+                w.endCompound();
+                w.endCompound();
+            }
+            w.endListElementCompound();
+        }
+        w.endList();
+    }
+    w.endCompound();
+    const std::vector<u8> nbtBytes = w.toVector();
+    net::Buffer buf;
+    buf.writeBytes(std::span<const u8>(nbtBytes.data(), nbtBytes.size()));
+    buf.writeBool(false);                  // overlay=false -> в чат, а не над хотбаром
+    player->getConnection()->sendPacket(0x6C, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+}
+static void ncSendCapeRule(const std::shared_ptr<entity::Player>& player) {
+    player->sendSystemMessage("§8§m=================================================");
 }
 
 void NetherCraftServer::handleLogin(std::shared_ptr<entity::Player> player, net::Buffer& data, i32 wireId) {
@@ -1593,7 +1911,7 @@ void NetherCraftServer::handleLogin(std::shared_ptr<entity::Player> player, net:
         // ALLPACKETS_V1: Login Plugin Response — принимаем без ошибки
         NC_DEBUG("Server", "Login Plugin Response from {} (ignored)", player->getName());
     } else if (wireId == 0x03) {
-        // Login Acknowledged — кли��нт пер��ключился в Configuration
+        // Login Acknowledged — клиент переключился в Configuration
         NC_DEBUG("Server", "{} acknowledged login, switching to Configuration", player->getName());
         player->getConnection()->setConnectionState(ConnectionState::Configuration);
         player->setState(entity::PlayerState::Configuration);
@@ -1654,43 +1972,26 @@ void NetherCraftServer::handleConfiguration(std::shared_ptr<entity::Player> play
         syncExperienceBar(player);
 
         { // LOADFIX_V2: Game Event 13 — start waiting for level chunks (без него клиент висит на Loading terrain до таймаута)
-            net::Buffer geBuf;
-            geBuf.writeByte(13);
-            geBuf.writeF32(0.0f);
-            player->getConnection()->sendPacket(0x22, std::vector<u8>(geBuf.writtenSpan().begin(), geBuf.writtenSpan().end()));
+            packets::sendGameEvent(player, static_cast<u8>(13), 0.0f); /* PACKETS_V10 */
         }
         { // DEATHSCREEN_V1: Game Event 11 (immediate respawn) = 0 — принудительно выключаем
           // doImmediateRespawn, чтобы клиент всегда показывал экран смерти с кнопкой «Возродиться»
-            net::Buffer irBuf;
-            irBuf.writeByte(11);
-            irBuf.writeF32(0.0f);
-            player->getConnection()->sendPacket(0x22, std::vector<u8>(irBuf.writtenSpan().begin(), irBuf.writtenSpan().end()));
+            packets::sendGameEvent(player, static_cast<u8>(11), 0.0f); /* PACKETS_V10 */
         }
         sendTimeUpdate(player);
 
         // PlayerInfoUpdate (0x3E) — add player to tab list
-        {
-            net::Buffer infoBuf;
-            // Action bitmask: ADD_PLAYER(0x01) | UPDATE_GAME_MODE(0x04) | UPDATE_LISTED(0x08) | UPDATE_LATENCY(0x10) = 0x1D
-            infoBuf.writeVarInt(0x1D);
-            // Player count
-            infoBuf.writeVarInt(1);
-            // UUID
-            infoBuf.writeUUID(player->getUuid());
-            // game_profile: name
-            infoBuf.writeString(player->getName());
-            // game_profile: textures property (skin + cape) — SKIN_V1
-            writeProfileProperties(infoBuf, *player);
+        { // PACKETS_V21: раскладка пакета уехала в packets::buildPlayerInfoAdd
+            // Свойства профиля (скин + плащ, SKIN_V1) кодируются здесь: они зависят
+            // от режима авторизации, а не от протокола.
+            net::Buffer props;
+            writeProfileProperties(props, *player);
             // INVENTORY_V3/GM3_FIX: реальный режим игрока в таб-листе.
             // Клиентский AbstractClientPlayer.isSpectator() читает режим ИМЕННО отсюда (PlayerInfo),
             // а не из login/GameEvent. Если слать жёстко 1 (creative), то в ГМ3 noPhysics=false и сквозь блоки не пройти.
-            infoBuf.writeVarInt(player->gameMode);
-            // listed: true
-            infoBuf.writeVarInt(1);
-            // latency: 0
-            infoBuf.writeVarInt(0);
-            player->getConnection()->sendPacket(0x3E,
-                std::vector<u8>(infoBuf.writtenSpan().begin(), infoBuf.writtenSpan().end()));
+            player->getConnection()->sendPacket(packets::cb::PlayerInfoUpdate,
+                packets::buildPlayerInfoAdd(player->getUuid(), player->getName(),
+                    props.writtenSpan(), player->gameMode, true, 0));
         }
 
         { // CMDTREE_V3: дерево строится из таблицы, новая команда появляется у клиента сама
@@ -1707,9 +2008,17 @@ void NetherCraftServer::handleConfiguration(std::shared_ptr<entity::Player> play
                 {"setblock", true, {}}, {"skin", true, {}},
                 {"nether", false, {}}, {"end", false, {}}, {"overworld", false, {}},
                 {"summon", true, {}}, {"killall", false, {}},
-                {"warprandomtick", true, {}}, {"save-all", false, {}},
+                {"warprandomtick", true, {}}, {"save-all", false, {}}, {"save", false, {}}, // SAVECMD_V1
                 {"stop", false, {}}, {"reload", false, {}}, {"crash", false, {}},
             };
+            if (!config_.xboxAuth) { // CAPETREE_V1: в online-mode плащей нет, значит и в дереве их быть не должно
+                // без этого клиент рисовал «Неизвестная команда» на /cape, хотя она работала
+                std::vector<std::string> capeSubs;
+                capeSubs.push_back("off");
+                for (const auto& __cc : kNcCapes) capeSubs.push_back(__cc.id); // автодополнение id в чате
+                cmds.push_back(TreeCmd{"cape", true, capeSubs});
+                cmds.push_back(TreeCmd{"capes", false, {}});
+            }
             for (const auto& __pc : nc::cmd::CommandRegistry::instance().all()) { // PLUGINCMD_V1: всё, что зарегистрировано, попадает в дерево
                 bool __known = false;
                 for (const auto& __c : cmds) if (__c.name == __pc.name) { __known = true; break; }
@@ -1768,10 +2077,7 @@ void NetherCraftServer::handleConfiguration(std::shared_ptr<entity::Player> play
 
         // UpdateViewDistance (0x55) — tell client view distance
         {
-            net::Buffer vdBuf;
-            vdBuf.writeVarInt(config_.viewDistance); // VIEWDIST_V1: реальный view distance
-            player->getConnection()->sendPacket(0x55,
-                std::vector<u8>(vdBuf.writtenSpan().begin(), vdBuf.writtenSpan().end()));
+            packets::sendSetRenderDistance(player, config_.viewDistance); /* PACKETS_V18 */
         }
 
         { // FLATWORLD_V1: чанки вокруг реальной позиции, радиус из view distance
@@ -1795,47 +2101,17 @@ void NetherCraftServer::handleConfiguration(std::shared_ptr<entity::Player> play
             }
             inv.writeVarInt(0);          // предмет в курсоре: пусто
             player->getConnection()->sendPacket(0x13, std::vector<u8>(inv.writtenSpan().begin(), inv.writtenSpan().end()));
-            net::Buffer carried; // выбранный слот хотбара
-            carried.writeByte((i8)(player->heldSlot >= 0 && player->heldSlot < 9 ? player->heldSlot : 0));
-            player->getConnection()->sendPacket(0x53, std::vector<u8>(carried.writtenSpan().begin(), carried.writtenSpan().end()));
+            packets::sendSetHeldSlot(player, static_cast<u8>(player->heldSlot >= 0 && player->heldSlot < 9 ? player->heldSlot : 0)); /* PACKETS_V16 */
         }
 
         { // VANILLA_JOIN_V8: ванильный клиент получает эти пакеты при входе в мир,
           // без каких-либо команд — просто как часть join-последовательности.
-            { // Set Simulation Distance (0x62)
-                net::Buffer sd;
-                sd.writeVarInt(config_.simulationDistance);
-                player->getConnection()->sendPacket(0x62, std::vector<u8>(sd.writtenSpan().begin(), sd.writtenSpan().end()));
-            }
-            { // Initialize World Border (0x25)
-                net::Buffer wb;
-                wb.writeF64(0.0); wb.writeF64(0.0);          // center x/z
-                wb.writeF64(59999968.0); wb.writeF64(59999968.0); // old/new diameter (vanilla default)
-                wb.writeVarLong(0);                          // speed (ms to reach new diameter)
-                wb.writeVarInt(29999984);                    // portal teleport boundary
-                wb.writeVarInt(5);                           // warning blocks
-                wb.writeVarInt(15);                          // warning time (seconds)
-                player->getConnection()->sendPacket(0x25, std::vector<u8>(wb.writtenSpan().begin(), wb.writtenSpan().end()));
-            }
-            { // Server Data (0x4B): MOTD component + optional icon (absent)
-                net::Buffer sdata;
-                writeTextComponent(sdata, config_.motd);
-                sdata.writeBool(false);
-                player->getConnection()->sendPacket(0x4B, std::vector<u8>(sdata.writtenSpan().begin(), sdata.writtenSpan().end()));
-            }
-            { // Update Tags (0x78): no extra play-state tag overrides
-                net::Buffer tg;
-                tg.writeVarInt(0);
-                player->getConnection()->sendPacket(0x78, std::vector<u8>(tg.writtenSpan().begin(), tg.writtenSpan().end()));
-            }
-            { // Update Advancements (0x74): reset the client tree, we track no advancements
-                net::Buffer adv;
-                adv.writeBool(true); // reset/clear
-                adv.writeVarInt(0);  // added advancements
-                adv.writeVarInt(0);  // removed identifiers
-                adv.writeVarInt(0);  // progress entries
-                player->getConnection()->sendPacket(0x74, std::vector<u8>(adv.writtenSpan().begin(), adv.writtenSpan().end()));
-            }
+          // Байты пакетов живут в /src/packets/clientbound_play.hpp.
+            packets::sendSetSimulationDistance(player, config_.simulationDistance);
+            packets::sendInitializeWorldBorder(player);
+            packets::sendServerData(player, config_.motd);
+            packets::sendUpdateTags(player);
+            packets::sendUpdateAdvancements(player, /*reset=*/true);
         }
 
         player->playReady = true; // JOINSAFE_V1: с этой секунды клиент готов к мировым пакетам
@@ -2165,16 +2441,16 @@ void NetherCraftServer::sendJoinPlay(std::shared_ptr<entity::Player> player) {
     buf.writeI64(config_.levelSeed);
 
     // GameType: byte (i8) — из конфига игрока (GM_JOIN_V1)
-    buf.writeByte((i8)player->gameMode);
+    buf.writeByte(static_cast<u8>(player->gameMode));
 
     // PreviousGameType: byte (i8), -1=none
-    buf.writeByte(-1);
+    buf.writeByte(static_cast<u8>(0xFF));
 
     // Is debug
     buf.writeBool(false);
 
-    // Is flat
-    buf.writeBool(true);
+    // Is flat (FLATFLAG_V1: раньше всегда true, даже для обычного мира)
+    buf.writeBool(isFlatGenerator(config_.generator));
 
     // Death location: optional (VarInt 0=absent)
     buf.writeVarInt(0);
@@ -2204,6 +2480,68 @@ void NetherCraftServer::sendJoinPlay(std::shared_ptr<entity::Player> player) {
 // ============================================================
 // BLOCKS_V1: вспомогательные функции для блоков
 // ============================================================
+// SIGNSEND_V1: текст таблички живёт только в g_signText на сервере. Без пакета
+// Block Entity Data (0x07) клиент рисует пустую доску, поэтому после рестарта
+// восстановленные таблички выглядели чистыми. Тип 7 = minecraft:sign (1.21.1).
+static std::vector<u8> buildSignNbt(const std::array<std::string, 4>& lines) {
+    // символы берём кодами: экранирование в литералах здесь только мешает
+    auto signJson = [](const std::string& in) {
+        const char jq = static_cast<char>(34);  // "
+        const char jb = static_cast<char>(92);  // backslash
+        std::string out;
+        out.push_back(jq);
+        for (char c : in) {
+            if (c == jq || c == jb) { out.push_back(jb); out.push_back(c); }
+            else if (c == '\n') { out.push_back(jb); out.push_back('n'); }
+            else out.push_back(c);
+        }
+        out.push_back(jq);
+        return out;
+    };
+    nbt::TagWriter w;
+    w.beginRootCompound();
+    w.writeByte(0, "is_waxed");
+    w.beginCompound("front_text");
+    w.writeByte(0, "has_glowing_text");
+    w.writeString("black", "color");
+    w.beginList("messages", nbt::TagType::String, 4);
+    for (int i = 0; i < 4; ++i) w.writeListElementString(signJson(lines[static_cast<size_t>(i)]));
+    w.endList();
+    w.endCompound();
+    w.beginCompound("back_text");
+    w.writeByte(0, "has_glowing_text");
+    w.writeString("black", "color");
+    w.beginList("messages", nbt::TagType::String, 4);
+    const std::string jsonEmpty(2, static_cast<char>(34));
+    for (int i = 0; i < 4; ++i) w.writeListElementString(jsonEmpty);
+    w.endList();
+    w.endCompound();
+    w.endCompound();
+    return w.toVector();
+}
+
+static std::vector<u8> buildSignBeData(i32 sx, i32 sy, i32 sz, const std::array<std::string, 4>& lines) {
+    net::Buffer be;
+    be.writePosition(BlockPos{sx, sy, sz});
+    be.writeVarInt(7); // minecraft:sign
+    const std::vector<u8> payload = buildSignNbt(lines);
+    be.writeBytes(std::span<const u8>(payload.data(), payload.size()));
+    return std::vector<u8>(be.writtenSpan().begin(), be.writtenSpan().end());
+}
+
+// CHESTBOAT_V1: контейнерный слой адресует сундуки упакованной позицией блока, а у
+// лодки-сундука блока нет. Берём координату x = 0x1FFFFFF (33 554 431) - это за
+// границей мира (29 999 984), так что столкнуться с настоящим сундуком невозможно.
+static constexpr u64 kEntityContainerTag = 0x1FFFFFFULL << 38;
+
+static u64 entityContainerKey(i32 eid) {
+    return kEntityContainerTag | (static_cast<u64>(static_cast<u32>(eid)) & 0x3FFFFFFFFFULL);
+}
+
+static bool isEntityContainerKey(u64 key) {
+    return (key >> 38) == 0x1FFFFFFULL;
+}
+
 static void decodeBlockPos(u64 v, i32& x, i32& y, i32& z) {
     x = static_cast<i32>(static_cast<i64>(v) >> 38);
     y = static_cast<i32>((static_cast<i64>(v) << 52) >> 52);
@@ -2247,7 +2585,7 @@ static u64 chestPosKey(i32 x, i32 y, i32 z) {
            (static_cast<u64>(static_cast<u32>(y)) & 0xFFFULL);
 }
 
-// CHEST_V1: ди��пазоны block state сундуков 1.21.1.
+// CHEST_V1: диапазоны block state сундуков 1.21.1.
 static bool isChestBlockState(i32 st)   { return st >= 2954 && st <= 2977; } // chest
 static bool isTrappedChestState(i32 st) { return st >= 9119 && st <= 9142; } // trapped_chest
 static bool isEnderChestState(i32 st)   { return st >= 7513 && st <= 7520; } // ender_chest
@@ -2259,7 +2597,7 @@ static i32 orientBlockForPlacement(i32 defState, f32 yaw) {
     f32 y = std::fmod(yaw, 360.0f);
     if (y < 0.0f) y += 360.0f;
     const i32 dir = static_cast<i32>(std::floor(y / 90.0f + 0.5f)) & 3; // куда смотрит игрок: 0=юг 1=запад 2=север 3=восток
-    static const i32 facingIdx[4] = {0, 3, 1, 2}; // направление игрока -> facing блока (навстречу игроку)
+    static const i32 facingIdx[4] = {0, 3, 1, 2}; // направление игрока -> facing блока (навстречу игрока)
     const i32 f = facingIdx[dir];
     switch (defState) {
         case 2955: return 2955 + f * 6; // chest
@@ -2285,7 +2623,7 @@ static i32 blockRegistryIdForState(i32 st) {
     return 0;
 }
 
-// CHEST_V2: смещение «по часово�� стрелке» от facing сундука (north=0,south=1,west=2,east=3).
+// CHEST_V2: смещение «по часовой стрелке» от facing сундука (north=0,south=1,west=2,east=3).
 // У LEFT-половины двойного сундука партнёр стоит по часовой, у RIGHT — против.
 static void chestCwOffset(i32 f, i32& dx, i32& dz) {
     switch (f) {
@@ -2681,6 +3019,114 @@ static bool stateHasProp(i32 s, const char* key, const char* value) {
     return it != bs->properties.end() && it->second == value;
 }
 
+// ============================================================
+// CONTAINER_V1: обобщённый блок-контейнер.
+// Раньше ядро знало ровно один тип — сундук на 27 слотов; бочка, печка,
+// воронка, раздатчик и выбрасыватель не открывались вообще. Тип определяем
+// по имени состояния, а не по диапазону id: диапазоны генерируются и плывут
+// между версиями данных, а имя стабильно.
+// ============================================================
+enum ContainerKind : i32 {
+    CK_NONE = 0, CK_CHEST, CK_TRAPPED, CK_ENDER, CK_BARREL,
+    CK_FURNACE, CK_BLAST_FURNACE, CK_SMOKER, CK_HOPPER, CK_DISPENSER, CK_DROPPER
+};
+
+// CONTAINER_V3: раньше тип контейнера брался по имени ТОЧНОГО состояния, а реестр
+// знает имя только у состояния ПО УМОЛЧАНИЮ: loadBlockDefaults() регистрирует
+// одно состояние на блок, а registerStateVariants() покрывает растения и брёвна,
+// но не контейнеры. Поставленный сундук/печка/бочка почти никогда не стоят
+// в дефолтном состоянии (facing берётся от игрока), поэтому имя приходило
+// пустым, кинд был CK_NONE и правый клик молча проваливался дальше.
+// Сколько состояний у каждого контейнера — из ванильного StateDefinition;
+// три сундука сверены с уже проверенными диапазонами выше (24 / 24 / 8).
+static int containerStateCountOf(i32 kind) {
+    switch (kind) {
+        case CK_CHEST: case CK_TRAPPED:  return 24; // facing(4) x type(3) x waterlogged(2)
+        case CK_ENDER:                   return 8;  // facing(4) x waterlogged(2)
+        case CK_BARREL:                  return 12; // facing(6) x open(2)
+        case CK_FURNACE: case CK_BLAST_FURNACE: case CK_SMOKER: return 8; // facing(4) x lit(2)
+        case CK_HOPPER:                  return 10; // facing(5) x enabled(2)
+        case CK_DISPENSER: case CK_DROPPER: return 12; // facing(6) x triggered(2)
+        default:                         return 1;
+    }
+}
+
+static i32 containerKindOfName(std::string_view n) {
+    if (n.rfind("minecraft:", 0) == 0) n.remove_prefix(10);
+    if (n == "chest")         return CK_CHEST;
+    if (n == "trapped_chest") return CK_TRAPPED;
+    if (n == "ender_chest")   return CK_ENDER;
+    if (n == "barrel")        return CK_BARREL;
+    if (n == "furnace")       return CK_FURNACE;
+    if (n == "blast_furnace") return CK_BLAST_FURNACE;
+    if (n == "smoker")        return CK_SMOKER;
+    if (n == "hopper")        return CK_HOPPER;
+    if (n == "dispenser")     return CK_DISPENSER;
+    if (n == "dropper")       return CK_DROPPER;
+    return CK_NONE;
+}
+
+static i32 containerKindOfState(i32 st) {
+    // точные диапазоны сундуков уже есть в ядре и не зависят от реестра
+    if (isChestBlockState(st))   return CK_CHEST;
+    if (isTrappedChestState(st)) return CK_TRAPPED;
+    if (isEnderChestState(st))   return CK_ENDER;
+    const i32 exact = containerKindOfName(stateNameOf(st));
+    if (exact != CK_NONE) return exact;
+    // Ищем ближайшее известное имя. Состояние по умолчанию стоит в начале
+    // диапазона (у всех трёх сундуков смещение ровно 1), поэтому вверх
+    // смотрим не дальше чем на 2 id, а вниз — только в пределах его же диапазона,
+    // чтобы соседний блок никогда не прикинулся контейнером.
+    for (i32 d = 1; d <= 24; ++d) {
+        if (d <= 2) {
+            const i32 up = containerKindOfName(stateNameOf(st + d));
+            if (up != CK_NONE && d < containerStateCountOf(up)) return up;
+        }
+        const i32 down = containerKindOfName(stateNameOf(st - d));
+        if (down != CK_NONE && d < containerStateCountOf(down)) return down;
+    }
+    return CK_NONE;
+}
+
+// Сколько слотов у контейнера. Хранилище общее (ChestData на 27 слотов),
+// маленькие контейнеры просто занимают первые N — формат extra.dat не меняется.
+static int containerSlotsOf(i32 kind) {
+    switch (kind) {
+        case CK_FURNACE: case CK_BLAST_FURNACE: case CK_SMOKER: return 3;
+        case CK_HOPPER: return 5;
+        case CK_DISPENSER: case CK_DROPPER: return 9;
+        default: return 27;
+    }
+}
+
+// menu type из реестра minecraft:menu (1.21.1): 2 = generic_9x3, 5 = generic_9x6,
+// 6 = generic_3x3, 10 = blast_furnace, 14 = furnace, 16 = hopper, 22 = smoker.
+static i32 containerMenuTypeOf(i32 kind) {
+    switch (kind) {
+        case CK_DISPENSER: case CK_DROPPER: return 6;
+        case CK_BLAST_FURNACE: return 10;
+        case CK_FURNACE: return 14;
+        case CK_HOPPER: return 16;
+        case CK_SMOKER: return 22;
+        default: return 2;
+    }
+}
+
+static const char* containerTitleOf(i32 kind, bool ru) {
+    switch (kind) {
+        case CK_TRAPPED:       return ru ? "Сундук-ловушка" : "Trapped Chest";
+        case CK_ENDER:         return ru ? "Эндер-сундук" : "Ender Chest";
+        case CK_BARREL:        return ru ? "Бочка" : "Barrel";
+        case CK_FURNACE:       return ru ? "Печь" : "Furnace";
+        case CK_BLAST_FURNACE: return ru ? "Плавильная печь" : "Blast Furnace";
+        case CK_SMOKER:        return ru ? "Коптильня" : "Smoker";
+        case CK_HOPPER:        return ru ? "Воронка" : "Hopper";
+        case CK_DISPENSER:     return ru ? "Раздатчик" : "Dispenser";
+        case CK_DROPPER:       return ru ? "Выбрасыватель" : "Dropper";
+        default:               return ru ? "Сундук" : "Chest";
+    }
+}
+
 // PLACE_V2: Block#canBeReplaced - what a newly placed block may overwrite.
 // Everything else must reject the placement, otherwise you can stack a door
 // on a door and the client ends up showing a world the server does not have.
@@ -2836,18 +3282,12 @@ static void sendItemDropSpawnTo(const std::shared_ptr<entity::Player>& viewer, i
     auto vel = [](f64 v) { return static_cast<i16>(std::clamp(v * 8000.0, -32000.0, 32000.0)); };
     sp.writeI16(vel(vx)); sp.writeI16(vel(vy)); sp.writeI16(vel(vz));
     viewer->getConnection()->sendPacket(0x01, std::vector<u8>(sp.writtenSpan().begin(), sp.writtenSpan().end()));
-    net::Buffer meta;
-    meta.writeVarInt(eid);
-    meta.writeByte(8);   // Item entity: index 8 = сам предмет
-    meta.writeVarInt(7); // сериализатор 7: Slot
-    meta.writeVarInt(count);
-    meta.writeVarInt(itemId);
-    meta.writeVarInt(0); meta.writeVarInt(0); // компонентов: +0 / -0
-    meta.writeByte(0xFF); // конец метадаты
-    viewer->getConnection()->sendPacket(0x58, std::vector<u8>(meta.writtenSpan().begin(), meta.writtenSpan().end()));
+    /* PACKETS_V21 */
+    viewer->getConnection()->sendPacket(packets::cb::SetEntityMetadata,
+        packets::buildEntityItemStack(eid, itemId, count));
 }
 
-// ITEMDROP_V1: заспавнить предмет в мире и показать в��ем
+// ITEMDROP_V1: заспавнить предмет в мире и показать всем
 void NetherCraftServer::spawnItemDrop(f64 x, f64 y, f64 z, i32 itemId, i32 count, f64 vx, f64 vy, f64 vz, i32 pickupDelay) {
     if (itemId <= 0 || count <= 0) return;
     const i32 eid = static_cast<i32>(nextEntityId_++);
@@ -2891,13 +3331,7 @@ static i32 giveItemToPlayer(const std::shared_ptr<entity::Player>& p, i32 itemId
     }
     for (i32 sl : changed) {
         if (sl >= 36 && sl <= 44) p->hotbarBlockState[sl - 36] = itemToBlockState(p->invItemId[sl]); // синк с постановкой блоков
-        net::Buffer sb;
-        sb.writeByte(0);   // окно 0 — инвентарь игрока
-        sb.writeVarInt(0); // state id
-        sb.writeI16(static_cast<i16>(sl));
-        sb.writeVarInt(p->invCount[sl]);
-        if (p->invCount[sl] > 0) { sb.writeVarInt(p->invItemId[sl]); sb.writeVarInt(0); sb.writeVarInt(0); }
-        p->getConnection()->sendPacket(0x15, std::vector<u8>(sb.writtenSpan().begin(), sb.writtenSpan().end()));
+        packets::sendContainerSlot(p, 0, 0, static_cast<i16>(sl), p->invItemId[sl], p->invCount[sl]); /* PACKETS_V15 */
     }
     return count - remaining;
 }
@@ -2911,7 +3345,7 @@ void NetherCraftServer::tickItemDrops() {
     std::vector<i32> removed;
     std::unordered_map<i32, ItemDrop> updated;
 
-    // PHYS_V2: классифика��ия блока по stateId 1.21.1 (см. core/item_blocks.gen.hpp).
+    // PHYS_V2: классификация блока по stateId 1.21.1 (см. core/item_blocks.gen.hpp).
     auto blockAt = [&](f64 X, f64 Y, f64 Z) {
         return world_.getBlock(static_cast<i32>(std::floor(X)), static_cast<i32>(std::floor(Y)), static_cast<i32>(std::floor(Z)));
     };
@@ -3037,7 +3471,7 @@ void NetherCraftServer::tickItemDrops() {
                 a.count + b.count > maxStack) continue;
             const f64 dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
             if (dx * dx + dz * dz > 0.5 || std::abs(dy) > 0.5) continue;
-            a.count += b.count; countChanged[i] = 1;               // ��ыбивает более старый предмет (i)
+            a.count += b.count; countChanged[i] = 1;               // выбивает более старый предмет (i)
             sendRemove(b.eid); removed.push_back(b.eid); gone[j] = 1;
         }
     }
@@ -3085,7 +3519,7 @@ void NetherCraftServer::tickItemDrops() {
 // DIMPHYS_V1: физика больше не прибита гвоздями к оверворлду. В ключ очереди
 // добавлены 2 бита измерения (0 = оверворлд, 1 = Ад, 2 = Энд); координаты
 // сжаты до 25 бит (±16.7М — шире границы мира в 30М/2). Измерение берётся из
-// g_dimCtx: поток игрока выставляет его по player->dimension, тик-пот��к — по текущему миру.
+// g_dimCtx: поток игрока выставляет его по player->dimension, тик-поток — по текущему миру.
 // ============================================================
 thread_local i32 g_dimCtx = 0;
 struct DimCtxScope {
@@ -3496,7 +3930,7 @@ void NetherCraftServer::explodeAt(f64 x, f64 y, f64 z, f32 radius, i32 sourceEid
             auto q = [](f64 v) { return static_cast<i16>(std::clamp(v * 8000.0, -32000.0, 32000.0)); };
             net::Buffer mv; mv.writeVarInt(static_cast<i32>(p->getEntityId()));
             mv.writeI16(q(dx * kb)); mv.writeI16(q(dy * kb)); mv.writeI16(q(dz * kb));
-            p->getConnection()->sendPacket(0x5A, std::vector<u8>(mv.writtenSpan().begin(), mv.writtenSpan().end()));
+            p->getConnection()->sendPacket(0x5A, std::vector<u8>(mv.writtenSpan().begin(), mv.writtenSpan().end()), true); /* NETQUEUE_V1: эфемерный апдейт */
         }
     }
 
@@ -3687,17 +4121,14 @@ void NetherCraftServer::tickPrimedTnt() {
         if (t.fuse <= 0) {
             if (explosionsThisTick >= 4) { t.fuse = 1; updated.emplace(t.eid, t); continue; }
             ++explosionsThisTick;
-            net::Buffer rm; rm.writeVarInt(1); rm.writeVarInt(t.eid);
-            const auto bytes = std::vector<u8>(rm.writtenSpan().begin(), rm.writtenSpan().end());
+            const auto bytes = packets::buildRemoveEntities(std::vector<i32>{ t.eid }); /* PACKETS_V15 */
             for (auto& p : players) if (p && p->isAlive()) p->getConnection()->sendPacket(0x42, bytes);
             removed.push_back(t.eid);
             explodeAt(t.x, t.y + 0.0625, t.z, 4.0f, t.eid, t.ownerEid);
             continue;
         }
-        net::Buffer tp; tp.writeVarInt(t.eid); tp.writeF64(t.x); tp.writeF64(t.y); tp.writeF64(t.z);
-        tp.writeByte(0); tp.writeByte(0); tp.writeBool(ground);
-        const auto bytes = std::vector<u8>(tp.writtenSpan().begin(), tp.writtenSpan().end());
-        for (auto& p : players) if (p && p->isAlive()) p->getConnection()->sendPacket(0x70, bytes);
+        const auto bytes = packets::buildTeleportEntity(t.eid, t.x, t.y, t.z, static_cast<u8>(0), static_cast<u8>(0), ground); /* PACKETS_V16 */
+        for (auto& p : players) if (p && p->isAlive()) p->getConnection()->sendPacket(0x70, bytes, true); /* NETQUEUE_V1 */
         updated.emplace(t.eid, t);
     }
     std::lock_guard lk(primedTntMutex_);
@@ -3834,25 +4265,17 @@ void NetherCraftServer::spawnVehicle(f64 x, f64 y, f64 z, f32 yaw, i32 typeId, i
     const auto bytes = std::vector<u8>(sp.writtenSpan().begin(), sp.writtenSpan().end());
     std::vector<u8> metaBytes;
     if ((typeId == kBoatTypeId || typeId == kChestBoatTypeId) && variant > 0) {
-        net::Buffer md;
-        md.writeVarInt(eid);
-        md.writeByte(11); md.writeVarInt(1); md.writeVarInt(variant); // Boat type (VarInt serializer)
-        md.writeByte(0xFF);
-        metaBytes.assign(md.writtenSpan().begin(), md.writtenSpan().end());
+        metaBytes = packets::buildBoatVariant(eid, variant); /* PACKETS_V21 */
     }
     for (auto& p : getAllPlayersCopy()) {
         if (!p || !p->isAlive() || p->getState() != entity::PlayerState::Play) continue;
         p->getConnection()->sendPacket(0x01, bytes);
-        if (!metaBytes.empty()) p->getConnection()->sendPacket(0x58, metaBytes);
+        if (!metaBytes.empty()) p->getConnection()->sendPacket(packets::cb::SetEntityMetadata, metaBytes);
     }
 }
 
 void NetherCraftServer::broadcastVehiclePassengers(i32 vehicleEid, i32 passengerEid) {
-    net::Buffer sp;
-    sp.writeVarInt(vehicleEid);
-    if (passengerEid != 0) { sp.writeVarInt(1); sp.writeVarInt(passengerEid); }
-    else sp.writeVarInt(0);
-    const auto bytes = std::vector<u8>(sp.writtenSpan().begin(), sp.writtenSpan().end());
+    const auto bytes = packets::buildSetPassengers(vehicleEid, passengerEid); /* PACKETS_V20 */
     for (auto& p : getAllPlayersCopy())
         if (p && p->isAlive() && p->getState() == entity::PlayerState::Play)
             p->getConnection()->sendPacket(0x5F, bytes);
@@ -3862,19 +4285,28 @@ bool NetherCraftServer::vehicleInteract(const std::shared_ptr<entity::Player>& p
     if (!player) return false;
     const i32 pEid = static_cast<i32>(player->getEntityId());
     f64 vx = 0.0, vy = 0.0, vz = 0.0;
+    i32 chestBoatEid = 0; // CHESTBOAT_V1
     std::vector<i32> leftBehind;
     {
         std::lock_guard lk(vehiclesMutex_);
         auto it = std::find_if(vehicles_.begin(), vehicles_.end(),
             [&](const VehicleMotion& v) { return v.eid == vehicleEid; });
         if (it == vehicles_.end()) return false;
-        if (it->passengerEid != 0 && it->passengerEid != pEid) return true; // seat taken
+        // CHESTBOAT_V1: по ванилле правый клик по лодке-сундуку открывает сундук,
+        // а садятся в неё с шифтом. Раньше ветки контейнера не было вовсе.
+        if (it->typeId == kChestBoatTypeId && !player->sneaking) chestBoatEid = vehicleEid;
+        if (chestBoatEid == 0 && it->passengerEid != 0 && it->passengerEid != pEid) return true; // seat taken
         for (auto& other : vehicles_)
             if (other.eid != vehicleEid && other.passengerEid == pEid) { other.passengerEid = 0; leftBehind.push_back(other.eid); }
-        it->passengerEid = pEid;
+        if (chestBoatEid == 0) it->passengerEid = pEid; // CHESTBOAT_V1
         vx = it->x; vy = it->y; vz = it->z;
     }
+    if (chestBoatEid != 0) { // CHESTBOAT_V1: открываем сундук лодки, а не садимся
+        openVehicleChestFor(player, chestBoatEid);
+        return true;
+    }
     player->ridingVehicleEid = vehicleEid;
+    player->vehicleSneakLatched = true; // VEHSHIFT_V1: mounted with shift held down
     player->vehicleForward = 0.0f;
     player->vehicleSideways = 0.0f;
     player->setPosition(vx, vy, vz);
@@ -3885,6 +4317,7 @@ bool NetherCraftServer::vehicleInteract(const std::shared_ptr<entity::Player>& p
 
 bool NetherCraftServer::vehicleAttack(const std::shared_ptr<entity::Player>& player, i32 vehicleEid) {
     i32 itemId = 0, passenger = 0;
+    i32 brokenTypeId = 0; // CHESTBOAT_DROP_V1
     f64 x = 0.0, y = 0.0, z = 0.0;
     bool survived = false;
     {
@@ -3898,6 +4331,7 @@ bool NetherCraftServer::vehicleAttack(const std::shared_ptr<entity::Player>& pla
         if (boatLike && !instant && ++it->hits < 3) survived = true;
         if (!survived) {
             itemId = it->itemId; passenger = it->passengerEid;
+            brokenTypeId = it->typeId; // CHESTBOAT_DROP_V1
             x = it->x; y = it->y; z = it->z;
             vehicles_.erase(it);
         }
@@ -3915,11 +4349,36 @@ bool NetherCraftServer::vehicleAttack(const std::shared_ptr<entity::Player>& pla
             if (p && static_cast<i32>(p->getEntityId()) == passenger) { p->ridingVehicleEid = 0; break; }
         broadcastVehiclePassengers(vehicleEid, 0);
     }
-    net::Buffer rm; rm.writeVarInt(1); rm.writeVarInt(vehicleEid);
-    const auto bytes = std::vector<u8>(rm.writtenSpan().begin(), rm.writtenSpan().end());
+    const auto bytes = packets::buildRemoveEntities(std::vector<i32>{ vehicleEid }); /* PACKETS_V15 */
     for (auto& p : getAllPlayersCopy())
         if (p && p->isAlive() && p->getState() == entity::PlayerState::Play)
             p->getConnection()->sendPacket(0x42, bytes);
+    // CHESTBOAT_DROP_V1: лодка сломана — её контейнер больше некому открывать.
+    // Раньше запись просто висла в chests_ мёртвым грузом, а вещи пропадали.
+    // По ванилле содержимое высыпается на землю даже в креативе.
+    if (brokenTypeId == kChestBoatTypeId) {
+        const u64 boatKey = entityContainerKey(vehicleEid);
+        ChestData spilled{};
+        {
+            std::lock_guard lock(chestsMutex_);
+            auto itc = chests_.find(boatKey);
+            if (itc != chests_.end()) spilled = itc->second;
+            chests_.erase(boatKey);
+        }
+        for (auto& p : getAllPlayersCopy()) { // зрителям закрываем окно, иначе они кладут в пустоту
+            if (!p || !p->isAlive() || p->openWindowId == 0) continue;
+            if (p->openIsEnder || p->openContainerKey != boatKey) continue;
+            packets::sendContainerClose(p, static_cast<u8>(p->openWindowId)); /* PACKETS_V18 */
+            p->openWindowId = 0;
+            p->openContainerKey = 0;
+            p->openIsDouble = false; p->openContainerKey2 = 0;
+            p->cursorItemId = 0; p->cursorCount = 0;
+        }
+        for (i32 ci = 0; ci < 27; ++ci)
+            if (spilled.count[ci] > 0 && spilled.itemId[ci] > 0)
+                spawnItemDrop(x, y + 0.25, z, spilled.itemId[ci], spilled.count[ci],
+                    static_cast<f64>(ci % 5 - 2) * 0.04, 0.15, static_cast<f64>(ci / 5 - 2) * 0.04);
+    }
     if (itemId > 0 && (!player || player->gameMode != 1))
         spawnItemDrop(x, y + 0.25, z, itemId, 1, 0.0, 0.1, 0.0);
     return true;
@@ -3988,9 +4447,16 @@ bool NetherCraftServer::placeVehicleItem(const std::shared_ptr<entity::Player>& 
         if (!isVehicleRailState(world_.getBlock(rx, ry, rz))) {
             rx = tx; ry = ty; rz = tz;
             if (!isVehicleRailState(world_.getBlock(rx, ry, rz))) {
-                player->sendSystemMessage(config_.language == "rus"
+                // RAILSPAM_V1: клиент шлёт Use Item по нескольку раз за клик,
+                // поэтому предупреждение печаталось пачкой. Не чаще раза в 2 с.
+                const i64 railNow = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (railNow - player->lastRailWarnMs >= 2000) {
+                    player->lastRailWarnMs = railNow;
+                    player->sendSystemMessage(config_.language == "rus"
                     ? "§cВагонетку можно поставить только на рельсы"
                     : "§cA minecart can only be placed on rails");
+                }
                 return false;
             }
         }
@@ -4046,7 +4512,7 @@ i32 NetherCraftServer::computeRailState(i32 x, i32 y, i32 z, i32 state, f32 plac
     // RAIL_SHAPE_V2: раньше соединением считались ЛЮБЫЕ рельсы рядом, а ванильный клиент
     // считает только те, что УЖЕ смотрят на нас; прямые powered/detector/activator гнуться
     // не умеют (6 форм вместо 10). Из-за расхождения клиент откатывал свою ставку —
-    // отсюда «серв хочет так, а кладёт так» и «энерго ставятся с 3 раза».
+    // отсюда «серв хочет там, а кладёт так» и «энерго ставятся с 3 раза».
     bool face[4]  = {false, false, false, false};
     bool rigid[4] = {false, false, false, false};
     auto pointsBack = [&](i32 nshape, i32 d) {
@@ -4057,7 +4523,7 @@ i32 NetherCraftServer::computeRailState(i32 x, i32 y, i32 z, i32 state, f32 plac
         return false;
     };
     // RAIL_SHAPE_V3: V2 резал слишком много (сосед не смотрит на нас — связи нет), сервер перебивал
-    // клиентскую форму и это выглядело как откат. Ванилла ��роще: соединяемся, если сосед уже
+    // клиентскую форму и это выглядело как откат. Ванилла проще: соединяемся, если сосед уже
     // смотрит на нас ЛИБО он гибкий (10 форм) и у него ещё есть свободный выход.
     auto busyExits = [&](i32 nx2, i32 ny2, i32 nz2, i32 nshape) {
         i32 ex[2][3];
@@ -4280,21 +4746,14 @@ void NetherCraftServer::tickVehicles() {
         const bool stillIdle = (v.speed == 0.0 && v.vx == 0.0 && v.vy == 0.0 && v.vz == 0.0);
         if (idle && stillIdle && !rider) { updated.emplace(v.eid, v); continue; } // ANTILAG: silent parked vehicles
         if (rider) rider->setPosition(v.x, v.y, v.z);
-        net::Buffer tp;
-        tp.writeVarInt(v.eid);
-        tp.writeF64(v.x); tp.writeF64(v.y); tp.writeF64(v.z);
-        tp.writeByte(yawToAngleByte(v.yaw)); tp.writeByte(0); tp.writeBool(v.onGround);
-        const auto bytes = std::vector<u8>(tp.writtenSpan().begin(), tp.writtenSpan().end());
+        const auto bytes = packets::buildTeleportEntity(v.eid, v.x, v.y, v.z, static_cast<u8>(yawToAngleByte(v.yaw)), static_cast<u8>(0), v.onGround); /* PACKETS_V16 */
         for (auto& p : players)
             if (p && p->isAlive() && p->getState() == entity::PlayerState::Play)
-                p->getConnection()->sendPacket(0x70, bytes);
+                p->getConnection()->sendPacket(0x70, bytes, true); /* NETQUEUE_V1 */
         // Vanilla vehicle clients also expect Move Vehicle while seated; this is emitted
         // from the actual boat/minecart simulation, not a command.
         if (rider) {
-            net::Buffer vm;
-            vm.writeF64(v.x); vm.writeF64(v.y); vm.writeF64(v.z);
-            vm.writeF32(v.yaw); vm.writeF32(0.0f);
-            rider->getConnection()->sendPacket(0x31, std::vector<u8>(vm.writtenSpan().begin(), vm.writtenSpan().end()));
+            packets::sendMoveVehicle(rider, v.x, v.y, v.z, v.yaw, 0.0f);
         }
         updated.emplace(v.eid, v);
     }
@@ -4351,16 +4810,8 @@ void NetherCraftServer::spawnThrowableProjectile(const std::shared_ptr<entity::P
     // ENTITY_ID_FIX_V2: id реестра идут в порядке объявления в EntityType.java, а не по алфавиту.
     // Проверено по всем 82 известным netId мобов: snowball = 97.
     const i32 throwItemId = entityTypeId == 97 ? 912 : (entityTypeId == 28 ? 927 : (entityTypeId == 37 ? 1088 : 993));
-    net::Buffer meta;
-    meta.writeVarInt(eid);
-    meta.writeByte(8);   // ThrowableItemProjectile: index 8 = сам предмет
-    meta.writeVarInt(7); // сериализатор 7: Slot
-    meta.writeVarInt(1);
-    meta.writeVarInt(throwItemId);
-    meta.writeVarInt(0); meta.writeVarInt(0); // компонентов: +0 / -0
-    meta.writeByte(0xFF); // конец метадаты
-    const auto metaBytes = std::vector<u8>(meta.writtenSpan().begin(), meta.writtenSpan().end());
-    for (auto& p : viewers) if (p && p->isAlive()) p->getConnection()->sendPacket(0x58, metaBytes);
+    const auto metaBytes = packets::buildEntityItemStack(eid, throwItemId, 1); /* PACKETS_V21 */
+    for (auto& p : viewers) if (p && p->isAlive()) p->getConnection()->sendPacket(packets::cb::SetEntityMetadata, metaBytes);
 }
 
 void NetherCraftServer::spawnEnderPearl(const std::shared_ptr<entity::Player>& owner, f32 yaw, f32 pitch) {
@@ -4492,15 +4943,14 @@ void NetherCraftServer::tickProjectiles() {
                 move.writeBool(false);
                 const auto moveBytes = std::vector<u8>(move.writtenSpan().begin(), move.writtenSpan().end());
                 for (auto& p : players) if (p && p->isAlive()) {
-                    p->getConnection()->sendPacket(0x5A, motionBytes);
-                    p->getConnection()->sendPacket(0x2E, moveBytes);
+                    p->getConnection()->sendPacket(0x5A, motionBytes, true); /* NETQUEUE_V1 */
+                    p->getConnection()->sendPacket(0x2E, moveBytes, true); /* NETQUEUE_V1 */
                 }
                 updated.emplace(q.eid, q);
             }
         }
         if (std::find(removed.begin(), removed.end(), q.eid) != removed.end()) {
-            net::Buffer rm; rm.writeVarInt(1); rm.writeVarInt(q.eid);
-            const auto bytes = std::vector<u8>(rm.writtenSpan().begin(), rm.writtenSpan().end());
+            const auto bytes = packets::buildRemoveEntities(std::vector<i32>{ q.eid }); /* PACKETS_V15 */
             for (auto& p : players) if (p && p->isAlive()) p->getConnection()->sendPacket(0x42, bytes);
         }
     }
@@ -4577,9 +5027,7 @@ void NetherCraftServer::tickExperienceOrbs() {
             const f64 dx = nearest->getX() - nx, dy = (nearest->getY() + 1.0) - ny, dz = nearest->getZ() - nz;
             if (dx * dx + dy * dy + dz * dz <= 1.0) { // vanilla pickup radius: 1 block
                 grantExperience(nearest, o.amount);
-                net::Buffer ti;
-                ti.writeVarInt(o.eid); ti.writeVarInt(static_cast<i32>(nearest->getEntityId())); ti.writeVarInt(o.amount);
-                const auto tiBytes = std::vector<u8>(ti.writtenSpan().begin(), ti.writtenSpan().end());
+                const auto tiBytes = packets::buildTakeItemEntity(o.eid, static_cast<i32>(nearest->getEntityId()), o.amount); /* PACKETS_V18 */
                 for (auto& p : players) if (p && p->isAlive()) p->getConnection()->sendPacket(0x6F, tiBytes);
                 removed.push_back(o.eid);
                 picked = true;
@@ -4603,14 +5051,13 @@ void NetherCraftServer::tickExperienceOrbs() {
         move.writeBool(false);
         const auto moveBytes = std::vector<u8>(move.writtenSpan().begin(), move.writtenSpan().end());
         for (auto& p : players) if (p && p->isAlive()) {
-            p->getConnection()->sendPacket(0x5A, motionBytes);
-            p->getConnection()->sendPacket(0x2E, moveBytes);
+            p->getConnection()->sendPacket(0x5A, motionBytes, true); /* NETQUEUE_V1 */
+            p->getConnection()->sendPacket(0x2E, moveBytes, true); /* NETQUEUE_V1 */
         }
         updated.emplace(o.eid, o);
     }
     for (i32 eid : removed) {
-        net::Buffer rm; rm.writeVarInt(1); rm.writeVarInt(eid);
-        const auto bytes = std::vector<u8>(rm.writtenSpan().begin(), rm.writtenSpan().end());
+        const auto bytes = packets::buildRemoveEntities(std::vector<i32>{ eid }); /* PACKETS_V15 */
         for (auto& p : players) if (p && p->isAlive()) p->getConnection()->sendPacket(0x42, bytes);
     }
     std::lock_guard lk(xpOrbsMutex_);
@@ -4621,7 +5068,7 @@ void NetherCraftServer::tickExperienceOrbs() {
 }
 
 // EQUIP_V1: собрать тело пакета Set Equipment (0x5b) для основной руки
-static void buildEquipmentPacket(net::Buffer& eq, i32 eid, i32 heldState) {
+[[maybe_unused]] static void buildEquipmentPacket(net::Buffer& eq, i32 eid, i32 heldState) { // WARNFIX_V2
     eq.writeVarInt(eid);
     eq.writeByte(0x00); // слот 0 = MAINHAND, старший бит снят -> единственная запись
     const i32 itemId = stateToItem(heldState);
@@ -4688,11 +5135,7 @@ static i32 xpNeededForNextLevel(i32 level) {
 
 static void syncExperienceBar(const std::shared_ptr<entity::Player>& player) {
     if (!player || !player->getConnection()) return;
-    net::Buffer xp;
-    xp.writeF32(std::clamp(player->experienceProgress, 0.0f, 1.0f));
-    xp.writeVarInt(std::max(0, player->experienceLevel));
-    xp.writeVarInt(std::max(0, player->totalExperience));
-    player->getConnection()->sendPacket(0x5C, std::vector<u8>(xp.writtenSpan().begin(), xp.writtenSpan().end()));
+    packets::sendSetExperience(player, std::clamp(player->experienceProgress, 0.0f, 1.0f), std::max(0, player->experienceLevel), std::max(0, player->totalExperience)); /* PACKETS_V18 */
 }
 
 static void grantExperience(const std::shared_ptr<entity::Player>& player, i32 amount) {
@@ -4714,10 +5157,7 @@ static void grantExperience(const std::shared_ptr<entity::Player>& player, i32 a
 }
 
 void NetherCraftServer::sendSpawnPosition(std::shared_ptr<entity::Player> player) {
-    net::Buffer buf;
-    buf.writePosition(BlockPos{g_spawnX, g_spawnY, g_spawnZ}); // SPAWN_V1: общий мировой спавн
-    buf.writeF32(0.0f); // angle = f32, НЕ u8!
-    player->getConnection()->sendPacket(0x56, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+    packets::sendSetDefaultSpawn(player, BlockPos{g_spawnX, g_spawnY, g_spawnZ}, 0.0f); // SPAWN_V1: общий мировой спавн /* PACKETS_V18 */
 }
 
 // ============================================================
@@ -4739,15 +5179,7 @@ void NetherCraftServer::sendPlayerAbilities(std::shared_ptr<entity::Player> play
 // ============================================================
 
 void NetherCraftServer::sendPlayerPositionAndLook(std::shared_ptr<entity::Player> player) {
-    net::Buffer buf;
-    buf.writeF64(player->getX());
-    buf.writeF64(player->getY());
-    buf.writeF64(player->getZ());
-    buf.writeF32(player->get_yaw()); // PLAYERSTATE_V2: restore camera yaw
-    buf.writeF32(player->get_pitch()); // PLAYERSTATE_V2: restore camera pitch
-    buf.writeByte(0x00); // Flags
-    buf.writeVarInt(player->nextTeleportId()); // TPFIX_V2: была константа 1 на все телепорты
-    player->getConnection()->sendPacket(0x40, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+    packets::sendPlayerPosition(player, player->getX(), player->getY(), player->getZ(), player->get_yaw(), player->get_pitch(), 0x00, player->nextTeleportId()); // TPFIX_V2 /* PACKETS_V18 */
 }
 
 // ============================================================
@@ -4755,10 +5187,7 @@ void NetherCraftServer::sendPlayerPositionAndLook(std::shared_ptr<entity::Player
 // ============================================================
 
 void NetherCraftServer::sendTimeUpdate(std::shared_ptr<entity::Player> player) {
-    net::Buffer buf;
-    buf.writeI64(g_timeOfDay); // CMDS_V1
-    buf.writeI64(g_timeOfDay);
-    player->getConnection()->sendPacket(0x64, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+    packets::sendUpdateTime(player, g_timeOfDay, g_timeOfDay); /* PACKETS_V16 */
 }
 
 // ============================================================
@@ -4787,10 +5216,398 @@ world::World& NetherCraftServer::worldOf(const std::shared_ptr<entity::Player>& 
     return worldFor(player ? player->dimension : 0);
 }
 
-void NetherCraftServer::saveWorlds() { // DIMSAVE_V1: у каждого измерения своя папка
-    world_.saveToDisk("world/overworld/world.dat");
-    if (netherReady_) nether_.saveToDisk("world/nether/nether.dat");
-    if (endReady_) end_.saveToDisk("world/end/end.dat");
+void NetherCraftServer::saveWorlds() { // V56_VANILLAONLY_V1: единственный формат хранения — ванильный
+    // CRASHTRACE_V1: самый аварийноопасный участок — если упадём здесь, по последней
+    // отметке в отчёте сразу видно, на каком именно шаге сохранения.
+    // world.dat/extra.dat больше не существуют: saveVanillaMirror(true) сама
+    // собирает снимок RAM и пишет level.dat + region/ + entities/ — форсируем,
+    // чтобы save-all/стоп сервера никогда не пропускались по таймеру.
+    NC_CTRACE("saveWorlds: saveVanillaMirror(true)");
+    saveVanillaMirror(true); // VANILLA_MIRROR_V1
+    NC_CTRACE("saveWorlds: готово");
+}
+
+// ============================================================
+// VANILLA_MIRROR_V1: двойная запись мира.
+// Раньше ванильный вид мира появлялся только по ручной команде export-vanilla
+// и в постороннюю папку, поэтому содержимое release/world было читаемо
+// только этим ядром. Теперь рядом с overworld/world.dat лежит настоящий
+// ванильный сейв: level.dat, region/, entities/, DIM-1/, DIM1/, playerdata/*.dat.
+// Источник истины при загрузке — всё ещё world.dat: зеркало только пишется,
+// никогда не читается. Поломать мир оно не может по построению.
+// Запись дорогая (весь мир в .mca), поэтому её держит таймер, а при остановке
+// сервера и по save-all зовётся с force = true.
+// ============================================================
+// V57_PLAYERTAG_V1: снимок игрока для тега Data.Player в level.dat.
+// Слоты копируются как есть — в нумерацию ванили их переводит экспортер.
+static world::anvil::PlayerExport makePlayerExport(const std::shared_ptr<entity::Player>& p) {
+    world::anvil::PlayerExport pe;
+    pe.x = p->getX();
+    pe.y = p->getY();
+    pe.z = p->getZ();
+    pe.yaw = p->get_yaw();
+    pe.pitch = p->get_pitch();
+    pe.gameMode = p->gameMode;
+    pe.selectedSlot = (p->heldSlot >= 0 && p->heldSlot < 9) ? p->heldSlot : 0;
+    pe.health = p->health;
+    pe.foodLevel = 20;
+    pe.xpLevel = p->experienceLevel;
+    pe.xpTotal = p->totalExperience;
+    for (int i = 0; i < entity::Player::INV_SIZE && i < 46; ++i) {
+        pe.itemId[static_cast<size_t>(i)] = p->invItemId[i];
+        pe.count[static_cast<size_t>(i)] = p->invCount[i];
+    }
+    for (int i = 0; i < 27; ++i) {
+        pe.enderItemId[static_cast<size_t>(i)] = p->enderItemId[i];
+        pe.enderCount[static_cast<size_t>(i)] = p->enderCount[i];
+    }
+    return pe;
+}
+
+// V57_GAMETYPE_V1: gamemode из settings.properties — в числовой GameType level.dat.
+static i32 gameTypeFromName(const std::string& name) {
+    if (name == "creative") return 1;
+    if (name == "adventure") return 2;
+    if (name == "spectator") return 3;
+    return 0;
+}
+
+void NetherCraftServer::saveVanillaMirror(bool force) {
+    // V56_VANILLAONLY_V1: это больше не опциональная витрина поверх world.dat —
+    // это единственный способ сохранить мир, поэтому config_.vanillaMirror
+    // больше не может его отключить.
+    const bool ru = (config_.language == "rus");
+    const i64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const i64 gap = static_cast<i64>(config_.vanillaMirrorInterval) * 1000;
+    if (!force && gap > 0 && lastMirrorMs_ != 0 && (now - lastMirrorMs_) < gap) return;
+    lastMirrorMs_ = now;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    NC_CTRACE("mirror: сбор снимка сундуков/табличек/сущностей"); // CRASHTRACE_V1
+    world::extra::Snapshot xsnap = buildExtrasSnapshot();
+    // SAVEPROF_V1: старый формат писал один бинарный world.dat за 6 мс, а ванильный
+    // сейв — это NBT + zlib по каждому чанку, region-файлы, сущности и playerdata.
+    // Без разбивки по этапам непонятно, кто из них съедает секунды.
+    const auto tSnapEnd = std::chrono::steady_clock::now();
+    const double msSnap = std::chrono::duration<double, std::milli>(tSnapEnd - t0).count();
+    NC_CTRACE("mirror: снимок собран (chests=%d signs=%d furnaces=%d spawners=%d banners=%d)",
+             static_cast<int>(xsnap.chests.size()), static_cast<int>(xsnap.signs.size()),
+             static_cast<int>(xsnap.furnaces.size()), static_cast<int>(xsnap.spawners.size()),
+             static_cast<int>(xsnap.banners.size()));
+
+    std::string err;
+    NC_CTRACE("mirror: exportToVanilla overworld"); // CRASHTRACE_V1
+    // V57_PLAYERTAG_V1: берём свежее состояние онлайн-игрока, а если все уже
+    // отключены (остановка сервера) — последний снимок из savePlayerData().
+    for (auto& mp : getAllPlayersCopy()) {
+        if (!mp || mp->dimension != 0) continue;
+        lastPlayerExport_ = makePlayerExport(mp);
+        haveLastPlayerExport_ = true;
+        break;
+    }
+    const world::anvil::PlayerExport* mirrorPlayer =
+        haveLastPlayerExport_ ? &lastPlayerExport_ : nullptr;
+    if (!world::anvil::exportToVanilla(world_, "world", config_.levelName, config_.levelSeed,
+                                       g_spawnX, g_spawnY, g_spawnZ, &err, &xsnap,
+                                       gameTypeFromName(config_.gamemode), mirrorPlayer)) {
+        if (ru) NC_WARN("Server", "Ванильное зеркало не записано: {}", err);
+        else NC_WARN("Server", "vanilla mirror failed: {}", err);
+        return;
+    }
+    const auto tOverEnd = std::chrono::steady_clock::now();
+    const double msOver = std::chrono::duration<double, std::milli>(tOverEnd - tSnapEnd).count(); // SAVEPROF_V1
+    std::string derr;
+    NC_CTRACE("mirror: exportDimension nether/end"); // CRASHTRACE_V1
+    if (netherReady_ && !world::anvil::exportDimension(nether_, "world", world::anvil::Dimension::Nether,
+                                                       config_.levelSeed, &derr, &xsnap))
+        NC_WARN("Server", "vanilla mirror (nether) failed: {}", derr);
+    if (endReady_ && !world::anvil::exportDimension(end_, "world", world::anvil::Dimension::End,
+                                                    config_.levelSeed, &derr, &xsnap))
+        NC_WARN("Server", "vanilla mirror (end) failed: {}", derr);
+    const auto tDimsEnd = std::chrono::steady_clock::now();
+    const double msDims = std::chrono::duration<double, std::milli>(tDimsEnd - tOverEnd).count(); // SAVEPROF_V1
+    NC_CTRACE("mirror: exportPlayers"); // CRASHTRACE_V1
+
+    // PLAYERCONV_V1: рядом с нашими playerdata/*.txt ложатся ванильные *.dat —
+    // расширения разные, исходники не затираются.
+    world::playerconv::ConvertStats pstats;
+    world::playerconv::exportPlayers("world/playerdata", "world", &pstats, nullptr);
+
+    const auto tEnd = std::chrono::steady_clock::now();
+    const double msPlayers = std::chrono::duration<double, std::milli>(tEnd - tDimsEnd).count(); // SAVEPROF_V1
+    const double ms = std::chrono::duration<double, std::milli>(tEnd - t0).count();
+    if (ru) NC_INFO("Server", "Мир сохранён за {:.0f} мс (world/level.dat + region)", ms);
+    else NC_INFO("Server", "world saved in {:.0f} ms (world/level.dat + region)", ms);
+    // SAVEPROF_V1: разбивка печатается только когда сохранение реально затянулось,
+    // чтобы не сорить в лог на каждом быстром автосейве.
+    if (ms > 400.0) {
+        if (ru) NC_WARN("Server", "Где время: снимок {:.0f}мс, обычный мир {:.0f}мс, незер+энд {:.0f}мс, игроки {:.0f}мс",
+                    msSnap, msOver, msDims, msPlayers);
+        else NC_WARN("Server", "save breakdown: snapshot {:.0f}ms, overworld {:.0f}ms, nether+end {:.0f}ms, players {:.0f}ms",
+                     msSnap, msOver, msDims, msPlayers);
+    }
+}
+
+// V56_VANILLAONLY_V1: снимок собирается прямо из RAM и уходит в exportToVanilla/
+// exportDimension — файла extra.dat больше нет, RAM остаётся единственным
+// хранилищем сундуков/печей/спавнеров/баннеров/табличек/мобов/дропа/транспорта
+// между вызовами buildExtrasSnapshot()/restoreExtras().
+world::extra::Snapshot NetherCraftServer::buildExtrasSnapshot() {
+    NC_CTRACE("buildExtrasSnapshot: старт");
+    world::extra::Snapshot snap;
+    {
+        std::lock_guard lk(chestsMutex_);
+        snap.chests.reserve(chests_.size());
+        for (const auto& entry : chests_) {
+            bool anything = false;
+            for (int i = 0; i < 27; ++i) {
+                if (entry.second.itemId[i] > 0 && entry.second.count[i] > 0) { anything = true; break; }
+            }
+            if (!anything) continue; // пустые сундуки восстановятся сами при открытии
+            if (isEntityContainerKey(entry.first)) continue; // CHESTBOAT_V1: eid меняется между сессиями
+            world::extra::ChestRecord rec;
+            rec.pos = static_cast<i64>(entry.first);
+            {   // CONTAINER_V1: тип берём из мира — по нему экспорт в ваниллу выбирает блок-сущность
+                i32 kx = 0, ky = 0, kz = 0;
+                world::extra::unpackPos(rec.pos, kx, ky, kz);
+                rec.kind = containerKindOfState(world_.getBlock(kx, ky, kz));
+                rec.trapped = (rec.kind == CK_TRAPPED);
+            }
+            for (int i = 0; i < 27; ++i) {
+                rec.itemId[static_cast<size_t>(i)] = entry.second.itemId[i];
+                rec.count[static_cast<size_t>(i)] = entry.second.count[i];
+            }
+            snap.chests.push_back(rec);
+        }
+    }
+    for (const auto& entry : g_signText) {
+        const auto& lines = entry.second;
+        if (lines[0].empty() && lines[1].empty() && lines[2].empty() && lines[3].empty()) continue;
+        world::extra::SignRecord rec;
+        rec.pos = static_cast<i64>(entry.first);
+        for (int i = 0; i < 4; ++i) rec.lines[static_cast<size_t>(i)] = lines[static_cast<size_t>(i)];
+        snap.signs.push_back(std::move(rec));
+    }
+    {
+        std::lock_guard lk(mobsMutex_);
+        snap.mobs.reserve(mobs_.size());
+        for (const auto& m : mobs_) {
+            if (m.dead) continue; // труп в анимации смерти сохранять незачем
+            world::extra::MobRecord rec;
+            rec.typeIdx = m.typeIdx;
+            rec.dim = m.dimension;
+            rec.x = m.x; rec.y = m.y; rec.z = m.z;
+            rec.yaw = m.yaw; rec.pitch = m.pitch; rec.headYaw = m.headYaw;
+            rec.health = m.health;
+            rec.baby = m.baby; rec.tamed = m.tamed; rec.sitting = m.sitting; rec.sheared = m.sheared;
+            rec.owner = m.owner; rec.profession = m.profession; rec.wool = m.wool; rec.tradeXp = m.tradeXp;
+            snap.mobs.push_back(rec);
+        }
+    }
+    {
+        std::lock_guard lk(itemDropsMutex_);
+        snap.drops.reserve(itemDrops_.size());
+        for (const auto& d : itemDrops_) {
+            world::extra::DropRecord rec;
+            rec.itemId = d.itemId; rec.count = d.count;
+            rec.x = d.x; rec.y = d.y; rec.z = d.z;
+            rec.vx = d.vx; rec.vy = d.vy; rec.vz = d.vz;
+            rec.age = d.age;
+            snap.drops.push_back(rec);
+        }
+    }
+    // CHESTBOAT_SAVE_V1: eid нужен, чтобы подтянуть контейнер лодки из chests_.
+    // Собираем его рядом с записями, а в chests_ лезем уже после отпускания
+    // vehiclesMutex_, чтобы не держать два замка вложенно.
+    std::vector<i32> vehicleEids;
+    {
+        std::lock_guard lk(vehiclesMutex_);
+        snap.vehicles.reserve(vehicles_.size());
+        vehicleEids.reserve(vehicles_.size());
+        for (const auto& v : vehicles_) {
+            world::extra::VehicleRecord rec;
+            rec.typeId = v.typeId; rec.itemId = v.itemId; rec.variant = v.variant;
+            rec.x = v.x; rec.y = v.y; rec.z = v.z; rec.yaw = v.yaw;
+            snap.vehicles.push_back(rec);
+            vehicleEids.push_back(v.eid);
+        }
+    }
+    {
+        std::lock_guard lk(chestsMutex_);
+        for (size_t i = 0; i < snap.vehicles.size(); ++i) {
+            if (snap.vehicles[i].typeId != kChestBoatTypeId) continue;
+            const auto it = chests_.find(entityContainerKey(vehicleEids[i]));
+            if (it == chests_.end()) continue;
+            snap.vehicles[i].hasChest = true;
+            for (int s = 0; s < 27; ++s) {
+                snap.vehicles[i].slotItemId[static_cast<size_t>(s)] = it->second.itemId[s];
+                snap.vehicles[i].slotCount[static_cast<size_t>(s)] = it->second.count[s];
+            }
+        }
+    }
+    NC_CTRACE("buildExtrasSnapshot: секция furnaces");
+    { // CONTAINER_V3: недогоревшее топливо и недоплавленное сырьё больше не теряются
+        std::lock_guard lk(chestsMutex_);
+        snap.furnaces.reserve(furnaces_.size());
+        for (const auto& entry : furnaces_) {
+            if (entry.second.burn <= 0 && entry.second.cook <= 0) continue;
+            world::extra::FurnaceRecord rec;
+            rec.pos = static_cast<i64>(entry.first);
+            rec.burn = entry.second.burn;
+            rec.burnTotal = entry.second.burnTotal;
+            rec.cook = entry.second.cook;
+            rec.cookTotal = entry.second.cookTotal;
+            snap.furnaces.push_back(rec);
+        }
+    }
+    NC_CTRACE("buildExtrasSnapshot: секция spawners");
+    { // SPAWNER_V1
+        std::lock_guard lk(spawnersMutex_);
+        snap.spawners.reserve(spawners_.size());
+        for (const auto& entry : spawners_) {
+            world::extra::SpawnerRecord rec;
+            rec.pos = static_cast<i64>(entry.first);
+            rec.entityId = entry.second.entityId;
+            rec.delay = entry.second.delay;
+            rec.minDelay = entry.second.minDelay;
+            rec.maxDelay = entry.second.maxDelay;
+            rec.spawnCount = entry.second.spawnCount;
+            rec.maxNearby = entry.second.maxNearby;
+            rec.requiredPlayerRange = entry.second.requiredPlayerRange;
+            rec.spawnRange = entry.second.spawnRange;
+            snap.spawners.push_back(std::move(rec));
+        }
+    }
+    NC_CTRACE("buildExtrasSnapshot: секция banners");
+    { // BANNER_V1
+        std::lock_guard lk(bannersMutex_);
+        snap.banners.reserve(banners_.size());
+        for (const auto& entry : banners_) snap.banners.push_back(entry.second);
+    }
+    NC_CTRACE("buildExtrasSnapshot: готово (chests=%d signs=%d furnaces=%d spawners=%d banners=%d)",
+             static_cast<int>(snap.chests.size()), static_cast<int>(snap.signs.size()),
+             static_cast<int>(snap.furnaces.size()), static_cast<int>(snap.spawners.size()),
+             static_cast<int>(snap.banners.size()));
+    return snap;
+}
+
+// V56_VANILLAONLY_V1: восстановление после старта из снимка, извлечённого прямо
+// из block_entities/entities region-файлов (importFromVanilla/importDimension).
+// Идентификаторы сущностей выдаём заново из nextEntityId_ — старые eid прошлой
+// сессии не имеют смысла.
+void NetherCraftServer::restoreExtras(const world::extra::Snapshot& snap) {
+    if (snap.empty()) return;
+    {
+        std::lock_guard lk(chestsMutex_);
+        for (const auto& rec : snap.chests) {
+            ChestData data{};
+            for (int i = 0; i < 27; ++i) {
+                data.itemId[i] = rec.itemId[static_cast<size_t>(i)];
+                data.count[i] = rec.count[static_cast<size_t>(i)];
+            }
+            chests_[static_cast<u64>(rec.pos)] = data;
+        }
+    }
+    for (const auto& rec : snap.chests) { // CONTAINER_V2: печки и воронки из прошлой сессии тоже должны тикать
+        i32 rx = 0, ry = 0, rz = 0;
+        world::extra::unpackPos(rec.pos, rx, ry, rz);
+        registerBlockEntity(rx, ry, rz, rec.kind);
+    }
+    { // CONTAINER_V3: прогресс плавки возвращается туда же, откуда ушёл
+        std::lock_guard lk(chestsMutex_);
+        for (const auto& rec : snap.furnaces) {
+            FurnaceData f;
+            f.burn = rec.burn; f.burnTotal = rec.burnTotal;
+            f.cook = rec.cook; f.cookTotal = rec.cookTotal;
+            furnaces_[static_cast<u64>(rec.pos)] = f;
+        }
+    }
+    { // SPAWNER_V1: имя моба разрешаем в индекс один раз, при загрузке
+        std::lock_guard lk(spawnersMutex_);
+        for (const auto& rec : snap.spawners) {
+            SpawnerData sp;
+            sp.entityId = rec.entityId;
+            std::string nm = rec.entityId;
+            if (nm.rfind("minecraft:", 0) == 0) nm = nm.substr(10);
+            sp.typeIdx = entity::mobIndexByName(nm.c_str());
+            sp.delay = rec.delay; sp.minDelay = rec.minDelay; sp.maxDelay = rec.maxDelay;
+            sp.spawnCount = rec.spawnCount; sp.maxNearby = rec.maxNearby;
+            sp.requiredPlayerRange = rec.requiredPlayerRange; sp.spawnRange = rec.spawnRange;
+            spawners_[static_cast<u64>(rec.pos)] = std::move(sp);
+        }
+    }
+    { // BANNER_V1
+        std::lock_guard lk(bannersMutex_);
+        for (const auto& rec : snap.banners) banners_[static_cast<u64>(rec.pos)] = rec;
+    }
+    for (const auto& rec : snap.signs) {
+        g_signText[static_cast<u64>(rec.pos)] = {rec.lines[0], rec.lines[1], rec.lines[2], rec.lines[3]};
+    }
+    {
+        std::lock_guard lk(mobsMutex_);
+        for (const auto& rec : snap.mobs) {
+            if (rec.typeIdx < 0 || rec.typeIdx >= entity::mobTypeCount()) continue;
+            entity::Mob m;
+            m.eid = static_cast<i32>(nextEntityId_++);
+            m.typeIdx = rec.typeIdx;
+            m.dimension = rec.dim;
+            m.x = rec.x; m.y = rec.y; m.z = rec.z;
+            m.yaw = rec.yaw; m.pitch = rec.pitch; m.headYaw = rec.headYaw;
+            m.baby = rec.baby; m.tamed = rec.tamed; m.sitting = rec.sitting; m.sheared = rec.sheared;
+            m.owner = rec.owner; m.profession = rec.profession; m.wool = rec.wool; m.tradeXp = rec.tradeXp;
+            m.health = rec.health > 0 ? rec.health : static_cast<i32>(m.def().maxHealth + 0.5f);
+            m.eggTimer = 6000 + (std::rand() % 6000);
+            m.strollTimer = std::rand() % 100;
+            m.lastSentX = m.x; m.lastSentY = m.y; m.lastSentZ = m.z;
+            mobs_.push_back(m);
+        }
+    }
+    {
+        std::lock_guard lk(itemDropsMutex_);
+        for (const auto& rec : snap.drops) {
+            if (rec.itemId <= 0 || rec.count <= 0) continue;
+            if (itemDrops_.size() >= 2000) break;
+            ItemDrop d{};
+            d.eid = static_cast<i32>(nextEntityId_++);
+            d.itemId = rec.itemId; d.count = rec.count;
+            d.x = rec.x; d.y = rec.y; d.z = rec.z;
+            d.vx = rec.vx; d.vy = rec.vy; d.vz = rec.vz;
+            d.age = rec.age; d.pickupDelay = 0;
+            itemDrops_.push_back(d);
+        }
+    }
+    // CHESTBOAT_SAVE_V1: лодка получает свежий eid, значит и ключ её контейнера
+    // строится заново. Содержимое раскладываем в chests_ отдельным шагом.
+    std::vector<std::pair<i32, const world::extra::VehicleRecord*>> boatChests;
+    {
+        std::lock_guard lk(vehiclesMutex_);
+        for (const auto& rec : snap.vehicles) {
+            if (vehicles_.size() >= 4096) break;
+            VehicleMotion v{};
+            v.eid = static_cast<i32>(nextEntityId_++);
+            v.typeId = rec.typeId; v.itemId = rec.itemId; v.variant = rec.variant;
+            v.x = rec.x; v.y = rec.y; v.z = rec.z; v.yaw = rec.yaw;
+            v.vx = 0.0; v.vy = 0.0; v.vz = 0.0;
+            v.dirX = 0; v.dirZ = 0; v.speed = 0.0;
+            v.passengerEid = 0; v.onGround = false;
+            vehicles_.push_back(v);
+            if (rec.hasChest) boatChests.emplace_back(v.eid, &rec);
+        }
+    }
+    if (!boatChests.empty()) {
+        std::lock_guard lk(chestsMutex_);
+        for (const auto& entry : boatChests) {
+            ChestData data{};
+            for (int s = 0; s < 27; ++s) {
+                data.itemId[s] = entry.second->slotItemId[static_cast<size_t>(s)];
+                data.count[s] = entry.second->slotCount[static_cast<size_t>(s)];
+            }
+            chests_[entityContainerKey(entry.first)] = data;
+        }
+    }
+    NC_INFO("World", "WORLDEXTRA_V1: восстановлено — сундуков {}, табличек {}, мобов {}, предметов {}, транспорта {}",
+            snap.chests.size(), snap.signs.size(), snap.mobs.size(), snap.drops.size(), snap.vehicles.size());
 }
 
 // SPAWNCFG_V1: обратный отсчёт /spawn. Настройки берутся из spawn/spawn.properties
@@ -4839,7 +5656,7 @@ void NetherCraftServer::tickSpawnWarmups() {
     }
 }
 
-// WORLDPREP_V1: ванильный старт готовит ��егион спавна ДО того, как пустит игроков, и пишет проценты.
+// WORLDPREP_V1: ванильный старт готовит регион спавна ДО того, как пустит игроков, и пишет проценты.
 // Раньше Ад и Энд генерировались лениво — прямо в тике, в момент первого
 // прохода в портал, отчего TPS проваливался до 2.32. Теперь эта работа сделана до старта тиков.
 void NetherCraftServer::prepareAllDimensions() {
@@ -4866,20 +5683,13 @@ void NetherCraftServer::prepareAllDimensions() {
             continue;
         }
         const auto t0 = std::chrono::steady_clock::now();
-        const char* datPath = (st.dim == 1) ? "world/nether/nether.dat" : "world/end/end.dat";
+        // V56_VANILLAONLY_V1: ванильный макет держит Ад/Энд в world/DIM-1/region и world/DIM1/region.
+        const char* regionPath = (st.dim == 1) ? "world/DIM-1/region" : "world/DIM1/region";
         std::error_code dec;
-        const bool fromDisk = std::filesystem::exists(datPath, dec); // DIMLOAD_V1
-        ensureDimensionReady(st.dim);
+        const bool fromDisk = std::filesystem::exists(regionPath, dec); // DIMLOAD_V1
+        ensureDimensionReady(st.dim); // теперь синхронный importDimension — ожидание фоновой загрузки больше не нужно
         world::World& w = worldFor(st.dim);
         if (fromDisk) {
-            // DIMLOAD_V1: измерение уже сохранено. Фоновая загрузка ставит колонны
-            // в очередь, а разбирает её drainLoadedChunks() в тике — но тиков ещё нет.
-            // Раньше из-за этого старт генерил измерение заново и затирал сохранённое.
-            for (int guard = 0; guard < 30000 && !w.isBackgroundLoadDone(); ++guard) {
-                w.drainLoadedChunks();
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
-            w.drainLoadedChunks();
             const auto lms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             if (ru) NC_INFO("Server", "  {}: 100% — загружен с диска за {} мс (генерация не нужна)", name, (long long)lms);
@@ -4923,13 +5733,15 @@ void NetherCraftServer::ensureDimensionReady(i32 dim) {
     if (dim == 1 && !netherReady_) {
         nether_.setLanguageRu(ru);
         nether_.initNetherGenerator(config_.levelSeed);
-        if (!nether_.startBackgroundLoad("world/nether/nether.dat")) // DIMSAVE_V1
+        std::string derr; // V56_VANILLAONLY_V1: читаем из world/DIM-1/region напрямую, без nether.dat
+        if (!world::anvil::importDimension(nether_, "world", world::anvil::Dimension::Nether, &derr, nullptr))
             nether_.generateDimSpawn(0, 0, 2);
         netherReady_ = true;
     } else if (dim == 2 && !endReady_) {
         end_.setLanguageRu(ru);
         end_.initEndGenerator(config_.levelSeed);
-        if (!end_.startBackgroundLoad("world/end/end.dat")) // DIMSAVE_V1
+        std::string derr; // V56_VANILLAONLY_V1: читаем из world/DIM1/region напрямую, без end.dat
+        if (!world::anvil::importDimension(end_, "world", world::anvil::Dimension::End, &derr, nullptr))
             end_.generateDimSpawn(6, 0, 2);
         endReady_ = true;
     }
@@ -4956,7 +5768,7 @@ const PortalBlocks& portalBlocks() {
         // не регистрировал property-варианты ни для nether_portal, ни для
         // end_portal_frame, поэтому оба запроса всегда возвращали nullopt ->
         // portalX/portalZ/frame* оставались -1 -> tryLightNetherPortal() выходил
-        // на первой же с��роке, а tryPlaceEnderEye() не находил ни одной рамки.
+        // на первой же строке, а tryPlaceEnderEye() не находил ни одной рамки.
         // Снаружи это выглядело как "огниво ставит огонь, портал не зажигается"
         // и "глаза не вставляются в рамку".
         // Теперь ID берутся от дефолтного состояния блока (оно в реестре есть
@@ -5171,7 +5983,7 @@ void NetherCraftServer::buildEndSpawnPlatform() { // ванильная обси
 }
 
 // Переход между измерениями: 80 тиков в выживании, мгновенно в творчестве,
-// масштаб 1:8, ��ул��аун 300 тиков (PORTAL_V1 поля игрока уже были заведены).
+// масштаб 1:8, кулдаун 300 тиков (PORTAL_V1 поля игрока уже были заведены).
 // PORTALBREAK_V1: в ванильной игре портал гаснет целиком, если сломать любой его блок
 // или блок рамки. Раньше сносился только один блок, остальные висели в воздухе.
 void NetherCraftServer::extinguishPortalNear(i32 dim, i32 bx, i32 by, i32 bz, i32 brokenState) {
@@ -5271,7 +6083,7 @@ void NetherCraftServer::tickPortals() {
 }
 
 bool NetherCraftServer::travelToDimension(const std::shared_ptr<entity::Player>& player, i32 dim, f64 tx, f64 ty, f64 tz) {
-    // DIMTOGGLE_V1: в выключенный мир не пускаем никого и ничем.
+    // DIMTOGGLE_V1: в выключенный мир не пускаем никого и ничего.
     if ((dim == 1 && !config_.enableNether) || (dim == 2 && !config_.enableEnd)) return false;
     if (!player || player->getState() != entity::PlayerState::Play) return false;
     if (dim < 0 || dim > 2 || player->dimension == dim) return false;
@@ -5284,20 +6096,17 @@ bool NetherCraftServer::travelToDimension(const std::shared_ptr<entity::Player>&
         rs.writeVarInt(dimTypeIndex(dim));
         rs.writeString(dimIdName(dim));
         rs.writeI64(config_.levelSeed);
-        rs.writeByte((i8)player->gameMode);
-        rs.writeByte(-1);
+        rs.writeByte(static_cast<u8>(player->gameMode));
+        rs.writeByte(static_cast<u8>(0xFF));
         rs.writeBool(false); // is debug
-        rs.writeBool(dim == 0); // is flat (DIMGEN_V1: nether/end are generated now)
+        rs.writeBool(dim == 0 && isFlatGenerator(config_.generator)); // is flat (FLATFLAG_V1)
         rs.writeBool(false); // has death location
         rs.writeVarInt(0);   // portal cooldown
         rs.writeByte(0x03);  // data kept: attributes + metadata
         player->getConnection()->sendPacket(0x47, std::vector<u8>(rs.writtenSpan().begin(), rs.writtenSpan().end()));
     }
     { // Game Event 13 "start waiting for level chunks", otherwise the client hangs on Loading terrain
-        net::Buffer ge;
-        ge.writeByte(13);
-        ge.writeF32(0.0f);
-        player->getConnection()->sendPacket(0x22, std::vector<u8>(ge.writtenSpan().begin(), ge.writtenSpan().end()));
+        packets::sendGameEvent(player, static_cast<u8>(13), 0.0f); /* PACKETS_V10 */
     }
     const i32 ccx = static_cast<i32>(std::floor(tx / 16.0));
     const i32 ccz = static_cast<i32>(std::floor(tz / 16.0));
@@ -5316,7 +6125,7 @@ bool NetherCraftServer::travelToDimension(const std::shared_ptr<entity::Player>&
     player->setPosition(tx, ty, tz);
     sendCenterChunk(player, ccx, ccz); // TPFIX_V2: та не дыра была и на переходе между измерениями
     sendPlayerPositionAndLook(player);
-    sendChunksAround(player, ccx, ccz, config_.viewDistance, 24);
+    sendChunksAround(player, ccx, ccz, config_.viewDistance, 32); // CHUNK_ADAPT_V1: дальше размер подстроится сам
     // INVDIM_V1: Ад/Энд шли через Respawn (0x47) без досылки инвентаря — вещи пропадали
     sendFullPlayerInventory(player);
     pruneAllWorlds(); // MEM_V2
@@ -5339,9 +6148,7 @@ void NetherCraftServer::sendFullPlayerInventory(const std::shared_ptr<entity::Pl
         writeInventoryStack(inv, player->invItemId[i], player->invCount[i], player->builderWandOwned && player->invItemId[i] == 821);
     inv.writeVarInt(0);          // курсор: пусто
     player->getConnection()->sendPacket(0x13, std::vector<u8>(inv.writtenSpan().begin(), inv.writtenSpan().end()));
-    net::Buffer carried;
-    carried.writeByte((i8)(player->heldSlot >= 0 && player->heldSlot < 9 ? player->heldSlot : 0));
-    player->getConnection()->sendPacket(0x53, std::vector<u8>(carried.writtenSpan().begin(), carried.writtenSpan().end()));
+    packets::sendSetHeldSlot(player, static_cast<u8>(player->heldSlot >= 0 && player->heldSlot < 9 ? player->heldSlot : 0)); /* PACKETS_V16 */
 }
 
 // MEM_V2: раньше чистился ТОЛЬКО оверворлд (world_), да и то лишь при пересечении
@@ -5374,10 +6181,7 @@ void NetherCraftServer::pruneAllWorlds() {
 // distance обязан сначала двинуть центр, и только потом слать чанки.
 void NetherCraftServer::sendCenterChunk(const std::shared_ptr<entity::Player>& player, i32 cx, i32 cz) {
     if (!player || !player->getConnection()) return;
-    net::Buffer vb;
-    vb.writeVarInt(cx);
-    vb.writeVarInt(cz);
-    player->getConnection()->sendPacket(0x54, std::vector<u8>(vb.writtenSpan().begin(), vb.writtenSpan().end()));
+    packets::sendSetCenterChunk(player, cx, cz); /* PACKETS_V10 */
     player->setViewCenter(cx, cz);
 }
 
@@ -5421,15 +6225,20 @@ bool NetherCraftServer::teleportSafe(const std::shared_ptr<entity::Player>& play
     }
     player->setPosition(tx, ty, tz);
     // TPFIX_V2: ГЛАВНОЕ. Без Set Center Chunk (0x54) клиент выбрасывает все чанки,
-    // ��ришедшие дальше view distance от его старого центра: после дальнего /tp была
+    // пришедшие дальше view distance от его старого центра: после дальнего /tp была
     // пустота без коллизий. А sendChunksAround в конце сам ставит setViewCenter, поэтому
     // streamChunks делал early-return и 0x54 не уходил уже никогда.
+    // NETQUEUE_V1: ПЕРЕД телепортом выбрасываем из очереди весь необязательный мусор.
+    // Сценарий бага: массовая правка (десятки млн блоков) забивает очередь на мегабайты,
+    // и Chunk Data с Synchronize Player Position приезжают к клиенту с задержкой в несколько секунд —
+    // всё это время игрок стоит в пустоте без коллизий и проваливается сквозь блоки.
+    if (player->getConnection()) player->getConnection()->dropQueuedDroppable();
     player->clearSeenChunks();
     sendCenterChunk(player, ccx, ccz);
     sendPlayerPositionAndLook(player); // ровно один раз: два телепорта подряд давали резиновую ленту
-    sendChunksAround(player, ccx, ccz, config_.viewDistance, 24);
+    sendChunksAround(player, ccx, ccz, config_.viewDistance, 32); // CHUNK_ADAPT_V1: дальше размер подстроится сам
     sendFullPlayerInventory(player); // INVDIM_V1: страховка от пропажи вещей после дальнего телепорта
-    pruneAllWorlds();                // MEM_V2: старая округа больше не висит в ОЗУ до пер��сечения чанка
+    pruneAllWorlds();                // MEM_V2: старая округа больше не висит в ОЗУ до пересечения чанка
     player->fallPeakY = ty;
     player->fallWasOnGround = true;
     player->setOnGround(true);
@@ -5458,6 +6267,20 @@ void NetherCraftServer::sendChunksAround(std::shared_ptr<entity::Player> player,
     if (coords.empty()) return; // нечего слать - не спамим пустыми пачками
     if (maxChunks < 1) maxChunks = 1;
 
+    // CHUNK_ADAPT_V1: размер пачки больше не фиксирован. Смотрим, сколько байт реально
+    // висит в очереди отправки: канал свободен — шлём вдвое больше (прогрузка резче),
+    // канал забит — урезаем, чтобы не раздувать очередь и не топить важные пакеты.
+    auto conn = player->getConnection();
+    constexpr size_t kLinkFreeBytes = 256u * 1024u;  // очередь почти пуста
+    constexpr size_t kLinkBusyBytes = 1024u * 1024u; // клиент не успевает вычитывать
+    constexpr size_t kLinkStopBytes = 3u * 1024u * 1024u; // дальше только фоновая генерация
+    if (conn) {
+        const size_t pending = conn->pendingBytes();
+        if (pending < kLinkFreeBytes)      maxChunks = std::min(maxChunks * 2, 96);
+        else if (pending > kLinkBusyBytes) maxChunks = std::max(maxChunks / 2, 2);
+    }
+    bool linkSaturated = false; // CHUNK_ADAPT_V1
+
     // Chunk Batch Start (0x0D, empty)
     player->getConnection()->sendPacket(0x0D, std::vector<u8>{});
 
@@ -5466,6 +6289,13 @@ void NetherCraftServer::sendChunksAround(std::shared_ptr<entity::Player> player,
     for (const auto& cc : coords) {
         const i32 cx = cc.first;
         const i32 cz = cc.second; {
+            // CHUNK_ADAPT_V1: каждые 8 чанков сверяемся с реальной очередью. Если клиент не вычитывает —
+            // добивать его чанками бессмысленно и вредно: остаток уйдёт следующей пачкой.
+            if (!linkSaturated && conn && batchSize > 0 && (batchSize % 8) == 0
+                && conn->pendingBytes() > kLinkStopBytes) {
+                linkSaturated = true;
+            }
+            if (linkSaturated) { world_.requestChunkAsync(cx, cz); continue; } // CHUNK_ADAPT_V1
             if (batchSize >= maxChunks) { world_.requestChunkAsync(cx, cz); continue; } // PERF_ASYNC_V1: prefetch rest of view into pool // CLIENT_BATCH_V1: остальное - следующей пачкой
             // PERF_ASYNC_V1: prefer a live chunk, then one the background pool finished.
             auto chunk = world_.getChunk(cx, cz);
@@ -5584,9 +6414,7 @@ void NetherCraftServer::sendKeepAlive(std::shared_ptr<entity::Player> player) {
     auto now = std::chrono::steady_clock::now();
     i64 id = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
-    net::Buffer buf;
-    buf.writeI64(id);
-    player->getConnection()->sendPacket(0x26, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+    packets::sendKeepAlive(player, id); /* PACKETS_V18 */
     // KEEPALIVE_TIMEOUT_V1: храним ожидание ответа на самом игроке (без утекающего общего вектора)
     player->pendingKeepAliveId = id;
     player->awaitingKeepAlive = true;
@@ -5649,16 +6477,12 @@ static bool isSpectatorHiddenFrom(const entity::Player& target, const entity::Pl
 
 // CHUNKVIS_V1: таб-лист отдельно от спавна сущности — в тебе видны ВСЕ, а сущность спавнится только в радиусе
 static void mpSendPlayerInfo(const std::shared_ptr<entity::Player>& viewer, const std::shared_ptr<entity::Player>& target) {
-    net::Buffer info;
-    info.writeVarInt(0x1D); // MP_DUP_V1 fix: ADD_PLAYER | UPDATE_GAME_MODE | UPDATE_LISTED | UPDATE_LATENCY
-    info.writeVarInt(1);    // count
-    info.writeUUID(target->getUuid());
-    info.writeString(target->getName());
-    writeProfileProperties(info, *target); // SKIN_V1: skin + cape (online & offline)
-    info.writeVarInt(target->gameMode);
-    info.writeVarInt(1);    // listed = true
-    info.writeVarInt(0);    // latency
-    viewer->getConnection()->sendPacket(0x3E, std::vector<u8>(info.writtenSpan().begin(), info.writtenSpan().end()));
+    net::Buffer props;
+    writeProfileProperties(props, *target); // SKIN_V1: skin + cape (online & offline)
+    /* PACKETS_V21 */
+    viewer->getConnection()->sendPacket(packets::cb::PlayerInfoUpdate,
+        packets::buildPlayerInfoAdd(target->getUuid(), target->getName(),
+            props.writtenSpan(), target->gameMode, true, 0));
 }
 
 void NetherCraftServer::spawnPlayerFor(const std::shared_ptr<entity::Player>& viewer, const std::shared_ptr<entity::Player>& target) {
@@ -5705,10 +6529,7 @@ void NetherCraftServer::spawnPlayerFor(const std::shared_ptr<entity::Player>& vi
 
     // 3) Entity Head Rotation (0x48)
     {
-        net::Buffer hr;
-        hr.writeVarInt(eid);
-        hr.writeByte(yaw.value);
-        viewer->getConnection()->sendPacket(0x48, std::vector<u8>(hr.writtenSpan().begin(), hr.writtenSpan().end()));
+        packets::sendRotateHead(viewer, eid, yaw.value); /* PACKETS_V18 */
     }
 
     // EQUIP_V1: показать зрителю предмет в руке target
@@ -5716,21 +6537,19 @@ void NetherCraftServer::spawnPlayerFor(const std::shared_ptr<entity::Player>& vi
 
     // PLAYER_VIS_V1: синхронизировать позу/присед/спринт target для зрителя
     {
-        net::Buffer m;
-        buildEntityMeta(m, static_cast<i32>(target->getEntityId()), target->sneaking, target->sprinting,
-            target->displayedSkinParts, target->remainingFireTicks > 0, target->elytraFlying);
-        viewer->getConnection()->sendPacket(0x58, std::vector<u8>(m.writtenSpan().begin(), m.writtenSpan().end()));
+        /* PACKETS_V21 */
+        viewer->getConnection()->sendPacket(packets::cb::SetEntityMetadata,
+            packets::buildPlayerAppearance(static_cast<i32>(target->getEntityId()), target->sneaking,
+                target->sprinting, target->displayedSkinParts, target->remainingFireTicks > 0,
+                target->elytraFlying));
     }
 
     // SHIELD_V2: новый зритель должен видеть поднятый щит target
     if (target->usingShield) {
-        net::Buffer hsm;
-        hsm.writeVarInt(static_cast<i32>(target->getEntityId()));
-        hsm.writeByte(8);   // index 8: LivingEntity hand states
-        hsm.writeVarInt(0); // сериализатор 0: byte
-        hsm.writeByte(static_cast<u8>(0x01 | (target->usingShieldHand == 1 ? 0x02 : 0x00)));
-        hsm.writeByte(0xFF);
-        viewer->getConnection()->sendPacket(0x58, std::vector<u8>(hsm.writtenSpan().begin(), hsm.writtenSpan().end()));
+        /* PACKETS_V21 */
+        viewer->getConnection()->sendPacket(packets::cb::SetEntityMetadata,
+            packets::buildEntityHandStates(static_cast<i32>(target->getEntityId()), true,
+                target->usingShieldHand == 1));
     }
 }
 
@@ -5739,10 +6558,7 @@ void NetherCraftServer::despawnPlayerFor(const std::shared_ptr<entity::Player>& 
     if (!viewer || !target || viewer.get() == target.get()) return;
     if (!viewer->isAlive() || !viewer->playReady || viewer->getState() != entity::PlayerState::Play) return; // JOINSAFE_V1
     if (!viewer->removeVisibleEntity(target->getEntityId())) return; // CHUNKVIS_V1: и так не был виден — не шлём Remove
-    net::Buffer b;
-    b.writeVarInt(1);
-    b.writeVarInt(static_cast<i32>(target->getEntityId()));
-    viewer->getConnection()->sendPacket(0x42, std::vector<u8>(b.writtenSpan().begin(), b.writtenSpan().end()));
+    packets::sendRemoveEntity(viewer, static_cast<i32>(target->getEntityId())); /* PACKETS_V10 */
 }
 
 // PLAYER_VIS_V2: при смене спектаторства пересчитать видимость сущности в обе стороны
@@ -5751,28 +6567,17 @@ void NetherCraftServer::applyGameMode(const std::shared_ptr<entity::Player>& tar
     if (!target || mode < 0 || mode > 3) return;
     const i32 prevMode = target->gameMode; // PLAYER_VIS_V2
     target->gameMode = mode; // GM_V1
-    net::Buffer ge;
-    ge.writeByte(3); // событие 3 — смена игрового режима
-    ge.writeF32(static_cast<f32>(mode));
-    target->getConnection()->sendPacket(0x22, std::vector<u8>(ge.writtenSpan().begin(), ge.writtenSpan().end()));
+    packets::sendGameEvent(target, static_cast<u8>(3), static_cast<f32>(mode)); /* PACKETS_V10 */
     // PROTOCOL767_GUARD_V1: never send the invalid 0x38 ability packet.
     sendPlayerAbilities(target);
     { // GM3_FIX: обновляем режим в таб-листе (PlayerInfo UPDATE_GAME_MODE)
-        net::Buffer gi;
-        gi.writeByte(0x04); // EnumSet из 6 действий -> 1 байт; бит 2 = UPDATE_GAME_MODE
-        gi.writeVarInt(1);  // 1 запись
-        gi.writeUUID(target->getUuid());
-        gi.writeVarInt(mode); // новый режим
-        auto giv = std::vector<u8>(gi.writtenSpan().begin(), gi.writtenSpan().end());
-        for (auto& pp : getAllPlayersCopy()) if (pp && pp->isAlive()) pp->getConnection()->sendPacket(0x3E, giv);
+        const auto giv = packets::buildPlayerInfoGameMode(target->getUuid(), mode); /* PACKETS_V21 */
+        for (auto& pp : getAllPlayersCopy()) if (pp && pp->isAlive()) pp->getConnection()->sendPacket(packets::cb::PlayerInfoUpdate, giv);
     }
     refreshSpectatorVisibility(target, prevMode == 3, mode == 3); // PLAYER_VIS_V2
     { // PERMLEVEL_V2: пересылаем уровень прав — клиент мог проигнорировать событие на входе,
       // из-за чего F3+F4 ругался «недостаточно полномочий»
-        net::Buffer ev;
-        ev.writeI32(static_cast<i32>(target->getEntityId()));
-        ev.writeByte(static_cast<u8>(24 + nc::opLevelOf(config_.ops, target->getName())));
-        target->getConnection()->sendPacket(0x1F, std::vector<u8>(ev.writtenSpan().begin(), ev.writtenSpan().end()));
+        packets::sendEntityEvent(target, static_cast<i32>(target->getEntityId()), static_cast<u8>(static_cast<u8>(24 + nc::opLevelOf(config_.ops, target->getName())))); /* PACKETS_V10 */
     }
 }
 
@@ -5814,16 +6619,16 @@ void NetherCraftServer::broadcastHeldEquipment(const std::shared_ptr<entity::Pla
 // PLAYER_VIS_V1: разослать метаданные (присед/спринт/поза) остальным игрокам
 void NetherCraftServer::broadcastEntityMeta(const std::shared_ptr<entity::Player>& player) {
     if (!player) return;
-    net::Buffer m;
-    buildEntityMeta(m, static_cast<i32>(player->getEntityId()), player->sneaking, player->sprinting,
-        player->displayedSkinParts, player->remainingFireTicks > 0, player->elytraFlying);
+    /* PACKETS_V21 */
+    const auto bytes = packets::buildPlayerAppearance(static_cast<i32>(player->getEntityId()),
+        player->sneaking, player->sprinting, player->displayedSkinParts,
+        player->remainingFireTicks > 0, player->elytraFlying);
     // ELYTRA_FIX_V3: the owner must receive the same state transition too.
     // Without the clearing update after landing/removing the elytra, a client keeps
     // Pose.FALL_FLYING but loses shared flag 7 and deliberately renders crawling.
-    const auto bytes = std::vector<u8>(m.writtenSpan().begin(), m.writtenSpan().end());
     for (auto& viewer : getAllPlayersCopy())
         if (viewer && viewer->isAlive() && viewer->playReady && viewer->getState() == entity::PlayerState::Play && viewer->getConnection()) // JOINSAFE_V1
-            viewer->getConnection()->sendPacket(0x58, bytes);
+            viewer->getConnection()->sendPacket(packets::cb::SetEntityMetadata, bytes);
 }
 
 void NetherCraftServer::onPlayerEnterPlay(const std::shared_ptr<entity::Player>& player) {
@@ -5842,17 +6647,18 @@ void NetherCraftServer::onPlayerEnterPlay(const std::shared_ptr<entity::Player>&
         if (other.get() == player.get()) continue;
         if (other->getState() != entity::PlayerState::Play) continue;
         if (!other->isAlive()) continue;
-        spawnPlayerFor(player, other); // п��казать уже находящегося в игре — новичку
+        spawnPlayerFor(player, other); // показать уже находящегося в игре — новичку
         spawnPlayerFor(other, player); // показать новичка — тому, кто уже в игре
     }
     // SELFSKIN_V1: отправить игроку метаданные ЕГО СОБСТВЕННОЙ сущности (index 17).
     // Клиент рендерит свою модель в F5 по synched-metadata, а не по локальным опциям,
     // поэтому без этого пакета плащ/шапка/слои на себе не видны (в одиночке их синкает встроенный сервер).
     {
-        net::Buffer sm;
-        buildEntityMeta(sm, static_cast<i32>(player->getEntityId()), player->sneaking, player->sprinting,
-            player->displayedSkinParts, player->remainingFireTicks > 0, player->elytraFlying);
-        player->getConnection()->sendPacket(0x58, std::vector<u8>(sm.writtenSpan().begin(), sm.writtenSpan().end()));
+        /* PACKETS_V21 */
+        player->getConnection()->sendPacket(packets::cb::SetEntityMetadata,
+            packets::buildPlayerAppearance(static_cast<i32>(player->getEntityId()), player->sneaking,
+                player->sprinting, player->displayedSkinParts, player->remainingFireTicks > 0,
+                player->elytraFlying));
     }
     // ENTITIES_V1: показать новичку уже заспавненные не-игроковые сущности
     {
@@ -5876,6 +6682,41 @@ void NetherCraftServer::onPlayerEnterPlay(const std::shared_ptr<entity::Player>&
         std::vector<ItemDrop> copy;
         { std::lock_guard lk(itemDropsMutex_); copy = itemDrops_; }
         for (auto& d : copy) sendItemDropSpawnTo(player, d.eid, d.itemId, d.count, d.x, d.y, d.z, 0.0, 0.0, 0.0);
+    }
+    // SIGNSEND_V1: показать новичку текст всех табличек мира
+    {
+        std::vector<std::pair<u64, std::array<std::string, 4>>> scopy;
+        { std::lock_guard<std::mutex> lk(g_signMutex); scopy.assign(g_signText.begin(), g_signText.end()); }
+        for (const auto& sg : scopy) {
+            i32 sgx = 0, sgy = 0, sgz = 0;
+            decodeBlockPos(sg.first, sgx, sgy, sgz);
+            player->getConnection()->sendPacket(0x07, buildSignBeData(sgx, sgy, sgz, sg.second));
+        }
+    }
+    // VEHSEND_V1: spawnVehicle() only broadcast at creation time, so after a restart
+    // boats and minecarts existed on the server but no client was ever told about them.
+    {
+        std::vector<VehicleMotion> vcopy;
+        { std::lock_guard lk(vehiclesMutex_); vcopy = vehicles_; }
+        for (const auto& v : vcopy) {
+            const u8 vYawByte = yawToAngleByte(v.yaw);
+            net::Buffer vs;
+            vs.writeVarInt(v.eid);
+            vs.writeUUID(UUID{static_cast<u64>(v.eid), 0x76000000ULL + static_cast<u64>(v.eid)});
+            vs.writeVarInt(v.typeId);
+            vs.writeF64(v.x); vs.writeF64(v.y); vs.writeF64(v.z);
+            vs.writeByte(0); vs.writeByte(vYawByte); vs.writeByte(vYawByte);
+            vs.writeVarInt(0);
+            vs.writeI16(0); vs.writeI16(0); vs.writeI16(0);
+            player->getConnection()->sendPacket(0x01, std::vector<u8>(vs.writtenSpan().begin(), vs.writtenSpan().end()));
+            if ((v.typeId == kBoatTypeId || v.typeId == kChestBoatTypeId) && v.variant > 0) {
+                /* PACKETS_V21 */
+                player->getConnection()->sendPacket(packets::cb::SetEntityMetadata,
+                    packets::buildBoatVariant(v.eid, v.variant));
+            }
+            if (v.passengerEid != 0)
+                player->getConnection()->sendPacket(0x5F, packets::buildSetPassengers(v.eid, v.passengerEid));
+        }
     }
     // FALLING_V1: поздно вошедший клиент должен увидеть уже падающие блоки.
     {
@@ -5924,7 +6765,7 @@ void NetherCraftServer::onPlayerEnterPlay(const std::shared_ptr<entity::Player>&
 // число онлайн всегда показываем в header/footer пакетом 0x6D, его список ников клиент не ограничивает.
 // ============================================================
 void NetherCraftServer::broadcastTabListHeaderFooter() {
-    // TABLIST_OPT_V1: троттлинг до 1 раза/с. Косметический header/footer не нужен ��а 20 Гц,
+    // TABLIST_OPT_V1: троттлинг до 1 раза/с. Косметический header/footer не нужен на 20 Гц,
     // а при churn (join/leave каждый тик) рассылка на всех = O(n^2) шторм
     // (профайлер поймал фазу tabList-broadcast как виновника). Перевзводим dirty, чтобы не потерять апдейт.
     static u64 s_lastBcastTick = 0;
@@ -5997,16 +6838,7 @@ void NetherCraftServer::broadcastTabListHeaderFooter() {
         footer += extra;
     }
 
-    auto writeNbtText = [](net::Buffer& buf, const std::string& text) {
-        buf.writeByte(0x08); // TAG_String
-        buf.writeU16(static_cast<u16>(text.size()));
-        buf.writeBytes(std::span<const u8>(reinterpret_cast<const u8*>(text.data()), text.size()));
-    };
-
-    net::Buffer buf;
-    writeNbtText(buf, header);
-    writeNbtText(buf, footer);
-    std::vector<u8> payload(buf.writtenSpan().begin(), buf.writtenSpan().end());
+    std::vector<u8> payload = packets::buildTabListHeaderFooter(header, footer); /* PACKETS_V20 */
     // TABLIST_V2: even with unchanged payload, a freshly joined or duplicate-login
     // player must receive header/footer again; otherwise it looks "disabled".
     static std::vector<u8> s_lastPayload;
@@ -6041,24 +6873,13 @@ void NetherCraftServer::applyEnvironmentalDamage(const std::shared_ptr<entity::P
     player->health = std::max(0.0f, player->health - damage);
     const i32 eid = static_cast<i32>(player->getEntityId());
 
-    net::Buffer damageEvent;
-    damageEvent.writeVarInt(eid);
-    damageEvent.writeVarInt(damageTypeId);
-    damageEvent.writeVarInt(0); // source cause absent
-    damageEvent.writeVarInt(0); // direct source absent
-    damageEvent.writeBool(false);
-    auto damageBytes = std::vector<u8>(damageEvent.writtenSpan().begin(), damageEvent.writtenSpan().end());
+    auto damageBytes = packets::buildDamageEvent(eid, damageTypeId); /* PACKETS_V18 */
     for (auto& target : getAllPlayersCopy()) {
         if (target && target->isAlive() && target->getState() == entity::PlayerState::Play)
             target->getConnection()->sendPacket(0x1A, damageBytes);
     }
 
-    net::Buffer health;
-    health.writeF32(player->health);
-    health.writeVarInt(20);
-    health.writeF32(5.0f);
-    player->getConnection()->sendPacket(0x5D,
-        std::vector<u8>(health.writtenSpan().begin(), health.writtenSpan().end()));
+    packets::sendSetHealth(player, player->health, 20, 5.0f); /* PACKETS_V10 */
 
     if (player->health <= 0.0f) {
         // Ставим terminal state ДО сетевых пакетов: параллельный/следующий env tick
@@ -6073,18 +6894,12 @@ void NetherCraftServer::applyEnvironmentalDamage(const std::shared_ptr<entity::P
 
         // Снять ON_FIRE сразу, иначе death-screen продолжает рисовать горящую модель.
         if (player->fireFlagSynced) {
-            net::Buffer fm;
-            fm.writeVarInt(eid);
-            fm.writeByte(0); fm.writeVarInt(0);
-            u8 flags = 0;
-            if (player->sneaking) flags |= 0x02;
-            if (player->sprinting) flags |= 0x08;
-            fm.writeByte(flags);
-            fm.writeByte(0xFF);
-            auto fv = std::vector<u8>(fm.writtenSpan().begin(), fm.writtenSpan().end());
+            /* PACKETS_V21 */
+            const auto fv = packets::buildEntitySharedFlags(eid,
+                packets::sharedFlagsByte(false, player->sneaking, player->sprinting, false));
             for (auto& target : getAllPlayersCopy())
                 if (target && target->isAlive() && target->getState() == entity::PlayerState::Play)
-                    target->getConnection()->sendPacket(0x58, fv);
+                    target->getConnection()->sendPacket(packets::cb::SetEntityMetadata, fv);
             player->fireFlagSynced = false;
         }
 
@@ -6172,7 +6987,7 @@ void NetherCraftServer::applyFallDamage(const std::shared_ptr<entity::Player>& p
                 }
             }
             if (fallDistance > 3.0) {
-                // FALLSOFT_V1: блок приз��мления влияет на урон (см. core/item_blocks.gen.hpp)
+                // FALLSOFT_V1: блок приземления влияет на урон (см. core/item_blocks.gen.hpp)
                 const i32 px = static_cast<i32>(std::floor(player->getX()));
                 const i32 pz = static_cast<i32>(std::floor(player->getZ()));
                 const i32 feet   = world_.getBlock(px, static_cast<i32>(std::floor(newY - 0.2)), pz);
@@ -6190,7 +7005,7 @@ void NetherCraftServer::applyFallDamage(const std::shared_ptr<entity::Player>& p
                     auto q = [](f64 v) { return static_cast<i16>(std::clamp(v * 8000.0, -32000.0, 32000.0)); };
                     net::Buffer vb; vb.writeVarInt(static_cast<i32>(player->getEntityId()));
                     vb.writeI16(0); vb.writeI16(q(up)); vb.writeI16(0);
-                    player->getConnection()->sendPacket(0x5A, std::vector<u8>(vb.writtenSpan().begin(), vb.writtenSpan().end()));
+                    player->getConnection()->sendPacket(0x5A, std::vector<u8>(vb.writtenSpan().begin(), vb.writtenSpan().end()), true); /* NETQUEUE_V1: эфемерный апдейт */
                     dmgF = 0.0;
                 } else if (soft) {
                     dmgF = 0.0;
@@ -6354,9 +7169,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             if (actionId == 1) { // STATS_V8: Award Statistics (0x04) — ответ на открытие экрана
                 // статистики в меню паузы. Сервер не ведёт счётчики — отдаём пустой
                 // корректный список, чтобы экран открывался, а не вис на загрузке.
-                net::Buffer st;
-                st.writeVarInt(0);
-                player->getConnection()->sendPacket(0x04, std::vector<u8>(st.writtenSpan().begin(), st.writtenSpan().end()));
+                packets::sendAwardStatistics(player);
             }
             if (actionId == 0) {
                 // COMBAT_V1: полноценный респавн после смерти — Respawn (0x47) + сброс здоровья.
@@ -6382,30 +7195,22 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     rs.writeVarInt(0);                      // dimension type (holder index 0 = overworld)
                     rs.writeString("minecraft:overworld"); // dimension name
                     rs.writeI64(config_.levelSeed);         // hashed seed
-                    rs.writeByte((i8)player->gameMode);     // game mode
-                    rs.writeByte(-1);                       // previous game mode
+                    rs.writeByte(static_cast<u8>(player->gameMode));     // game mode
+                    rs.writeByte(static_cast<u8>(0xFF));                       // previous game mode
                     rs.writeBool(false);                    // is debug
-                    rs.writeBool(true);                     // is flat
+                    rs.writeBool(isFlatGenerator(config_.generator)); // is flat (FLATFLAG_V1)
                     rs.writeBool(false);                    // has death location
                     rs.writeVarInt(0);                      // portal cooldown
                     rs.writeByte(0x03);                     // data kept: attributes + metadata
                     player->getConnection()->sendPacket(0x47, std::vector<u8>(rs.writtenSpan().begin(), rs.writtenSpan().end()));
                 }
                 { // RESPAWN_V2: Game Event 13 «start waiting for level chunks» — без него клиент висит на «Loading terrain» до таймаута
-                    net::Buffer ge;
-                    ge.writeByte(13);
-                    ge.writeF32(0.0f);
-                    player->getConnection()->sendPacket(0x22, std::vector<u8>(ge.writtenSpan().begin(), ge.writtenSpan().end()));
+                    packets::sendGameEvent(player, static_cast<u8>(13), 0.0f); /* PACKETS_V10 */
                 }
-                { // TITLES_V8: Clear Titles (0x0F) — ванильный респавн сбрасывает титры
-                    net::Buffer ct;
-                    ct.writeBool(true); // reset
-                    player->getConnection()->sendPacket(0x0F, std::vector<u8>(ct.writtenSpan().begin(), ct.writtenSpan().end()));
-                }
-                if (player->inCombat) { // COMBAT_V8: End Combat Event (0x3A) после смерти/респавна
-                    net::Buffer ec;
-                    ec.writeVarInt(0);
-                    player->getConnection()->sendPacket(0x3A, std::vector<u8>(ec.writtenSpan().begin(), ec.writtenSpan().end()));
+                // TITLES_V8: ванильный респавн сбрасывает титры
+                packets::sendClearTitles(player, /*resetTimes=*/true);
+                if (player->inCombat) { // COMBAT_V8: End Combat Event после смерти/респавна
+                    packets::sendEndCombat(player, 0);
                     player->inCombat = false;
                     player->combatStartMs = 0;
                 }
@@ -6413,8 +7218,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 player->openWindowId = 0;  // RESPAWN_V2: окно контейнера на клиенте закрыто после смерти
                 player->setPosition(g_spawnX + 0.5, (f64)g_spawnY, g_spawnZ + 0.5);
                 sendPlayerPositionAndLook(player);
-                { net::Buffer uh; uh.writeF32(20.0f); uh.writeVarInt(20); uh.writeF32(5.0f);
-                  player->getConnection()->sendPacket(0x5D, std::vector<u8>(uh.writtenSpan().begin(), uh.writtenSpan().end())); }
+                { packets::sendSetHealth(player, 20.0f, 20, 5.0f); /* PACKETS_V10 */ }
                 syncExperienceBar(player);
                 sendTimeUpdate(player); // TIMESYNC_V1: Respawn сбрасывает время суток у клиента — синхронизируем заново
                 streamChunks(player);
@@ -6435,19 +7239,14 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     player->getConnection()->sendPacket(0x13, std::vector<u8>(inv.writtenSpan().begin(), inv.writtenSpan().end()));
                 }
                 { // PERMLEVEL_V2: после респавна пересылаем уровень прав (фикс F3+F4 «недостаточно полномочий»)
-                    net::Buffer ev;
-                    ev.writeI32(static_cast<i32>(player->getEntityId()));
-                    ev.writeByte(static_cast<u8>(24 + nc::opLevelOf(config_.ops, player->getName())));
-                    player->getConnection()->sendPacket(0x1F, std::vector<u8>(ev.writtenSpan().begin(), ev.writtenSpan().end()));
+                    packets::sendEntityEvent(player, static_cast<i32>(player->getEntityId()), static_cast<u8>(static_cast<u8>(24 + nc::opLevelOf(config_.ops, player->getName())))); /* PACKETS_V10 */
                 }
             }
             break;
         }
         case 0x21: { // ESSENTIALS_V1: Ping Request (play) -> Ping Response (clientbound 0x36)
             i64 pingId = data.readI64();
-            net::Buffer pr;
-            pr.writeI64(pingId);
-            player->getConnection()->sendPacket(0x36, std::vector<u8>(pr.writtenSpan().begin(), pr.writtenSpan().end()));
+            packets::sendPongResponse(player, pingId); /* PACKETS_V18 */
             break;
         }
         case 0x23: { // ESSENTIALS_V1: Player Abilities — клиент тогглит полёт (0x02 = is flying)
@@ -6466,10 +7265,11 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             (void)data.readBool();           // server listing
             // обновить свою модель (self) + разослать остальным
             {
-                net::Buffer sm;
-                buildEntityMeta(sm, static_cast<i32>(player->getEntityId()), player->sneaking, player->sprinting,
-                    player->displayedSkinParts, player->remainingFireTicks > 0, player->elytraFlying);
-                player->getConnection()->sendPacket(0x58, std::vector<u8>(sm.writtenSpan().begin(), sm.writtenSpan().end()));
+                /* PACKETS_V21 */
+                player->getConnection()->sendPacket(packets::cb::SetEntityMetadata,
+                    packets::buildPlayerAppearance(static_cast<i32>(player->getEntityId()), player->sneaking,
+                        player->sprinting, player->displayedSkinParts, player->remainingFireTicks > 0,
+                        player->elytraFlying));
             }
             broadcastEntityMeta(player);
             break;
@@ -6489,6 +7289,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             if (vehicleAttack(player, targetEid)) break;
             if (mobAttack(player, targetEid)) break; // MOBS_V1: урон и дроп животным
             if (player->gameMode == 3) break;  // спектатор не бьёт
+            if (!config_.pvp) break;           // SETTINGS_V10: pvp=false теперь действительно гасит удары по игрокам
             std::shared_ptr<entity::Player> victim;
             for (auto& p : getAllPlayersCopy()) {
                 if (p && p.get() != player.get() && static_cast<i32>(p->getEntityId()) == targetEid) { victim = p; break; }
@@ -6526,7 +7327,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             if (!victim->isAlive() || victim->getState() != entity::PlayerState::Play) break;
             if (victim->dead) break;
             if (victim->gameMode == 1 || victim->gameMode == 3) break; // креатив/спектатор неуязвимы
-            if (victim->respawnInvulnerabilityTicks > 0) break; // RESPAWN_INVULN_V1: PvP то��е блокируется
+            if (victim->respawnInvulnerabilityTicks > 0) break; // RESPAWN_INVULN_V1: PvP тоже блокируется
             const i32 vEid = static_cast<i32>(victim->getEntityId());
             // COMBAT_V2: урон зависит от предмета в руке + ванильный кулдаун атаки
             f32 baseDmg = 1.0f, atkSpeed = 4.0f;
@@ -6599,11 +7400,11 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             if (!blocked) { // COMBAT_V8: Enter Combat Event (0x3B) — ванильный вход в бой
                 if (!victim->inCombat) {
                     victim->inCombat = true;
-                    victim->getConnection()->sendPacket(0x3B, std::vector<u8>{});
+                    packets::sendEnterCombat(victim);
                 }
                 if (!player->inCombat) {
                     player->inCombat = true;
-                    player->getConnection()->sendPacket(0x3B, std::vector<u8>{});
+                    packets::sendEnterCombat(player);
                 }
                 victim->combatStartMs = victim->combatStartMs ? victim->combatStartMs : nowMs;
                 player->combatStartMs = player->combatStartMs ? player->combatStartMs : nowMs;
@@ -6611,24 +7412,15 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             victim->health -= dmg;
             if (victim->health < 0.0f) victim->health = 0.0f;
             if (!blocked) { // SOUND_V8: Entity Sound Effect (0x67) — звук боли привязан к сущности
-                net::Buffer es;
-                es.writeVarInt(0);                                  // inline sound holder
-                es.writeString("minecraft:entity.player.hurt");
-                es.writeBool(false);                                // no fixed range
-                es.writeVarInt(7);                                  // sound category: players (SoundSource ordinal 7)
-                es.writeVarInt(vEid);
-                es.writeF32(1.0f);
-                es.writeF32(1.0f);
-                es.writeI64(static_cast<i64>(nowMs));
-                auto esv = std::vector<u8>(es.writtenSpan().begin(), es.writtenSpan().end());
                 for (auto& p : getAllPlayersCopy())
                     if (p && p->isAlive() && p->getState() == entity::PlayerState::Play)
-                        p->getConnection()->sendPacket(0x67, esv);
+                        packets::sendEntitySoundEffect(p, "minecraft:entity.player.hurt",
+                            packets::SoundCategory::Players, vEid, 1.0f, 1.0f,
+                            static_cast<i64>(nowMs));
             }
-            if (victim->health <= 0.0f && victim->inCombat) { // COMBAT_V8: End Combat Event (0x3A)
-                net::Buffer ec;
-                ec.writeVarInt(static_cast<i32>(std::max<i64>(0, (nowMs - victim->combatStartMs) / 50)));
-                victim->getConnection()->sendPacket(0x3A, std::vector<u8>(ec.writtenSpan().begin(), ec.writtenSpan().end()));
+            if (victim->health <= 0.0f && victim->inCombat) { // COMBAT_V8: End Combat Event
+                packets::sendEndCombat(victim,
+                    static_cast<i32>(std::max<i64>(0, (nowMs - victim->combatStartMs) / 50)));
                 victim->inCombat = false;
                 victim->combatStartMs = 0;
             }
@@ -6666,18 +7458,14 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             }
             if (victim->health <= 0.0f && !victim->dead) {
                 victim->dead = true;
-                { net::Buffer uh; uh.writeF32(0.0f); uh.writeVarInt(20); uh.writeF32(5.0f);
-                  victim->getConnection()->sendPacket(0x5D, std::vector<u8>(uh.writtenSpan().begin(), uh.writtenSpan().end())); }
-                { net::Buffer dc; dc.writeVarInt(vEid); // Death Combat Event (0x3C)
-                  writeTextComponent(dc, std::format("{} был убит игроком {}", victim->getName(), player->getName()));
-                  victim->getConnection()->sendPacket(0x3C, std::vector<u8>(dc.writtenSpan().begin(), dc.writtenSpan().end())); }
+                { packets::sendSetHealth(victim, 0.0f, 20, 5.0f); /* PACKETS_V10 */ }
+                { packets::sendDeathCombatEvent(victim, vEid, std::format("{} был убит игроком {}", victim->getName(), player->getName())); /* PACKETS_V15 */ }
                 for (auto& p : getAllPlayersCopy())
                     if (p && p->isAlive())
                         p->sendSystemMessage(std::format("§e{} §7был убит игроком §e{}", victim->getName(), player->getName()));
                 for (auto& pp : getAllPlayersCopy()) despawnPlayerFor(pp, victim); // DEATHVIS_V1: труп не должен стоять столбом у других
             } else {
-                net::Buffer uh; uh.writeF32(victim->health); uh.writeVarInt(20); uh.writeF32(5.0f);
-                victim->getConnection()->sendPacket(0x5D, std::vector<u8>(uh.writtenSpan().begin(), uh.writtenSpan().end()));
+                packets::sendSetHealth(victim, victim->health, 20, 5.0f); /* PACKETS_V10 */
             }
             break;
         }
@@ -6686,7 +7474,15 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             // CHUNK_THROUGHPUT_V3: honor the client's pacing request for fast streaming.
             i32 budget = static_cast<i32>(desired * 6.0f); // PERF_ASYNC_V2: was *5
             if (budget < 8) budget = 8;    // PERF_ASYNC_V2: higher floor (was 4)
-            if (budget > 64) budget = 64;  // PERF_ASYNC_V2: higher ceiling (was 24)
+            // CHUNK_ADAPT_V1: потолок теперь зависит от того, успел ли клиент разобрать прошлую пачку.
+            // На быстром канале (очередь пуста) разрешаем вдвое больше, на тормозном — жёстко режем.
+            i32 budgetCap = 64;
+            if (auto c = player->getConnection()) {
+                const size_t pending = c->pendingBytes();
+                if (pending < 256u * 1024u)       budgetCap = 128;
+                else if (pending > 1024u * 1024u) budgetCap = 16;
+            }
+            if (budget > budgetCap) budget = budgetCap;
             i32 vcx = player->getViewCenterX();
             i32 vcz = player->getViewCenterZ();
             i32 vr = config_.viewDistance;
@@ -6822,6 +7618,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             std::string tok;
             while (iss >> tok) args.push_back(tok);
             const std::string cmd = args.empty() ? std::string() : args[0];
+            nc::log::commandLine(player->getName(), "/" + command); // CMDLOG_V2
             // CRASHCTX_V1: record what's about to run on THIS connection's thread so
             // that if it crashes, the crash report can say exactly which command (and
             // whose) caused it — "source" defaults to core since there are no plugins
@@ -6872,8 +7669,15 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 std::abort();
             } else if (cmd == "stop") { // STOPCMD_V1: остановка из игры (только оператор)
                 if (!op) { needOp(); break; }
-                NC_INFO("Server", "/stop от {}: остана��ливаю сервер", player->getName());
+                NC_INFO("Server", "/stop от {}: останавливаю сервер", player->getName());
                 queueConsoleCommand("stop"); // выполнится на tick-потоке, а не на сетевом
+            } else if (cmd == "save" || cmd == "save-all") { // SAVECMD_V1: ручное сохранение из игры (только оператор)
+                if (!op) { needOp(); break; }
+                // Сохранение занимает секунды, а сюда мы пришли с сетевого потока:
+                // как и /stop, отдаём работу tick-потоку, иначе подвиснет соединение.
+                NC_INFO("Server", "/{} от {}: сохраняю мир", cmd, player->getName());
+                player->sendSystemMessage("§7Сохраняю мир и данные игроков...");
+                queueConsoleCommand("save-all"); // выполнится на tick-потоке
             } else if (cmd == "reload") { // SOFTRELOAD_V1: мягкий рестарт из игры (только оператор)
                 if (!op) { needOp(); break; }
                 queueConsoleCommand("reload"); // выполнится на tick-потоке
@@ -6883,12 +7687,36 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 player->sendSystemMessage("§6/time set <day|night|тики> /weather <clear|rain|thunder>");
                 player->sendSystemMessage("§6/say <текст> /setblock <x y z блок> /kick <ник>");
                 player->sendSystemMessage("§6/skin <ник> — скин лицензионного игрока, /skin reset — вернуть свой"); // SKINCMD_V1
+                if (!config_.xboxAuth) // CAPEEULA_V1
+                player->sendSystemMessage("§6/cape <id> — плащ minecraft.net, /cape off — снять, /capes — список"); // CAPE_V1
                 player->sendSystemMessage("§6/summon <pig|zombie|cow|sheep|creeper|skeleton|id> [кол-во] /killall");
                 player->sendSystemMessage("§c/stop — остановка, /reload — мягкий рестарт (только оператор)"); // STOPCMD_V1 + SOFTRELOAD_V1
+                player->sendSystemMessage("§c/save или /save-all — сохранить мир сейчас (только оператор)"); // SAVECMD_V1
                 player->sendSystemMessage("§c/crash — намеренный тестовый краш сервера (только оператор)"); // CRASHTEST_V1
             } else if (cmd == "skin") { // SKINCMD_V1: скин любого лицензионного ника для пиратов в офлайн-моде
                 if (args.size() < 2) { player->sendSystemMessage("§cИспользование: /skin <ник с лицензией> или /skin reset"); break; }
                 const std::string want = args[1];
+                // CAPE_V1: если надет плащ, первый /skin reset только предупреждает.
+                if (want == "reset") {
+                    const std::string curCape = ncCapeOf(player->getName());
+                    if (!curCape.empty()) {
+                        const auto nowTp = std::chrono::steady_clock::now();
+                        std::unique_lock<std::mutex> lkReset(g_ncCapeMutex);
+                        auto pend = g_ncSkinResetPending.find(player->getName());
+                        if (pend == g_ncSkinResetPending.end() || nowTp - pend->second > std::chrono::seconds(15)) {
+                            g_ncSkinResetPending[player->getName()] = nowTp;
+                            lkReset.unlock();
+                            const NcCape* wornCape = ncFindCape(curCape);
+                            player->sendSystemMessage(std::format(
+                                "§eНа тебе плащ §6{}§e. Введи §6/skin reset§e ещё раз в течение 15 секунд — сбросится и скин, и плащ.",
+                                wornCape ? wornCape->title : curCape.c_str()));
+                            player->sendSystemMessage("§7Надеть плащ снова: §6/cape " + curCape);
+                            break;
+                        }
+                        g_ncSkinResetPending.erase(player->getName());
+                        g_ncCapeByPlayer.erase(player->getName());
+                    }
+                }
                 std::string texVal, texSig;
                 if (want == "reset") {
                     // вернуть скин по собственному нику (не премиум — Стив/Алекс)
@@ -6899,6 +7727,15 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 }
                 player->texturesValue     = texVal;
                 player->texturesSignature = texSig;
+                { // CAPE_V1: новый скин не должен снимать надетый плащ
+                    const std::string keepCape = ncCapeOf(player->getName());
+                    if (!keepCape.empty()) {
+                        if (const NcCape* kc = ncFindCape(keepCape)) {
+                            player->texturesValue = ncApplyCapeToTextures(player->texturesValue, ncCapeUrl(*kc), player->getName());
+                            player->texturesSignature.clear();
+                        }
+                    }
+                }
                 { // всем: убрать запись из таба (клиент кеширует скин по uuid) и пересоздать сущность
                     net::Buffer rm;
                     rm.writeVarInt(1);
@@ -6912,28 +7749,25 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         spawnPlayerFor(other, player); // info-add с новыми текстурами + спавн сущности
                     }
                 }
-                // сам игрок увидит свой новый скин только после Respawn (data kept) — как у SkinsRestorer
                 mpSendPlayerInfo(player, player); // вернуть себя в таб уже с новым скином
                 {
                     net::Buffer rs;
                     rs.writeVarInt(dimTypeIndex(player->dimension));   // DIMRESPAWN_V1
                     rs.writeString(dimIdName(player->dimension));
                     rs.writeI64(config_.levelSeed);
-                    rs.writeByte((i8)player->gameMode);
-                    rs.writeByte(-1);
+                    rs.writeByte(static_cast<u8>(player->gameMode));
+                    rs.writeByte(static_cast<u8>(0xFF));
                     rs.writeBool(false);
-                    rs.writeBool(player->dimension == 0);             // is flat
+                    rs.writeBool(player->dimension == 0 && isFlatGenerator(config_.generator)); // is flat (FLATFLAG_V1)
                     rs.writeBool(false);
                     rs.writeVarInt(0);
                     rs.writeByte(0x03);                     // data kept: attributes + metadata
                     player->getConnection()->sendPacket(0x47, std::vector<u8>(rs.writtenSpan().begin(), rs.writtenSpan().end()));
                 }
-                { net::Buffer ge; ge.writeByte(13); ge.writeF32(0.0f); // start waiting for level chunks
-                  player->getConnection()->sendPacket(0x22, std::vector<u8>(ge.writtenSpan().begin(), ge.writtenSpan().end())); }
+                { packets::sendGameEvent(player, static_cast<u8>(13), 0.0f); /* PACKETS_V10 */ }
                 player->clearSeenChunks();          // клиент выбросил чанки после Respawn
                 sendPlayerPositionAndLook(player);  // остаёмся на том же месте — без телепорта на спавн
-                { net::Buffer uh; uh.writeF32(player->health); uh.writeVarInt(20); uh.writeF32(5.0f);
-                  player->getConnection()->sendPacket(0x5D, std::vector<u8>(uh.writtenSpan().begin(), uh.writtenSpan().end())); }
+                { packets::sendSetHealth(player, player->health, 20, 5.0f); /* PACKETS_V10 */ }
                 syncExperienceBar(player);
                 sendTimeUpdate(player);
                 streamChunks(player);
@@ -6954,6 +7788,129 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     player->getConnection()->sendPacket(0x13, std::vector<u8>(inv.writtenSpan().begin(), inv.writtenSpan().end()));
                 }
                 player->sendSystemMessage(want == "reset" ? std::string("§aСкин сброшен") : std::format("§aСкин игрока {} применён", want));
+            } else if (cmd == "cape") { // CAPE_V1
+                if (config_.xboxAuth) { // CAPEEULA_V1: online-mode -> плащи запрещены
+                    player->sendSystemMessage("§cПлащи недоступны: сервер работает в онлайн-режиме (online-mode=true)");
+                    player->sendSystemMessage("§7Выдача чужих плащей лицензионным аккаунтам нарушает Minecraft EULA.");
+                    break;
+                }
+                if (args.size() < 2) {
+                    player->sendSystemMessage("§cИспользование: §e/cape <id>§c или §e/cape off");
+                    ncSendClickableLine(player, "§7Список плащей: ",
+                        { NcClickPart{ "[/capes]", "gold", "/capes", "§7открыть список" } });
+                    break;
+                }
+                const std::string capeArg = args[1];
+                const bool capeOff = (capeArg == "off" || capeArg == "none" || capeArg == "reset" || capeArg == "снять");
+                std::string capeUrl, capeTitle, capeId;
+                if (!capeOff) {
+                    const NcCape* found = ncFindCape(capeArg);
+                    if (!found) {
+                        player->sendSystemMessage(std::format("§cПлащ «{}» не найден", capeArg));
+                        ncSendClickableLine(player, "§7Список плащей: ",
+                            { NcClickPart{ "[/capes]", "gold", "/capes", "§7открыть список" } });
+                        break;
+                    }
+                    capeId = found->id; capeTitle = found->title; capeUrl = ncCapeUrl(*found);
+                }
+                if (capeOff && ncCapeOf(player->getName()).empty()) { player->sendSystemMessage("§eПлащ и так не надет"); break; }
+                player->texturesValue = ncApplyCapeToTextures(player->texturesValue, capeUrl, player->getName());
+                player->texturesSignature.clear(); // текстуры изменены — подпись Mojang больше не подходит (online-mode=off)
+                {
+                    std::lock_guard<std::mutex> lkCape(g_ncCapeMutex);
+                    g_ncSkinResetPending.erase(player->getName());
+                    if (capeOff) g_ncCapeByPlayer.erase(player->getName());
+                    else g_ncCapeByPlayer[player->getName()] = capeId;
+                }
+                { // всем: убрать запись из таба (клиент кеширует скин по uuid) и пересоздать сущность
+                    net::Buffer rm;
+                    rm.writeVarInt(1);
+                    rm.writeUUID(player->getUuid());
+                    auto rmv = std::vector<u8>(rm.writtenSpan().begin(), rm.writtenSpan().end());
+                    for (auto& other : getAllPlayersCopy()) {
+                        if (!other || !other->isAlive() || other->getState() != entity::PlayerState::Play) continue;
+                        other->getConnection()->sendPacket(0x3D, rmv); // Player Info Remove
+                        if (other.get() == player.get()) continue;
+                        despawnPlayerFor(other, player);
+                        spawnPlayerFor(other, player); // info-add с новыми текстурами + спавн сущности
+                    }
+                }
+                mpSendPlayerInfo(player, player); // вернуть себя в таб уже с новым скином
+                {
+                    net::Buffer rs;
+                    rs.writeVarInt(dimTypeIndex(player->dimension));   // DIMRESPAWN_V1
+                    rs.writeString(dimIdName(player->dimension));
+                    rs.writeI64(config_.levelSeed);
+                    rs.writeByte(static_cast<u8>(player->gameMode));
+                    rs.writeByte(static_cast<u8>(0xFF));
+                    rs.writeBool(false);
+                    rs.writeBool(player->dimension == 0 && isFlatGenerator(config_.generator)); // is flat (FLATFLAG_V1)
+                    rs.writeBool(false);
+                    rs.writeVarInt(0);
+                    rs.writeByte(0x03);                     // data kept: attributes + metadata
+                    player->getConnection()->sendPacket(0x47, std::vector<u8>(rs.writtenSpan().begin(), rs.writtenSpan().end()));
+                }
+                { packets::sendGameEvent(player, static_cast<u8>(13), 0.0f); /* PACKETS_V10 */ }
+                player->clearSeenChunks();          // клиент выбросил чанки после Respawn
+                sendPlayerPositionAndLook(player);  // остаёмся на том же месте — без телепорта на спавн
+                { packets::sendSetHealth(player, player->health, 20, 5.0f); /* PACKETS_V10 */ }
+                syncExperienceBar(player);
+                sendTimeUpdate(player);
+                streamChunks(player);
+                player->clearVisibleEntities();
+                for (auto& pp : getAllPlayersCopy()) if (pp && pp.get() != player.get()) spawnPlayerFor(player, pp);
+                { // инвентарь: клиент прячет вещи после Respawn — как INVRESPAWN_V1
+                    net::Buffer inv;
+                    inv.writeByte(0);
+                    inv.writeVarInt(1);
+                    inv.writeVarInt(entity::Player::INV_SIZE);
+                    for (int i = 0; i < entity::Player::INV_SIZE; ++i) {
+                        const i32 iid = player->invItemId[i];
+                        const i32 icnt = player->invCount[i];
+                        if (icnt > 0 && iid > 0) { inv.writeVarInt(icnt); inv.writeVarInt(iid); inv.writeVarInt(0); inv.writeVarInt(0); }
+                        else { inv.writeVarInt(0); }
+                    }
+                    inv.writeVarInt(0);
+                    player->getConnection()->sendPacket(0x13, std::vector<u8>(inv.writtenSpan().begin(), inv.writtenSpan().end()));
+                }
+                savePlayerData(player); // CAPE_V1: плащ переживает перезаход
+                player->sendSystemMessage(capeOff ? std::string("§aПлащ снят")
+                                                  : std::format("§aПлащ §6{}§a надет", capeTitle));
+            } else if (cmd == "capes") { // CAPE_V1 + CAPECLICK_V1
+                if (config_.xboxAuth) { // CAPEEULA_V1: online-mode -> плащи запрещены
+                    player->sendSystemMessage("§cПлащи недоступны: сервер работает в онлайн-режиме (online-mode=true)");
+                    player->sendSystemMessage("§7Выдача чужих плащей лицензионным аккаунтам нарушает Minecraft EULA.");
+                    break;
+                }
+                const std::string curCape = ncCapeOf(player->getName());
+                const int capeTotal = static_cast<int>(sizeof(kNcCapes) / sizeof(kNcCapes[0]));
+                ncSendCapeRule(player);
+                player->sendSystemMessage(std::format("§6        ПЛАЩИ MINECRAFT.NET §7({} шт.)", capeTotal));
+                player->sendSystemMessage("§7   Нажми на id — плащ наденется сразу");
+                ncSendCapeRule(player);
+                std::vector<NcClickPart> capeRow;
+                int capeShown = 0;
+                for (const auto& c : kNcCapes) {
+                    const bool worn = (curCape == c.id);
+                    capeRow.push_back(NcClickPart{
+                        std::string(c.id) + "  ",
+                        worn ? std::string("green") : std::string("white"),
+                        std::string("/cape ") + c.id,
+                        worn ? std::format("§6{}\n§aсейчас надет", c.title)
+                             : std::format("§6{}\n§7нажми, чтобы надеть", c.title) });
+                    if (++capeShown % 5 == 0) { ncSendClickableLine(player, "§8 §f", capeRow); capeRow.clear(); }
+                }
+                if (!capeRow.empty()) ncSendClickableLine(player, "§8 §f", capeRow);
+                ncSendCapeRule(player);
+                if (!curCape.empty()) {
+                    const NcCape* wc = ncFindCape(curCape);
+                    player->sendSystemMessage(std::format("§7 Сейчас надет: §a{}", wc ? wc->title : curCape.c_str()));
+                    ncSendClickableLine(player, "§7 Снять плащ: ",
+                        { NcClickPart{ "[снять]", "red", "/cape off", "§cубрать плащ" } });
+                } else {
+                    player->sendSystemMessage("§7 Плащ сейчас не надет");
+                }
+                ncSendCapeRule(player);
             } else if (cmd == "tps") {
                 // TPS_BOSS_V1: port of the Bedrock overlay toggle to Java Boss Event packets.
                 player->tpsBossbarEnabled = !player->tpsBossbarEnabled;
@@ -7017,7 +7974,8 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 const auto __sl = nc::i18n::langFromLocale(player->clientLocale); // SPAWNCMD_V1
                 if (!okc) { player->sendSystemMessage(std::string(nc::i18n::tr(__sl, "spawn.int"))); break; }
                 g_spawnX = nx; g_spawnY = ny; g_spawnZ = nz;
-                writeWorldSpawn(g_spawnX, g_spawnY, g_spawnZ); // SPAWN_V1
+                // V56_DATKILL_V1: точка спавна больше не пишется в отдельный spawn.dat —
+                // следующий saveWorlds() кладёт её в world/level.dat вместе с остальным.
                 auto allSp = getAllPlayersCopy();
                 for (auto& p : allSp) if (p->isAlive()) sendSpawnPosition(p);
                 player->sendSystemMessage(nc::i18n::f(__sl, "spawn.set", g_spawnX, g_spawnY, g_spawnZ)); // SPAWNCMD_V1
@@ -7049,7 +8007,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 if (!op) { needOp(); break; }
                 if (args.size() < 2) {
                     player->sendSystemMessage(ruMob
-                        ? std::format("§e/mob <��мя> [кол-во], типов всего: {} — например /mob zombie 3", entity::mobTypeCount())
+                        ? std::format("§e/mob <имя> [кол-во], типов всего: {} — например /mob zombie 3", entity::mobTypeCount())
                         : std::format("§e/mob <name> [count], types: {} — e.g. /mob zombie 3", entity::mobTypeCount()));
                 } else {
                     const i32 mobIdx = entity::mobIndexByName(args[1].c_str());
@@ -7068,12 +8026,12 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                             : std::format("§aSpawned: {} x{}", entity::mobDef(mobIdx).name, mobCnt));
                     }
                 }
-            } else if (cmd == "locate") { // STRUCT_LOCATE_V1: проверка, что структуры есть, и куда идти
+            } else if (cmd == "locate") { // STRUCT_LOCATE_V1: проверки, что структуры есть, и куда идти
                 const bool ruLang = (config_.language == "rus");
                 if (args.size() < 2) {
                     player->sendSystemMessage((ruLang ? std::string("§e/locate <тип>: ") : std::string("§e/locate <type>: ")) + world::World::structureKeys());
                 } else if (player->dimension != 0) {
-                    player->sendSystemMessage(ruLang ? "§cСтруктуры пока есть т��лько в оверворлде" : "§cStructures exist only in the overworld for now");
+                    player->sendSystemMessage(ruLang ? "§cСтруктуры пока есть только в оверворлде" : "§cStructures exist only in the overworld for now");
                 } else {
                     auto& lw = worldFor(player->dimension);
                     const i32 pcx = (i32)std::floor(player->getX() / 16.0);
@@ -7140,10 +8098,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 if (t < 0) player->sendSystemMessage("§cИспользование: /time set <day|noon|night|midnight|тики>");
                 else {
                     g_timeOfDay = t;
-                    net::Buffer tb;
-                    tb.writeI64(t);
-                    tb.writeI64(t);
-                    auto vec = std::vector<u8>(tb.writtenSpan().begin(), tb.writtenSpan().end());
+                    auto vec = packets::buildUpdateTime(t, t); /* PACKETS_V16 */
                     auto allPlayers = getAllPlayersCopy();
                     for (auto& p : allPlayers) if (p->isAlive()) p->getConnection()->sendPacket(0x64, vec);
                     player->sendSystemMessage(std::format("§aВремя: {}", t));
@@ -7199,7 +8154,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 // редстоуну/хорусу (они тут вообще не затрагиваются) — только растения/
                 // опоры растений, то есть те же 3 случайные клетки на чанк-колонну, что и в обычном
                 // тике, просто много раз подряд. Сделано для smoke_bot.py, чтобы можно было
-                // честно пров��рять бамбук/естественный рост урожая без 27-минутного ожидания.
+                // честно проверять бамбук/естественный рост урожая без 27-минутного ожидания.
                 if (!op) { needOp(); break; }
                 i64 n = -1;
                 if (args.size() >= 2) { try { n = std::stoll(args[1]); } catch (...) { n = -1; } }
@@ -7262,7 +8217,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         }
                     }
                     player->sendSystemMessage(found ? "§aИгрок кикнут" : "§cИгрок не найден");
-                } else player->sendSystemMessage("§cИспользов��ние: /kick <ник>");
+                } else player->sendSystemMessage("§cИспользование: /kick <ник>");
             } else if (cmd == "summon") { // ENTITIES_V1: заспавнить не-игроковую сущность
                 if (!op) { needOp(); break; }
                 i32 typeId = -1;
@@ -7342,9 +8297,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 std::vector<SpawnedEntity> copy;
                 { std::lock_guard lk(entitiesMutex_); copy = entities_; entities_.clear(); }
                 if (!copy.empty()) {
-                    net::Buffer rm; rm.writeVarInt(static_cast<i32>(copy.size()));
-                    for (auto& e : copy) rm.writeVarInt(e.eid);
-                    auto v = std::vector<u8>(rm.writtenSpan().begin(), rm.writtenSpan().end());
+                    std::vector<i32> rmIds; rmIds.reserve(copy.size()); for (auto& e : copy) rmIds.push_back(e.eid); auto v = packets::buildRemoveEntities(rmIds); /* PACKETS_V15 */
                     for (auto& p : getAllPlayersCopy()) if (p && p->isAlive() && p->getState() == entity::PlayerState::Play) p->getConnection()->sendPacket(0x42, v);
                 }
                 player->sendSystemMessage(std::format("§aУдалено сущностей: {}", copy.size()));
@@ -7387,14 +8340,8 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     if (selection.complete()) sendMiniEditOutline(player, selection);
                 }
                 // Cancel both creative instant-break and survival finish-break.
-                net::Buffer restore;
-                restore.writePosition(BlockPos{bx, by, bz});
-                restore.writeVarInt(world_.getBlock(bx, by, bz));
-                player->getConnection()->sendPacket(0x09,
-                    std::vector<u8>(restore.writtenSpan().begin(), restore.writtenSpan().end()));
-                net::Buffer ack; ack.writeVarInt(seq);
-                player->getConnection()->sendPacket(0x05,
-                    std::vector<u8>(ack.writtenSpan().begin(), ack.writtenSpan().end()));
+                packets::sendBlockUpdate(player, BlockPos{bx, by, bz}, world_.getBlock(bx, by, bz)); /* PACKETS_V10 */
+                packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                 break;
             }
             if (status == 5 && player->usingShield) { // SHIELD_V1: Release Use Item — щит опущен
@@ -7421,14 +8368,11 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 std::swap(player->invCount[mainSlot], player->invCount[45]);
                 if (player->heldSlot >= 0 && player->heldSlot < 9) player->hotbarBlockState[player->heldSlot] = -1;
                 for (const i32 sSlot : {mainSlot, 45}) {
-                    net::Buffer sw; sw.writeByte(0); sw.writeVarInt(0); sw.writeI16(static_cast<i16>(sSlot));
-                    sw.writeVarInt(player->invCount[sSlot]);
-                    if (player->invCount[sSlot] > 0) { sw.writeVarInt(player->invItemId[sSlot]); sw.writeVarInt(0); sw.writeVarInt(0); }
-                    player->getConnection()->sendPacket(0x15, std::vector<u8>(sw.writtenSpan().begin(), sw.writtenSpan().end()));
+                    packets::sendContainerSlot(player, 0, 0, static_cast<i16>(sSlot), player->invItemId[sSlot], player->invCount[sSlot]); /* PACKETS_V15 */
                 }
                 broadcastHeldEquipment(player); // others must see the new item in hand
             }
-            const bool creative = (player->gameMode == 1); // GM_V1: ��о-игроковому, а не из конфига
+            const bool creative = (player->gameMode == 1); // GM_V1: по-игроковому, а не из конфига
             const bool wantsBreak = player->gameMode != 3 && ((creative && status == 0) || (!creative && status == 2));
             if (wantsBreak && by >= world::CHUNK_HEIGHT_MIN && by < world::CHUNK_HEIGHT_MAX) { // HEIGHT_V2: vanilla world is -64..319
                 const i32 ax = bx < 0 ? -bx : bx;
@@ -7442,11 +8386,8 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     player->sendSystemMessage("§cСпавн защищён — здесь ломать нельзя");
                 } else if (by == world::CHUNK_HEIGHT_MIN && world_.getBlock(bx, by, bz) == 79) {
                     // BEDROCK_PROTECT_V1: exact lower border cannot be mined in survival or creative.
-                    net::Buffer bu;
-                    bu.writePosition(BlockPos{bx, by, bz});
-                    bu.writeVarInt(79);
-                    player->getConnection()->sendPacket(0x09, std::vector<u8>(bu.writtenSpan().begin(), bu.writtenSpan().end()));
-                    player->sendSystemMessage(config_.language == "rus" ? "§cНижний бедрок на высоте -64 нельзя сломать" : "��cThe bottom bedrock at Y=-64 cannot be broken");
+                    packets::sendBlockUpdate(player, BlockPos{bx, by, bz}, 79); /* PACKETS_V10 */
+                    player->sendSystemMessage(config_.language == "rus" ? "§cНижний бедрок на высоте -64 нельзя сломать" : "§cThe bottom bedrock at Y=-64 cannot be broken");
                 } else {
                     const i32 oldState = world_.getBlock(bx, by, bz); // BREAKFX_V1
                     if (oldState == 2095) tntCountDecrement(tntBlockCount_); // ANTILAG_TNT_V1: stationary TNT broken
@@ -7540,21 +8481,11 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     if (fxSilent && isFireBlockState(oldState)) {
                         // Vanilla: putting out fire is Level Event 1009 (extinguish puff + hiss),
                         // not the block-break effect that showered "fire" particles everywhere.
-                        net::Buffer fe;
-                        fe.writeI32(1009);
-                        fe.writePosition(BlockPos{bx, by, bz});
-                        fe.writeI32(0);
-                        fe.writeBool(false);
-                        auto fev = std::vector<u8>(fe.writtenSpan().begin(), fe.writtenSpan().end());
+                        auto fev = packets::buildLevelEvent(1009, BlockPos{bx, by, bz}, 0, false); /* PACKETS_V16 */
                         for (auto& p : allPlayers) if (p->isAlive()) p->getConnection()->sendPacket(0x28, fev);
                     }
                     if (oldState > 0 && !fxSilent) { // BREAKFX_V1: частицы + звук ломания (Level Event 2001)
-                        net::Buffer fx;
-                        fx.writeI32(2001);
-                        fx.writePosition(BlockPos{bx, by, bz});
-                        fx.writeI32(oldState);
-                        fx.writeBool(false);
-                        auto fxv = std::vector<u8>(fx.writtenSpan().begin(), fx.writtenSpan().end());
+                        auto fxv = packets::buildLevelEvent(2001, BlockPos{bx, by, bz}, oldState, false); /* PACKETS_V16 */
                         for (auto& p : allPlayers) if (p->isAlive()) p->getConnection()->sendPacket(0x28, fxv);
                     }
                     { // COCOA_BREAK_DROP_V1: mined cocoa pods drop 1 bean if unripe (age 0/1) or
@@ -7583,9 +8514,15 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                             spawnItemDrop(bx + 0.5 + jx, by + 0.5, bz + 0.5 + jz, dropId, 1, jx, 0.2, jz);
                         }
                     }
-                    if (isChestBlockState(oldState) || isTrappedChestState(oldState) || isEnderChestState(oldState)) { // CHEST_V1/CHEST_V2: сундук сломан — чистим к��нтейнер и закрываем окна зрителей (в т.ч. эндер-сундук)
+                    { // BANNER_V1: узоры живут ровно пока стоит сам баннер
+                        std::lock_guard blk(bannersMutex_);
+                        banners_.erase(chestPosKey(bx, by, bz));
+                    }
+                    if (containerKindOfState(oldState) != CK_NONE) { // CHEST_V1/CHEST_V2/CONTAINER_V1: контейнер сломан — чистим контейнер и закрываем окна зрителей (в т.ч. эндер-сундук)
                         const u64 key = chestPosKey(bx, by, bz);
                         const bool wasEnder = isEnderChestState(oldState);
+                        forgetBlockEntity(key); // CONTAINER_V2: больше не тикаем
+                        { std::lock_guard slk(spawnersMutex_); spawners_.erase(key); } // SPAWNER_V1
                         if (!wasEnder) { // ITEMDROP_V1: содержимое сундука высыпается на пол
                             ChestData spilled{};
                             { std::lock_guard lock(chestsMutex_); auto itc = chests_.find(key); if (itc != chests_.end()) spilled = itc->second; chests_.erase(key); }
@@ -7596,9 +8533,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         }
                         for (auto& p : allPlayers) {
                             if (p->isAlive() && p->openWindowId != 0 && p->openIsEnder == wasEnder && (p->openContainerKey == key || (p->openIsDouble && p->openContainerKey2 == key))) { // CHEST_V3: закрываем и зрителей второй половины
-                                net::Buffer cw;
-                                cw.writeByte((u8)p->openWindowId);
-                                p->getConnection()->sendPacket(0x12, std::vector<u8>(cw.writtenSpan().begin(), cw.writtenSpan().end())); // clientbound Close Container
+                                packets::sendContainerClose(p, static_cast<u8>(p->openWindowId)); // clientbound Close Container /* PACKETS_V18 */
                                 p->openWindowId = 0;
                                 p->openIsDouble = false; p->openContainerKey2 = 0; // CHEST_V3
                                 p->cursorItemId = 0; p->cursorCount = 0;
@@ -7630,9 +8565,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 }
             }
             {
-                net::Buffer ab;
-                ab.writeVarInt(seq);
-                player->getConnection()->sendPacket(0x05, std::vector<u8>(ab.writtenSpan().begin(), ab.writtenSpan().end()));
+                packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
             }
             break;
         }
@@ -7672,7 +8605,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             // CHEST_V1: клики в открытом окне сундука (generic_9x3):
             // слоты 0..26 — контейнер, 27..62 — инвентарь игрока (слоты окна игрока 9..44).
             if (player->openWindowId != 0 && windowId == (u8)player->openWindowId) {
-                const int CONT = player->openIsDouble ? 54 : 27; // CHEST_V3: двойной сундук = 54 слота контейнера
+                const int CONT = player->openIsDouble ? 54 : player->openContSlots; // CHEST_V3 / CONTAINER_V1
                 {
                     std::lock_guard lock(chestsMutex_);
                     if (!player->openIsEnder) { // CHEST_V3: создаём оба контейнера заранее, чтобы указатели не инвалидировались
@@ -7682,12 +8615,12 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     ChestData* chest = player->openIsEnder ? nullptr : &chests_[player->openContainerKey];
                     ChestData* chest2 = (!player->openIsEnder && player->openIsDouble) ? &chests_[player->openContainerKey2] : nullptr; // CHEST_V3
                     auto idRef = [&](int s) -> i32& {
-                        if (s < 27) return player->openIsEnder ? player->enderItemId[s] : chest->itemId[s];
+                        if (s < player->openContSlots) return player->openIsEnder ? player->enderItemId[s] : chest->itemId[s]; // CONTAINER_V1
                         if (s < CONT) return chest2->itemId[s - 27]; // CHEST_V3: вторая половина
                         return player->invItemId[s - CONT + 9];
                     };
                     auto cntRef = [&](int s) -> i32& {
-                        if (s < 27) return player->openIsEnder ? player->enderCount[s] : chest->count[s];
+                        if (s < player->openContSlots) return player->openIsEnder ? player->enderCount[s] : chest->count[s]; // CONTAINER_V1
                         if (s < CONT) return chest2->count[s - 27]; // CHEST_V3
                         return player->invCount[s - CONT + 9];
                     };
@@ -7738,7 +8671,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             const bool creative = (player->gameMode == 1);
             auto resync = [&]() {
                 net::Buffer inv;
-                inv.writeByte((i8)windowId);
+                inv.writeByte(static_cast<u8>(windowId));
                 inv.writeVarInt(1);
                 inv.writeVarInt(entity::Player::INV_SIZE);
                 for (int i = 0; i < entity::Player::INV_SIZE; ++i) {
@@ -7798,9 +8731,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 player->sendSystemMessage(std::format("§dMiniEdit pos2: {} {} {}{}", bx, by, bz,
                     selection.complete() ? std::format(" ({} блоков)", selection.volume()) : std::string()));
                 if (selection.complete()) sendMiniEditOutline(player, selection);
-                net::Buffer ack; ack.writeVarInt(seq);
-                player->getConnection()->sendPacket(0x05,
-                    std::vector<u8>(ack.writtenSpan().begin(), ack.writtenSpan().end()));
+                packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                 break;
             }
             { // DOORS_V4: vanilla wooden door interaction. Earlier patches only placed
@@ -7824,8 +8755,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                                     p->getConnection()->sendPacket(0x09, dv);
                             }
                             broadcastBlockSound("minecraft:block.wooden_door.open", bx, by, bz, 1.0f, 1.0f);
-                            net::Buffer da; da.writeVarInt(seq);
-                            player->getConnection()->sendPacket(0x05, std::vector<u8>(da.writtenSpan().begin(), da.writtenSpan().end()));
+                            packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                             break;
                         }
                     }
@@ -7839,16 +8769,12 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         player->invCount[vehHandSlot] = 0; player->invItemId[vehHandSlot] = 0;
                         if (vehHandSlot >= 36 && vehHandSlot <= 44) player->hotbarBlockState[vehHandSlot - 36] = -1;
                     }
-                    net::Buffer vslot; vslot.writeByte(0); vslot.writeVarInt(0); vslot.writeI16(static_cast<i16>(vehHandSlot));
-                    vslot.writeVarInt(player->invCount[vehHandSlot]);
-                    if (player->invCount[vehHandSlot] > 0) { vslot.writeVarInt(player->invItemId[vehHandSlot]); vslot.writeVarInt(0); vslot.writeVarInt(0); }
-                    player->getConnection()->sendPacket(0x15, std::vector<u8>(vslot.writtenSpan().begin(), vslot.writtenSpan().end()));
-                    net::Buffer vack; vack.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(vack.writtenSpan().begin(), vack.writtenSpan().end()));
+                    packets::sendContainerSlot(player, 0, 0, static_cast<i16>(vehHandSlot), player->invItemId[vehHandSlot], player->invCount[vehHandSlot]); /* PACKETS_V15 */
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
-            { // MOBS_ALL_V1: яйца спавна — ��аботают для всех мобов из таблицы
+            { // MOBS_ALL_V1: яйца спавна — работают для всех мобов из таблицы
                 const i32 eggHandSlot = useHand == 1 ? 45 : (36 + std::clamp(player->heldSlot, 0, 8));
                 const i32 eggItem = player->invCount[eggHandSlot] > 0 ? player->invItemId[eggHandSlot] : 0;
                 const i32 eggMob = entity::mobIndexBySpawnEgg(eggItem);
@@ -7864,12 +8790,8 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         player->invCount[eggHandSlot] = 0; player->invItemId[eggHandSlot] = 0;
                         if (eggHandSlot >= 36 && eggHandSlot <= 44) player->hotbarBlockState[eggHandSlot - 36] = -1;
                     }
-                    net::Buffer eslot; eslot.writeByte(0); eslot.writeVarInt(0); eslot.writeI16(static_cast<i16>(eggHandSlot));
-                    eslot.writeVarInt(player->invCount[eggHandSlot]);
-                    if (player->invCount[eggHandSlot] > 0) { eslot.writeVarInt(player->invItemId[eggHandSlot]); eslot.writeVarInt(0); eslot.writeVarInt(0); }
-                    player->getConnection()->sendPacket(0x15, std::vector<u8>(eslot.writtenSpan().begin(), eslot.writtenSpan().end()));
-                    net::Buffer eack; eack.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(eack.writtenSpan().begin(), eack.writtenSpan().end()));
+                    packets::sendContainerSlot(player, 0, 0, static_cast<i16>(eggHandSlot), player->invItemId[eggHandSlot], player->invCount[eggHandSlot]); /* PACKETS_V15 */
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -7892,12 +8814,30 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 }
                 // Complain about the disabled Nether only when this click really would
                 // have lit a portal, i.e. a valid obsidian frame is standing here.
-                const bool ptDeadFrame = (ptItem == 798 && ptObsidian && !config_.enableNether) &&
-                                         tryLightNetherPortal(player->dimension, ptFx, ptFy, ptFz, true);
-                if (ptItem == 1006 && ptEndFrame && !config_.enableEnd) {
+                // PORTALMSG_V1: the frame used to be probed ONLY from the cell the fire
+                // would land in. On a portal bigger than 2x3 you easily click the outer
+                // face of the obsidian, the fire lands outside the opening, no frame is
+                // found and the server stayed silent. Probe the neighbours too.
+                auto ptFrameNear = [&]() {
+                    if (tryLightNetherPortal(player->dimension, ptFx, ptFy, ptFz, true)) return true;
+                    static const i32 ptOff[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+                    for (const auto& o : ptOff)
+                        if (tryLightNetherPortal(player->dimension, bx + o[0], by + o[1], bz + o[2], true)) return true;
+                    return false;
+                };
+                const bool ptDeadFrame = (ptItem == 798 && ptObsidian && !config_.enableNether) && ptFrameNear();
+                // PORTALMSG_V1: one warning every 3 seconds instead of a wall of them.
+                auto ptWarnOk = [&]() {
+                    const i64 nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    if (nowMs - player->lastPortalWarnMs < 3000) return false;
+                    player->lastPortalWarnMs = nowMs;
+                    return true;
+                };
+                if (ptItem == 1006 && ptEndFrame && !config_.enableEnd && ptWarnOk()) {
                     player->sendSystemMessage(rlPt ? "§cМир Энда выключен на сервере — портал не заработает"
                                                    : "§cThe End is disabled on this server - this portal will never work");
-                } else if (ptDeadFrame) {
+                } else if (ptDeadFrame && ptWarnOk()) {
                     player->sendSystemMessage(rlPt ? "§cМир Ада выключен на сервере — портал не зажечь"
                                                    : "§cThe Nether is disabled on this server - the portal will not light");
                 } else if (ptItem == 1006 && config_.enableEnd) { // ender_eye
@@ -7917,12 +8857,8 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         player->invCount[ptHandSlot] = 0; player->invItemId[ptHandSlot] = 0;
                         if (ptHandSlot >= 36 && ptHandSlot <= 44) player->hotbarBlockState[ptHandSlot - 36] = -1;
                     }
-                    net::Buffer pslot; pslot.writeByte(0); pslot.writeVarInt(0); pslot.writeI16(static_cast<i16>(ptHandSlot));
-                    pslot.writeVarInt(player->invCount[ptHandSlot]);
-                    if (player->invCount[ptHandSlot] > 0) { pslot.writeVarInt(player->invItemId[ptHandSlot]); pslot.writeVarInt(0); pslot.writeVarInt(0); }
-                    player->getConnection()->sendPacket(0x15, std::vector<u8>(pslot.writtenSpan().begin(), pslot.writtenSpan().end()));
-                    net::Buffer pack; pack.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(pack.writtenSpan().begin(), pack.writtenSpan().end()));
+                    packets::sendContainerSlot(player, 0, 0, static_cast<i16>(ptHandSlot), player->invItemId[ptHandSlot], player->invCount[ptHandSlot]); /* PACKETS_V15 */
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -7957,12 +8893,8 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                             const i32 id=player->invItemId[handSlot];
                             player->hotbarBlockState[handSlot-36]=id==909?80:(id==910?96:-1);
                         }
-                        net::Buffer slot; slot.writeByte(0); slot.writeVarInt(0); slot.writeI16(static_cast<i16>(handSlot));
-                        slot.writeVarInt(player->invCount[handSlot]);
-                        if(player->invCount[handSlot]>0){slot.writeVarInt(player->invItemId[handSlot]);slot.writeVarInt(0);slot.writeVarInt(0);}
-                        player->getConnection()->sendPacket(0x15,std::vector<u8>(slot.writtenSpan().begin(),slot.writtenSpan().end()));
-                        net::Buffer ab; ab.writeVarInt(seq);
-                        player->getConnection()->sendPacket(0x05,std::vector<u8>(ab.writtenSpan().begin(),ab.writtenSpan().end()));
+                        packets::sendContainerSlot(player, 0, 0, static_cast<i16>(handSlot), player->invItemId[handSlot], player->invCount[handSlot]); /* PACKETS_V15 */
+                        packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                         break;
                     }
                 }
@@ -7978,13 +8910,9 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                             player->invCount[handSlot] = 0; player->invItemId[handSlot] = 0;
                             if (handSlot >= 36 && handSlot <= 44) player->hotbarBlockState[handSlot - 36] = -1;
                         }
-                        net::Buffer slot; slot.writeByte(0); slot.writeVarInt(0); slot.writeI16(static_cast<i16>(handSlot));
-                        slot.writeVarInt(player->invCount[handSlot]);
-                        if (player->invCount[handSlot] > 0) { slot.writeVarInt(player->invItemId[handSlot]); slot.writeVarInt(0); slot.writeVarInt(0); }
-                        player->getConnection()->sendPacket(0x15, std::vector<u8>(slot.writtenSpan().begin(), slot.writtenSpan().end()));
+                        packets::sendContainerSlot(player, 0, 0, static_cast<i16>(handSlot), player->invItemId[handSlot], player->invCount[handSlot]); /* PACKETS_V15 */
                     }
-                    net::Buffer ab; ab.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(ab.writtenSpan().begin(), ab.writtenSpan().end()));
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -8017,26 +8945,20 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                                 player->invCount[handSlot] = 0; player->invItemId[handSlot] = 0;
                                 if (handSlot >= 36 && handSlot <= 44) player->hotbarBlockState[handSlot - 36] = -1;
                             }
-                            net::Buffer slot; slot.writeByte(0); slot.writeVarInt(0); slot.writeI16(static_cast<i16>(handSlot));
-                            slot.writeVarInt(player->invCount[handSlot]);
-                            if (player->invCount[handSlot] > 0) { slot.writeVarInt(player->invItemId[handSlot]); slot.writeVarInt(0); slot.writeVarInt(0); }
-                            player->getConnection()->sendPacket(0x15, std::vector<u8>(slot.writtenSpan().begin(), slot.writtenSpan().end()));
+                            packets::sendContainerSlot(player, 0, 0, static_cast<i16>(handSlot), player->invItemId[handSlot], player->invCount[handSlot]); /* PACKETS_V15 */
                         }
                     }
-                    net::Buffer ab; ab.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(ab.writtenSpan().begin(), ab.writtenSpan().end()));
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
             { // CHEST_V1: правый клик по сундуку открывает контейнер (кроме приседа и наблюдателя)
                 const i32 clicked = world_.getBlock(bx, by, bz);
                 const bool ender = isEnderChestState(clicked);
-                if ((isChestBlockState(clicked) || isTrappedChestState(clicked) || ender) &&
+                if (containerKindOfState(clicked) != CK_NONE && // CONTAINER_V1: бочка, печка, воронка, раздатчик и выбрасыватель тоже открываются
                     player->gameMode != 3 && !player->sneaking) {
                     openChestFor(player, bx, by, bz, ender);
-                    net::Buffer ab;
-                    ab.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(ab.writtenSpan().begin(), ab.writtenSpan().end()));
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -8117,8 +9039,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         for (auto& p : allPlayers)
                             if (p && p->isAlive() && p->getState() == entity::PlayerState::Play)
                                 p->getConnection()->sendPacket(0x09, bytes);
-                        net::Buffer fx; fx.writeI32(2005); fx.writePosition(BlockPos{bx, by, bz}); fx.writeI32(0); fx.writeBool(false); // LevelEvent 2005: bonemeal particles
-                        const auto fxBytes = std::vector<u8>(fx.writtenSpan().begin(), fx.writtenSpan().end());
+                        const auto fxBytes = packets::buildLevelEvent(2005, BlockPos{bx, by, bz}, 0, false); /* PACKETS_V16 */
                         for (auto& p : allPlayers)
                             if (p && p->isAlive() && p->getState() == entity::PlayerState::Play)
                                 p->getConnection()->sendPacket(0x28, fxBytes);
@@ -8126,13 +9047,9 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                             player->invCount[handSlot] = 0; player->invItemId[handSlot] = 0;
                             if (handSlot >= 36 && handSlot <= 44) player->hotbarBlockState[handSlot - 36] = -1;
                         }
-                        net::Buffer slot; slot.writeByte(0); slot.writeVarInt(0); slot.writeI16(static_cast<i16>(handSlot));
-                        slot.writeVarInt(player->invCount[handSlot]);
-                        if (player->invCount[handSlot] > 0) { slot.writeVarInt(player->invItemId[handSlot]); slot.writeVarInt(0); slot.writeVarInt(0); }
-                        player->getConnection()->sendPacket(0x15, std::vector<u8>(slot.writtenSpan().begin(), slot.writtenSpan().end()));
+                        packets::sendContainerSlot(player, 0, 0, static_cast<i16>(handSlot), player->invItemId[handSlot], player->invCount[handSlot]); /* PACKETS_V15 */
                     }
-                    net::Buffer ab; ab.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(ab.writtenSpan().begin(), ab.writtenSpan().end()));
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -8161,8 +9078,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                             if (p && p->isAlive() && p->getState() == entity::PlayerState::Play)
                                 p->getConnection()->sendPacket(0x09, bytes);
                     }
-                    net::Buffer ab; ab.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(ab.writtenSpan().begin(), ab.writtenSpan().end()));
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -8204,13 +9120,9 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                             player->invCount[handSlot] = 0; player->invItemId[handSlot] = 0;
                             if (handSlot >= 36 && handSlot <= 44) player->hotbarBlockState[handSlot - 36] = -1;
                         }
-                        net::Buffer slot; slot.writeByte(0); slot.writeVarInt(0); slot.writeI16(static_cast<i16>(handSlot));
-                        slot.writeVarInt(player->invCount[handSlot]);
-                        if (player->invCount[handSlot] > 0) { slot.writeVarInt(player->invItemId[handSlot]); slot.writeVarInt(0); slot.writeVarInt(0); }
-                        player->getConnection()->sendPacket(0x15, std::vector<u8>(slot.writtenSpan().begin(), slot.writtenSpan().end()));
+                        packets::sendContainerSlot(player, 0, 0, static_cast<i16>(handSlot), player->invItemId[handSlot], player->invCount[handSlot]); /* PACKETS_V15 */
                     }
-                    net::Buffer ab2; ab2.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(ab2.writtenSpan().begin(), ab2.writtenSpan().end()));
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -8271,18 +9183,11 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                             if (freeSlot >= 0) {
                                 if (player->invCount[freeSlot] <= 0) player->invItemId[freeSlot] = 960;
                                 player->invCount[freeSlot] += giveBoneMeal;
-                                net::Buffer slot2; slot2.writeByte(0); slot2.writeVarInt(0); slot2.writeI16(static_cast<i16>(freeSlot));
-                                slot2.writeVarInt(player->invCount[freeSlot]);
-                                slot2.writeVarInt(player->invItemId[freeSlot]); slot2.writeVarInt(0); slot2.writeVarInt(0);
-                                player->getConnection()->sendPacket(0x15, std::vector<u8>(slot2.writtenSpan().begin(), slot2.writtenSpan().end()));
+                                packets::sendContainerSlot(player, 0, 0, static_cast<i16>(freeSlot), player->invItemId[freeSlot], player->invCount[freeSlot]); /* PACKETS_V15 */
                             }
                         }
-                        net::Buffer slot; slot.writeByte(0); slot.writeVarInt(0); slot.writeI16(static_cast<i16>(handSlot));
-                        slot.writeVarInt(player->invCount[handSlot]);
-                        if (player->invCount[handSlot] > 0) { slot.writeVarInt(player->invItemId[handSlot]); slot.writeVarInt(0); slot.writeVarInt(0); }
-                        player->getConnection()->sendPacket(0x15, std::vector<u8>(slot.writtenSpan().begin(), slot.writtenSpan().end()));
-                        net::Buffer ab3; ab3.writeVarInt(seq);
-                        player->getConnection()->sendPacket(0x05, std::vector<u8>(ab3.writtenSpan().begin(), ab3.writtenSpan().end()));
+                        packets::sendContainerSlot(player, 0, 0, static_cast<i16>(handSlot), player->invItemId[handSlot], player->invCount[handSlot]); /* PACKETS_V15 */
+                        packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                         break;
                     }
                 }
@@ -8302,8 +9207,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         if (p && p->isAlive() && p->getState() == entity::PlayerState::Play)
                             p->getConnection()->sendPacket(0x09, bytes);
                     broadcastBlockSound("minecraft:entity.generic.eat", bx, by, bz, 1.0f, 1.0f);
-                    net::Buffer ab4; ab4.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(ab4.writtenSpan().begin(), ab4.writtenSpan().end()));
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -8317,8 +9221,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 const auto* clickedNoteBs = reg.blockStates().getById(world_.getBlock(bx, by, bz));
                 if (clickedNoteBs && clickedNoteBs->name == "minecraft:note_block" && player->gameMode != 3) {
                     broadcastBlockSound("minecraft:block.note_block.harp", bx, by, bz, 3.0f, 1.0f);
-                    net::Buffer ab5; ab5.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(ab5.writtenSpan().begin(), ab5.writtenSpan().end()));
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -8332,8 +9235,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 const auto* clickedBellBs = reg.blockStates().getById(world_.getBlock(bx, by, bz));
                 if (clickedBellBs && clickedBellBs->name == "minecraft:bell" && player->gameMode != 3) {
                     broadcastBlockSound("minecraft:block.bell.use", bx, by, bz, 2.0f, 1.0f);
-                    net::Buffer ab6; ab6.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(ab6.writtenSpan().begin(), ab6.writtenSpan().end()));
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -8368,14 +9270,10 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                                 player->invCount[handSlot] = 0; player->invItemId[handSlot] = 0;
                                 if (handSlot >= 36 && handSlot <= 44) player->hotbarBlockState[handSlot - 36] = -1;
                             }
-                            net::Buffer slot; slot.writeByte(0); slot.writeVarInt(0); slot.writeI16(static_cast<i16>(handSlot));
-                            slot.writeVarInt(player->invCount[handSlot]);
-                            if (player->invCount[handSlot] > 0) { slot.writeVarInt(player->invItemId[handSlot]); slot.writeVarInt(0); slot.writeVarInt(0); }
-                            player->getConnection()->sendPacket(0x15, std::vector<u8>(slot.writtenSpan().begin(), slot.writtenSpan().end()));
+                            packets::sendContainerSlot(player, 0, 0, static_cast<i16>(handSlot), player->invItemId[handSlot], player->invCount[handSlot]); /* PACKETS_V15 */
                         }
                     }
-                    net::Buffer ab3; ab3.writeVarInt(seq);
-                    player->getConnection()->sendPacket(0x05, std::vector<u8>(ab3.writtenSpan().begin(), ab3.writtenSpan().end()));
+                    packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
                     break;
                 }
             }
@@ -8415,37 +9313,25 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 const bool upperBlocked = state > 0 && upperState >= 0 &&
                     (ty + 1 >= world::CHUNK_HEIGHT_MAX || !isReplaceableState(world_.getBlock(tx, ty + 1, tz)));
                 if (prot) {
-                    net::Buffer bu;
-                    bu.writePosition(BlockPos{tx, ty, tz});
-                    bu.writeVarInt(world_.getBlock(tx, ty, tz));
-                    player->getConnection()->sendPacket(0x09, std::vector<u8>(bu.writtenSpan().begin(), bu.writtenSpan().end()));
+                    packets::sendBlockUpdate(player, BlockPos{tx, ty, tz}, world_.getBlock(tx, ty, tz)); /* PACKETS_V10 */
                     player->sendSystemMessage("§cСпавн защищён — здесь строить нельзя");
                 } else if (targetBlocked || upperBlocked) {
                     // Reject and repaint both cells so the client cannot keep a ghost block.
                     for (const i32 ry : {ty, ty + 1}) {
                         if (ry < world::CHUNK_HEIGHT_MIN || ry >= world::CHUNK_HEIGHT_MAX) continue;
-                        net::Buffer rb;
-                        rb.writePosition(BlockPos{tx, ry, tz});
-                        rb.writeVarInt(world_.getBlock(tx, ry, tz));
-                        player->getConnection()->sendPacket(0x09, std::vector<u8>(rb.writtenSpan().begin(), rb.writtenSpan().end()));
+                        packets::sendBlockUpdate(player, BlockPos{tx, ry, tz}, world_.getBlock(tx, ry, tz)); /* PACKETS_V10 */
                     }
                 } else if (playerBlocked) {
-                    net::Buffer bu;
-                    bu.writePosition(BlockPos{tx, ty, tz});
-                    bu.writeVarInt(world_.getBlock(tx, ty, tz));
-                    player->getConnection()->sendPacket(0x09, std::vector<u8>(bu.writtenSpan().begin(), bu.writtenSpan().end()));
+                    packets::sendBlockUpdate(player, BlockPos{tx, ty, tz}, world_.getBlock(tx, ty, tz)); /* PACKETS_V10 */
                 } else if (state == 2095 && tntTotalCount() >= kMaxTntTotal) {
                     // ANTILAG_TNT_V1: deny new TNT block placement once the combined active+stationary cap is hit.
-                    net::Buffer bu;
-                    bu.writePosition(BlockPos{tx, ty, tz});
-                    bu.writeVarInt(world_.getBlock(tx, ty, tz));
-                    player->getConnection()->sendPacket(0x09, std::vector<u8>(bu.writtenSpan().begin(), bu.writtenSpan().end()));
+                    packets::sendBlockUpdate(player, BlockPos{tx, ty, tz}, world_.getBlock(tx, ty, tz)); /* PACKETS_V10 */
                     player->sendSystemMessage(config_.language == "rus" ? "§cДостигнут лимит TNT в мире (8 000 000)" : "§cWorld TNT limit reached (8,000,000)");
                 } else if (state > 0) {
                     world_.setBlock(tx, ty, tz, state);
                     if (state == 2095) tntBlockCount_.fetch_add(1, std::memory_order_relaxed); // ANTILAG_TNT_V1
                     if (isVehicleRailState(state)) updateRailShapesAround(tx, ty, tz); // RAIL_SHAPE_V1
-                    scheduleFluidNeighbors(tx, ty, tz); // FLUID_V1: поставили блок — рядом жидкости пересчитаются
+                    scheduleFluidNeighbors(tx, ty, tz); // FLUID_V1: поставили блок — рядом жидкости пересчитается
                     scheduleFallingBlockUpdate(tx, ty, tz, 2);     // FALLING_V1
                     scheduleFallingBlockUpdate(tx, ty + 1, tz, 2);
                     if (player->gameMode != 1) { // SURVIVAL_ITEM_V1 + BUCKET_V1: выживание расходует предмет; ведро — в пустое ведро
@@ -8463,11 +9349,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                             slotChanged = true;
                         }
                         if (slotChanged) {
-                            net::Buffer ds;
-                            ds.writeByte(0); ds.writeVarInt(0); ds.writeI16(static_cast<i16>(sl2));
-                            ds.writeVarInt(player->invCount[sl2]);
-                            if (player->invCount[sl2] > 0) { ds.writeVarInt(player->invItemId[sl2]); ds.writeVarInt(0); ds.writeVarInt(0); }
-                            player->getConnection()->sendPacket(0x15, std::vector<u8>(ds.writtenSpan().begin(), ds.writtenSpan().end()));
+                            packets::sendContainerSlot(player, 0, 0, static_cast<i16>(sl2), player->invItemId[sl2], player->invCount[sl2]); /* PACKETS_V15 */
                         }
                     }
                     net::Buffer bu;
@@ -8514,10 +9396,10 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     { // PLACE_V2: the server may rotate or merge what was placed (stairs, chests,
                       // rails, concrete, doors). Send the final state back to the placer so the
                       // client stops showing its own guess of the orientation.
-                        net::Buffer fsb;
-                        fsb.writePosition(BlockPos{tx, ty, tz});
-                        fsb.writeVarInt(world_.getBlock(tx, ty, tz));
-                        player->getConnection()->sendPacket(0x09, std::vector<u8>(fsb.writtenSpan().begin(), fsb.writtenSpan().end()));
+                        packets::sendBlockUpdate(player, BlockPos{tx, ty, tz}, world_.getBlock(tx, ty, tz)); /* PACKETS_V10 */
+                    }
+                    { // CONTAINER_V2: только что поставленная печка или воронка сразу оживает
+                        registerBlockEntity(tx, ty, tz, containerKindOfState(world_.getBlock(tx, ty, tz)));
                     }
                     { // SIGN_V8: Open Sign Editor (0x34) — в ванилке только что поставленная
                       // табличка сразу открывает редактор текста у того, кто её поставил.
@@ -8525,25 +9407,17 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         if (placedBs) {
                             const std::string_view pn = placedBs->name;
                             if (pn.find("_sign") != std::string_view::npos && pn.find("sign_") == std::string_view::npos) {
-                                net::Buffer se;
-                                se.writePosition(BlockPos{tx, ty, tz});
-                                se.writeBool(true); // front text
-                                player->getConnection()->sendPacket(0x34, std::vector<u8>(se.writtenSpan().begin(), se.writtenSpan().end()));
+                                packets::sendOpenSignEditor(player, BlockPos{tx, ty, tz}, /*frontText=*/true);
                             }
                         }
                     }
                 } else {
                     // предмет не блок или блока нет в реестре — мягкий откат клиентского предикта
-                    net::Buffer bu;
-                    bu.writePosition(BlockPos{tx, ty, tz});
-                    bu.writeVarInt(world_.getBlock(tx, ty, tz));
-                    player->getConnection()->sendPacket(0x09, std::vector<u8>(bu.writtenSpan().begin(), bu.writtenSpan().end()));
+                    packets::sendBlockUpdate(player, BlockPos{tx, ty, tz}, world_.getBlock(tx, ty, tz)); /* PACKETS_V10 */
                 }
             }
             {
-                net::Buffer ab;
-                ab.writeVarInt(seq);
-                player->getConnection()->sendPacket(0x05, std::vector<u8>(ab.writtenSpan().begin(), ab.writtenSpan().end()));
+                packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
             }
             break;
         }
@@ -8551,7 +9425,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             const i32 useHand = data.readVarInt(); // SHIELD_V1: 0 = основная рука, 1 = оффхенд
             const i32 seq = data.readVarInt();
             // BUCKET_V2: 1.21.1 ServerboundUseItemPacket несёт актуальный взгляд.
-            // Старый код игнорировал эти поля и иногда raycast'ил по прошлому yaw/pitch.
+            // Старый код игнорировал эти поля — иногда raycast'ил по прошлому yaw/pitch.
             const f32 useYaw = data.readF32();
             const f32 usePitch = data.readF32();
             const bool mainHandOk = player->heldSlot >= 0 && player->heldSlot < 9;
@@ -8565,7 +9439,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     if (nowUseMs >= player->shieldDisabledUntilMs) { // SHIELD_V2: в кд (после топора) щит не поднять
                         player->usingShield = true;
                         player->usingShieldHand = useHand;
-                        player->shieldRaisedMs = nowUseMs; // SHIELD_V2: ванильный про��рев 5 тиков
+                        player->shieldRaisedMs = nowUseMs; // SHIELD_V2: ванильный прогрев 5 тиков
                         broadcastHandState(player); // метаданные 0x58: рука занята щитом
                     }
                 }
@@ -8576,9 +9450,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 if (handCount > 0) {
                     const std::string useItemName = nc::gen::itemNameById(handItem);
                     if (useItemName == "minecraft:written_book") {
-                        net::Buffer ob;
-                        ob.writeVarInt(useHand == 1 ? 1 : 0);
-                        player->getConnection()->sendPacket(0x32, std::vector<u8>(ob.writtenSpan().begin(), ob.writtenSpan().end()));
+                        packets::sendOpenBook(player, useHand);
                     }
                 }
             }
@@ -8635,9 +9507,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         p->getConnection()->sendPacket(0x09, bytes);
             };
             auto acknowledgeUse = [&]() {
-                net::Buffer ab; ab.writeVarInt(seq);
-                player->getConnection()->sendPacket(0x05,
-                    std::vector<u8>(ab.writtenSpan().begin(), ab.writtenSpan().end()));
+                packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
             };
             auto broadcastSwing = [&]() {
                 net::Buffer swing; swing.writeVarInt(static_cast<i32>(player->getEntityId())); swing.writeByte(0);
@@ -8687,7 +9557,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                 const auto motionBytes = std::vector<u8>(motion.writtenSpan().begin(), motion.writtenSpan().end());
                 for (auto& observer : getAllPlayersCopy())
                     if (observer && observer->isAlive() && observer->getState() == entity::PlayerState::Play)
-                        observer->getConnection()->sendPacket(0x5A, motionBytes);
+                        observer->getConnection()->sendPacket(0x5A, motionBytes, true); /* NETQUEUE_V1 */
                 broadcastBlockSound("minecraft:entity.firework_rocket.launch",
                     static_cast<i32>(std::floor(player->getX())), static_cast<i32>(std::floor(player->getY())),
                     static_cast<i32>(std::floor(player->getZ())), 1.0f, 1.0f);
@@ -8727,8 +9597,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
 
             if ((handItem == 912 || handItem == 927 || handItem == 1088) && handCount > 0 && player->gameMode != 3) { // snowball / egg / experience bottle
                 const bool snowball = handItem == 912;
-                const bool egg = handItem == 927;
-                const bool xpBottle = handItem == 1088;
+                const bool egg = handItem == 927; // WARNFIX_V2: третий вариант (1088) — бутылёк опыта
                 spawnThrowableProjectile(player, useYaw, usePitch,
                                         snowball ? 97 : (egg ? 28 : 37), // ENTITY_ID_FIX_V2: snowball = 97
                                         snowball ? 2 : (egg ? 3 : 4));
@@ -8841,9 +9710,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     broadcastBlock(hitX, hitY, hitZ, world_.getBlock(hitX, hitY, hitZ));
             }
             {
-                net::Buffer ab;
-                ab.writeVarInt(seq);
-                player->getConnection()->sendPacket(0x05, std::vector<u8>(ab.writtenSpan().begin(), ab.writtenSpan().end()));
+                packets::sendAckBlockChange(player, seq); /* PACKETS_V10 */
             }
             break;
         }
@@ -8892,7 +9759,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
         case 0x02: { // Change Difficulty — от клиента игнорируем (сложность задаёт сервер)
             break;
         }
-        case 0x05: { // ALLPACKETS_V1: Signed Chat Command — исполняем тем же путём, ��то и 0x04
+        case 0x05: { // ALLPACKETS_V1: Signed Chat Command — исполняем тем же путём, что и 0x04
             std::string command = data.readString();
             net::Buffer cmdBuf;
             cmdBuf.writeString(command);
@@ -9044,10 +9911,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                     std::swap(player->invCount[pickSlot], player->invCount[handSlot]);
                     if (player->heldSlot >= 0 && player->heldSlot < 9) player->hotbarBlockState[player->heldSlot] = -1;
                     for (const i32 sSlot : {pickSlot, handSlot}) {
-                        net::Buffer pk; pk.writeByte(0); pk.writeVarInt(0); pk.writeI16(static_cast<i16>(sSlot));
-                        pk.writeVarInt(player->invCount[sSlot]);
-                        if (player->invCount[sSlot] > 0) { pk.writeVarInt(player->invItemId[sSlot]); pk.writeVarInt(0); pk.writeVarInt(0); }
-                        player->getConnection()->sendPacket(0x15, std::vector<u8>(pk.writtenSpan().begin(), pk.writtenSpan().end()));
+                        packets::sendContainerSlot(player, 0, 0, static_cast<i16>(sSlot), player->invItemId[sSlot], player->invCount[sSlot]); /* PACKETS_V15 */
                     }
                     broadcastHeldEquipment(player);
                 }
@@ -9060,10 +9924,7 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             const std::string recipeId = data.readString();
             (void)data.readBool(); // makeAll (shift-click)
             if (!recipeId.empty()) {
-                net::Buffer gr;
-                gr.writeByte(static_cast<u8>(recipeWindowId & 0xFF));
-                gr.writeString(recipeId);
-                player->getConnection()->sendPacket(0x37, std::vector<u8>(gr.writtenSpan().begin(), gr.writtenSpan().end()));
+                packets::sendPlaceGhostRecipe(player, recipeWindowId, recipeId);
             }
             break;
         }
@@ -9073,7 +9934,12 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             const u8 steerFlags = static_cast<u8>(data.readByte());
             player->vehicleSideways = steerSideways;
             player->vehicleForward = steerForward;
-            if ((steerFlags & 0x02) != 0) vehicleDismount(player); // shift = leave the vehicle
+            // VEHSHIFT_V1: 0x26 carries the CURRENT key state every tick, not a keypress.
+            // Mounting with shift held threw the player straight back out. Dismount only
+            // on a fresh press: the latch clears once shift is released.
+            const bool steerSneak = (steerFlags & 0x02) != 0;
+            if (!steerSneak) player->vehicleSneakLatched = false;
+            else if (!player->vehicleSneakLatched) vehicleDismount(player);
             break;
         }
         case 0x27: { // Pong (ответ на play-ping) — принимаем, состояние не храним
@@ -9187,6 +10053,12 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
             NC_DEBUG("Sign", "{} wrote a sign at {} {} {} ({}): {} | {} | {} | {}", player->getName(),
                      sgx, sgy, sgz, signFront ? "front" : "back",
                      signLines[0], signLines[1], signLines[2], signLines[3]);
+            { // SIGNSEND_V1: разослать новый текст всем, иначе его увидит только автор
+                const std::array<std::string, 4> sgLines{signLines[0], signLines[1], signLines[2], signLines[3]};
+                const std::vector<u8> sgPkt = buildSignBeData(sgx, sgy, sgz, sgLines);
+                for (auto& sgP : getAllPlayersCopy())
+                    if (sgP && sgP->isAlive()) sgP->getConnection()->sendPacket(0x07, sgPkt);
+            }
             break;
         }
         case 0x37: { // ALLPACKETS_V2: Spectate - jump to the picked player in spectator mode
@@ -9199,11 +10071,8 @@ void NetherCraftServer::handlePlay(std::shared_ptr<entity::Player> player, net::
                         target->getUuid().leastSignificant != specLo) continue;
                     player->setPosition(target->getX(), target->getY(), target->getZ());
                     sendPlayerPositionAndLook(player);
-                    { // CAMERA_V8: Set Camera (0x52) — в ванилке спектатор смотрит глазами цели
-                        net::Buffer cam;
-                        cam.writeVarInt(static_cast<i32>(target->getEntityId()));
-                        player->getConnection()->sendPacket(0x52, std::vector<u8>(cam.writtenSpan().begin(), cam.writtenSpan().end()));
-                    }
+                    // CAMERA_V8: в ванилке спектатор смотрит глазами цели
+                    packets::sendSetCamera(player, static_cast<i32>(target->getEntityId()));
                     break;
                 }
             }
@@ -9233,6 +10102,29 @@ std::vector<std::shared_ptr<entity::Player>> NetherCraftServer::getAllPlayersCop
 // ============================================================
 
 // CHEST_V1: Open Screen 0x33 (generic_9x3) + полная синхронизация содержимого.
+// CHESTBOAT_V1: открыть сундук лодки-сундука. Контейнер тот же chests_, но ключ
+// строится от eid сущности, а не от позиции блока.
+void NetherCraftServer::openVehicleChestFor(const std::shared_ptr<entity::Player>& player, i32 vehicleEid) {
+    if (!player || !player->isAlive()) return;
+    const u64 key = entityContainerKey(vehicleEid);
+    {
+        std::lock_guard lock(chestsMutex_);
+        (void)chests_[key];
+    }
+    const i32 wid = player->nextWindowId++;
+    if (player->nextWindowId > 99) player->nextWindowId = 1;
+    player->openWindowId = wid;
+    player->openContainerKey = key;
+    player->openContainerKey2 = 0;
+    player->openIsDouble = false;
+    player->openIsEnder = false;
+    player->openContSlots = 27;      // CONTAINER_V1
+    player->openContKind = CK_CHEST; // CONTAINER_V1
+    player->openBlockState = 0;
+    packets::sendOpenScreen(player, wid, 2, config_.language == "rus" ? "Лодка с сундуком" : "Chest Boat");
+    sendContainerContent(player);
+}
+
 void NetherCraftServer::openChestFor(const std::shared_ptr<entity::Player>& player, i32 bx, i32 by, i32 bz, bool isEnder) {
     if (!player || !player->isAlive()) return;
     const u64 key = chestPosKey(bx, by, bz);
@@ -9241,6 +10133,8 @@ void NetherCraftServer::openChestFor(const std::shared_ptr<entity::Player>& play
     u64 key1 = key, key2 = 0;
     i32 bx2 = bx, bz2 = bz;
     const i32 st0 = world_.getBlock(bx, by, bz);
+    const i32 ckind = isEnder ? static_cast<i32>(CK_ENDER) : containerKindOfState(st0); // CONTAINER_V1
+    const int cslots = containerSlotsOf(ckind);                                         // CONTAINER_V1
     if (!isEnder && (isChestBlockState(st0) || isTrappedChestState(st0))) {
         const i32 base = isChestBlockState(st0) ? 2954 : 9119;
         const i32 f = (st0 - base) / 6;
@@ -9272,21 +10166,31 @@ void NetherCraftServer::openChestFor(const std::shared_ptr<entity::Player>& play
     player->openContainerKey2 = isDouble ? key2 : 0; // CHEST_V3
     player->openIsDouble = isDouble;                 // CHEST_V3
     player->openIsEnder = isEnder;
-    net::Buffer buf;
-    buf.writeVarInt(wid);
-    buf.writeVarInt(isDouble ? 5 : 2); // CHEST_V3: generic_9x6 ��ля двойного, иначе generic_9x3
-    writeTextComponent(buf, isEnder ? "Эндер-сундук" : (isDouble ? "Большой сундук" : "Сундук"));
-    player->getConnection()->sendPacket(0x33, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+    player->openContSlots = cslots;                  // CONTAINER_V1
+    player->openContKind = ckind;                    // CONTAINER_V1
+    registerBlockEntity(bx, by, bz, ckind);          // CONTAINER_V2: печка/воронка начинает тикать
+    {   // PACKETS_V16 / CONTAINER_V1: свой menu type и заголовок на каждый тип контейнера
+        const bool ruTitle = (config_.language == "rus");
+        const char* title = isDouble ? (ruTitle ? "Большой сундук" : "Large Chest")
+                                     : containerTitleOf(ckind, ruTitle);
+        packets::sendOpenScreen(player, wid, isDouble ? 5 : containerMenuTypeOf(ckind), title);
+    }
     sendContainerContent(player);
     player->openBlockState = world_.getBlock(bx, by, bz); // CHEST_V2: запоминаем блок для анимации
     const int viewers = countChestViewers(player->openContainerKey, isEnder);
-    broadcastChestLid(bx, by, bz, player->openBlockState, viewers);
-    if (isDouble) broadcastChestLid(bx2, by, bz2, world_.getBlock(bx2, by, bz2), viewers); // CHEST_V3: крышка второй половины
-    if (viewers == 1) // CHEST_V2: первый зритель — звук открытия
-        broadcastBlockSound(isEnder ? "minecraft:block.ender_chest.open" : "minecraft:block.chest.open", bx, by, bz, 0.5f, 0.95f);
+    // CONTAINER_V1: крышка (Block Action) есть только у сундуков; у бочки свой звук, у остальных нет и его.
+    const bool lidKind = (ckind == CK_CHEST || ckind == CK_TRAPPED || ckind == CK_ENDER);
+    if (lidKind) {
+        broadcastChestLid(bx, by, bz, player->openBlockState, viewers);
+        if (isDouble) broadcastChestLid(bx2, by, bz2, world_.getBlock(bx2, by, bz2), viewers); // CHEST_V3: крышка второй половины
+        if (viewers == 1) // CHEST_V2: первый зритель — звук открытия
+            broadcastBlockSound(isEnder ? "minecraft:block.ender_chest.open" : "minecraft:block.chest.open", bx, by, bz, 0.5f, 0.95f);
+    } else if (viewers == 1 && ckind == CK_BARREL) {
+        broadcastBlockSound("minecraft:block.barrel.open", bx, by, bz, 0.5f, 0.95f);
+    }
 }
 
-// CHEST_V2: сколько игроков сейчас держат открытым сундук с данным ключо�� позиции.
+// CHEST_V2: сколько игроков сейчас держат открытым сундук с данным ключом позиции.
 int NetherCraftServer::countChestViewers(u64 key, bool ender) {
     int n = 0;
     for (auto& p : getAllPlayersCopy())
@@ -9338,23 +10242,19 @@ void NetherCraftServer::broadcastBlockSound(const char* name, i32 bx, i32 by, i3
     s.writeI64(0);            // seed
     auto vec = std::vector<u8>(s.writtenSpan().begin(), s.writtenSpan().end());
     for (auto& p : getAllPlayersCopy()) // JOINSAFE_V1
-        if (p && p->isAlive() && p->playReady && p->getState() == entity::PlayerState::Play) p->getConnection()->sendPacket(0x68, vec);
+        if (p && p->isAlive() && p->playReady && p->getState() == entity::PlayerState::Play) p->getConnection()->sendPacket(0x68, vec, true); /* NETQUEUE_V1 */
 }
 
 // SHIELD_V1: метаданные «руки заняты» (Set Entity Metadata 0x58, index 8, byte) —
-// активная фаза щита в��дна остальным игрокам.
+// активная фаза щита видна остальным игрокам.
 void NetherCraftServer::broadcastHandState(const std::shared_ptr<entity::Player>& player) {
     if (!player) return;
-    net::Buffer m;
-    m.writeVarInt(static_cast<i32>(player->getEntityId()));
-    m.writeByte(8);   // index 8: LivingEntity hand states
-    m.writeVarInt(0); // сериализатор 0: byte
-    m.writeByte(player->usingShield ? static_cast<u8>(0x01 | (player->usingShieldHand == 1 ? 0x02 : 0x00)) : 0x00); // bit0 = active, bit1 = offhand
-    m.writeByte(0xFF); // конец метаданных
-    auto v = std::vector<u8>(m.writtenSpan().begin(), m.writtenSpan().end());
+    /* PACKETS_V21 */
+    const auto v = packets::buildEntityHandStates(static_cast<i32>(player->getEntityId()),
+        player->usingShield, player->usingShieldHand == 1);
     for (auto& p : getAllPlayersCopy())
         if (p && p != player && p->isAlive() && p->getState() == entity::PlayerState::Play)
-            p->getConnection()->sendPacket(0x58, v);
+            p->getConnection()->sendPacket(packets::cb::SetEntityMetadata, v);
 }
 
 // CHEST_V2: игрок закрыл окно сундука — обновить анимацию крышки и звук закрытия.
@@ -9368,13 +10268,14 @@ void NetherCraftServer::handleChestWindowClosed(const std::shared_ptr<entity::Pl
     player->openWindowId = 0;
     player->openIsDouble = false;     // CHEST_V3
     player->openContainerKey2 = 0;    // CHEST_V3
+    if (isEntityContainerKey(key)) return; // CHESTBOAT_V1: у лодки нет крышки и блока в мире
     i32 bx = 0, by = 0, bz = 0;
     decodeChestPosKey(key, bx, by, bz);
     const i32 st = world_.getBlock(bx, by, bz);
     if (!isChestBlockState(st) && !isTrappedChestState(st) && !isEnderChestState(st)) return; // блока уже нет
     const int viewers = countChestViewers(key, ender);
     broadcastChestLid(bx, by, bz, st, viewers);
-    if (key2 != 0) { // CHEST_V3: крышка в��орой половины двойного сундука
+    if (key2 != 0) { // CHEST_V3: крышка второй половины двойного сундука
         i32 qx = 0, qy = 0, qz = 0;
         decodeChestPosKey(key2, qx, qy, qz);
         const i32 st2 = world_.getBlock(qx, qy, qz);
@@ -9385,9 +10286,483 @@ void NetherCraftServer::handleChestWindowClosed(const std::shared_ptr<entity::Pl
 }
 
 // CHEST_V1: Container Set Content 0x13 для открытого окна сундука (27 + 36 слотов).
+// ============================================================
+// CONTAINER_V2: поведение блок-сущностей — плавка и перекачка.
+// Слоты печки: 0 сырьё, 1 топливо, 2 результат. Слоты воронки: 0..4.
+// ============================================================
+
+// Рецепт плавки: имя сырья -> (имя результата, категория).
+// Категория: 0 — только обычная печь, 1 — еда (ещё коптильня), 2 — руда (ещё домна).
+struct SmeltRecipe { i32 result; i32 category; };
+
+static const std::unordered_map<i32, SmeltRecipe>& smeltTable() {
+    static const std::unordered_map<i32, SmeltRecipe> table = []{
+        static const struct { const char* in; const char* out; i32 cat; } kRaw[] = {
+            {"ironore", "iron_ingot", 2}, {"deepslate_iron_ore", "iron_ingot", 2},
+            {"raw_iron", "iron_ingot", 2}, {"gold_ore", "gold_ingot", 2},
+            {"deepslate_gold_ore", "gold_ingot", 2}, {"raw_gold", "gold_ingot", 2},
+            {"nether_gold_ore", "gold_ingot", 2}, {"copper_ore", "copper_ingot", 2},
+            {"deepslate_copper_ore", "copper_ingot", 2}, {"raw_copper", "copper_ingot", 2},
+            {"coal_ore", "coal", 2}, {"deepslate_coal_ore", "coal", 2},
+            {"diamond_ore", "diamond", 2}, {"deepslate_diamond_ore", "diamond", 2},
+            {"emerald_ore", "emerald", 2}, {"deepslate_emerald_ore", "emerald", 2},
+            {"lapis_ore", "lapis_lazuli", 2}, {"deepslate_lapis_ore", "lapis_lazuli", 2},
+            {"redstone_ore", "redstone", 2}, {"deepslate_redstone_ore", "redstone", 2},
+            {"nether_quartz_ore", "quartz", 2}, {"ancient_debris", "netherite_scrap", 2},
+            {"golden_pickaxe", "gold_nugget", 2}, {"golden_sword", "gold_nugget", 2},
+            {"iron_pickaxe", "iron_nugget", 2}, {"iron_sword", "iron_nugget", 2},
+            {"beef", "cooked_beef", 1}, {"porkchop", "cooked_porkchop", 1},
+            {"chicken", "cooked_chicken", 1}, {"mutton", "cooked_mutton", 1},
+            {"rabbit", "cooked_rabbit", 1}, {"cod", "cooked_cod", 1},
+            {"salmon", "cooked_salmon", 1}, {"potato", "baked_potato", 1},
+            {"kelp", "dried_kelp", 1},
+            {"sand", "glass", 0}, {"red_sand", "glass", 0}, {"cobblestone", "stone", 0},
+            {"stone", "smooth_stone", 0}, {"cobbled_deepslate", "deepslate", 0},
+            {"clay_ball", "brick", 0}, {"clay", "terracotta", 0},
+            {"netherrack", "nether_brick", 0}, {"wet_sponge", "sponge", 0},
+            {"cactus", "green_dye", 0}, {"sea_pickle", "lime_dye", 0},
+            {"chorus_fruit", "popped_chorus_fruit", 0}, {"basalt", "smooth_basalt", 0},
+            {"stone_bricks", "cracked_stone_bricks", 0},
+            {"nether_bricks", "cracked_nether_bricks", 0},
+            {"deepslate_bricks", "cracked_deepslate_bricks", 0},
+            {"deepslate_tiles", "cracked_deepslate_tiles", 0},
+            {"polished_blackstone_bricks", "cracked_polished_blackstone_bricks", 0},
+            {"quartz_block", "smooth_quartz", 0}, {"sandstone", "smooth_sandstone", 0},
+            {"red_sandstone", "smooth_red_sandstone", 0},
+            {"oak_log", "charcoal", 0}, {"spruce_log", "charcoal", 0},
+            {"birch_log", "charcoal", 0}, {"jungle_log", "charcoal", 0},
+            {"acacia_log", "charcoal", 0}, {"dark_oak_log", "charcoal", 0},
+            {"cherry_log", "charcoal", 0}, {"mangrove_log", "charcoal", 0},
+            {"crimson_stem", "charcoal", 0}, {"warped_stem", "charcoal", 0},
+        };
+        std::unordered_map<i32, SmeltRecipe> m;
+        for (const auto& r : kRaw) {
+            const i32 in = nc::gen::itemIdByName(r.in);
+            const i32 out = nc::gen::itemIdByName(r.out);
+            if (in > 0 && out > 0) m.emplace(in, SmeltRecipe{out, r.cat});
+        }
+        return m;
+    }();
+    return table;
+}
+
+// Результат плавки для конкретного типа печки (0 = этот предмет здесь не правится).
+static i32 smeltResultFor(i32 itemId, i32 kind) {
+    if (itemId <= 0) return 0;
+    const auto& t = smeltTable();
+    const auto it = t.find(itemId);
+    if (it == t.end()) return 0;
+    if (kind == CK_SMOKER && it->second.category != 1) return 0;
+    if (kind == CK_BLAST_FURNACE && it->second.category != 2) return 0;
+    return it->second.result;
+}
+
+// Сколько тиков горит предмет (0 = не топливо).
+static i32 fuelBurnTicksFor(i32 itemId) {
+    if (itemId <= 0) return 0;
+    static const std::unordered_map<i32, i32>& fuels = []() -> const std::unordered_map<i32, i32>& {
+        static std::unordered_map<i32, i32> m;
+        static const struct { const char* name; i32 ticks; } kExact[] = {
+            {"coal", 1600}, {"charcoal", 1600}, {"coal_block", 16000},
+            {"lava_bucket", 20000}, {"blaze_rod", 2400}, {"dried_kelp_block", 4000},
+            {"stick", 100}, {"bamboo", 50}, {"scaffolding", 50}, {"bowl", 100},
+            {"crafting_table", 300}, {"bookshelf", 300}, {"chest", 300},
+            {"trapped_chest", 300}, {"barrel", 300}, {"ladder", 300},
+            {"note_block", 300}, {"jukebox", 300}, {"loom", 300}, {"lectern", 300},
+            {"cartography_table", 300}, {"fletching_table", 300}, {"smithing_table", 300},
+            {"dead_bush", 100}, {"azalea", 100},
+        };
+        for (const auto& f : kExact) {
+            const i32 id = nc::gen::itemIdByName(f.name);
+            if (id > 0) m.emplace(id, f.ticks);
+        }
+        // Суффиксные правила дешевле, чем выписывать все породы дерева руками.
+        static const struct { const char* suffix; i32 ticks; } kSuffix[] = {
+            {"_planks", 300}, {"_log", 300}, {"_wood", 300}, {"_stem", 300},
+            {"_hyphae", 300}, {"_slab", 150}, {"_stairs", 300}, {"_fence", 300},
+            {"_fence_gate", 300}, {"_door", 200}, {"_trapdoor", 300},
+            {"_sign", 200}, {"_sapling", 100}, {"_wool", 100}, {"_carpet", 67},
+            {"_boat", 1200}, {"_button", 100}, {"_pressure_plate", 300},
+            {"_sword", 200}, {"_pickaxe", 200}, {"_axe", 200}, {"_shovel", 200}, {"_hoe", 200},
+        };
+        for (i32 id = 1; id < 1400; ++id) {
+            const std::string n = nc::gen::itemNameById(id);
+            if (n.empty() || m.count(id)) continue;
+            const bool wooden = n.rfind("wooden", 0) == 0 || n.find("oak") != std::string::npos ||
+                                n.find("spruce") != std::string::npos || n.find("birch") != std::string::npos ||
+                                n.find("jungle") != std::string::npos || n.find("acacia") != std::string::npos ||
+                                n.find("cherry") != std::string::npos || n.find("mangrove") != std::string::npos ||
+                                n.find("bamboo") != std::string::npos || n.find("crimson") != std::string::npos ||
+                                n.find("warped") != std::string::npos;
+            for (const auto& s : kSuffix) {
+                const std::string suf = s.suffix;
+                if (n.size() <= suf.size() || n.compare(n.size() - suf.size(), suf.size(), suf) != 0) continue;
+                const bool needWood = (suf != "_wool" && suf != "_carpet");
+                if (needWood && !wooden) break;
+                m.emplace(id, s.ticks);
+                break;
+            }
+        }
+        return m;
+    }();
+    const auto it = fuels.find(itemId);
+    return it == fuels.end() ? 0 : it->second;
+}
+
+// Соседнее состояние того же блока с другим lit и тем же facing.
+// Ищем поиском рядом, а не смещением: порядок свойств в таблице не гарантирован.
+static i32 furnaceLitState(i32 st, bool lit) {
+    const std::string_view name = stateNameOf(st);
+    if (name.empty()) return st;
+    const auto* cur = registries::RegistryManager::instance().blockStates().getById(st);
+    if (!cur) return st;
+    const auto curFacing = cur->properties.find("facing");
+    for (i32 d = -16; d <= 16; ++d) {
+        const i32 cand = st + d;
+        if (cand <= 0 || cand == st) continue;
+        if (stateNameOf(cand) != name) continue;
+        if (!stateHasProp(cand, "lit", lit ? "true" : "false")) continue;
+        const auto* bs = registries::RegistryManager::instance().blockStates().getById(cand);
+        if (!bs) continue;
+        const auto candFacing = bs->properties.find("facing");
+        if (curFacing != cur->properties.end() && candFacing != bs->properties.end() &&
+            curFacing->second != candFacing->second) continue;
+        return cand;
+    }
+    return st;
+}
+
+// Направление воронки по свойству facing.
+static void hopperFacingOffset(i32 st, i32& dx, i32& dy, i32& dz) {
+    dx = 0; dy = -1; dz = 0;
+    if (stateHasProp(st, "facing", "down"))  { dx = 0; dy = -1; dz = 0; return; }
+    if (stateHasProp(st, "facing", "north")) { dx = 0; dy = 0; dz = -1; return; }
+    if (stateHasProp(st, "facing", "south")) { dx = 0; dy = 0; dz = 1; return; }
+    if (stateHasProp(st, "facing", "west"))  { dx = -1; dy = 0; dz = 0; return; }
+    if (stateHasProp(st, "facing", "east"))  { dx = 1; dy = 0; dz = 0; return; }
+}
+
+void NetherCraftServer::registerBlockEntity(i32 bx, i32 by, i32 bz, i32 kind) {
+    if (kind != CK_FURNACE && kind != CK_BLAST_FURNACE && kind != CK_SMOKER && kind != CK_HOPPER) return;
+    const u64 key = chestPosKey(bx, by, bz);
+    std::lock_guard lk(chestsMutex_);
+    blockEnts_[key] = kind;
+}
+
+void NetherCraftServer::forgetBlockEntity(u64 key) {
+    std::lock_guard lk(chestsMutex_);
+    blockEnts_.erase(key);
+    furnaces_.erase(key);
+}
+
+// SPAWNER_V1: блок-спавнер оживает.
+// До этого спавнер был просто декоративным блоком: тип моба негде было хранить,
+// и ванильный SpawnData терялся на импорте. Правила как в BaseSpawner.java:
+// тикаем только когда игрок ближе requiredPlayerRange, при срабатывании пытаемся
+// спавнить spawnCount раз в кубе spawnRange, и не больше maxNearby мобов рядом.
+void NetherCraftServer::tickSpawners() {
+    std::vector<std::pair<u64, SpawnerData>> list;
+    {
+        std::lock_guard lk(spawnersMutex_);
+        if (spawners_.empty()) return;
+        for (const auto& e : spawners_) list.push_back(e);
+    }
+    auto players = getAllPlayersCopy();
+    std::vector<u64> dead;
+    std::vector<std::pair<u64, i32>> newDelays;
+
+    for (auto& entry : list) {
+        i32 bx = 0, by = 0, bz = 0;
+        world::extra::unpackPos(static_cast<i64>(entry.first), bx, by, bz);
+        std::string_view sn = stateNameOf(world_.getBlock(bx, by, bz));
+        if (sn.rfind("minecraft:", 0) == 0) sn.remove_prefix(10);
+        if (sn != "spawner") {
+            dead.push_back(entry.first); // блок убрали
+            continue;
+        }
+        SpawnerData& sp = entry.second;
+        if (sp.typeIdx < 0) continue; // тип моба ядро не знает — молча стоим, но запись бережём
+
+        bool playerNear = false; // SPAWNER_V1: не "near" — MSVC держит это имя под макрос
+        const f64 rr = static_cast<f64>(sp.requiredPlayerRange) * static_cast<f64>(sp.requiredPlayerRange);
+        for (auto& p : players) {
+            if (!p || !p->isAlive() || p->dimension != 0) continue;
+            const f64 dx = p->getX() - (static_cast<f64>(bx) + 0.5);
+            const f64 dy = p->getY() - static_cast<f64>(by);
+            const f64 dz = p->getZ() - (static_cast<f64>(bz) + 0.5);
+            if (dx * dx + dy * dy + dz * dz <= rr) { playerNear = true; break; }
+        }
+        if (!playerNear) continue;
+
+        if (sp.delay > 0) { newDelays.push_back({entry.first, sp.delay - 1}); continue; }
+
+        // Сколько своих уже крутится рядом — ванильный предел против лавины.
+        int nearby = 0;
+        {
+            std::lock_guard lk(mobsMutex_);
+            for (const auto& m : mobs_) {
+                if (m.dead || m.typeIdx != sp.typeIdx || m.dimension != 0) continue;
+                const f64 dx = m.x - (static_cast<f64>(bx) + 0.5);
+                const f64 dy = m.y - static_cast<f64>(by);
+                const f64 dz = m.z - (static_cast<f64>(bz) + 0.5);
+                const f64 r = static_cast<f64>(sp.spawnRange) + 1.0;
+                if (dx * dx + dz * dz <= r * r * 4.0 && dy * dy <= 16.0) ++nearby;
+            }
+        }
+
+        if (nearby < sp.maxNearby) {
+            for (i32 i = 0; i < sp.spawnCount; ++i) {
+                const f64 ox = (static_cast<f64>(std::rand() % 2001) / 1000.0 - 1.0) * static_cast<f64>(sp.spawnRange);
+                const f64 oz = (static_cast<f64>(std::rand() % 2001) / 1000.0 - 1.0) * static_cast<f64>(sp.spawnRange);
+                const i32 oy = (std::rand() % 3) - 1;
+                const i32 sx = static_cast<i32>(std::floor(static_cast<f64>(bx) + 0.5 + ox));
+                const i32 sy = by + oy;
+                const i32 sz = static_cast<i32>(std::floor(static_cast<f64>(bz) + 0.5 + oz));
+                if (world_.getBlock(sx, sy, sz) != 0 || world_.getBlock(sx, sy + 1, sz) != 0) continue; // нужно два воздуха
+                if (world_.getBlock(sx, sy - 1, sz) == 0) continue;                                    // и пол под ногами
+                spawnMobAt(sp.typeIdx, static_cast<f64>(sx) + 0.5, static_cast<f64>(sy),
+                           static_cast<f64>(sz) + 0.5, 0, 1, false);
+            }
+            broadcastBlockSound("minecraft:block.beacon.ambient", bx, by, bz, 0.3f, 1.6f);
+        }
+        const i32 span = (sp.maxDelay > sp.minDelay) ? (sp.maxDelay - sp.minDelay) : 1;
+        newDelays.push_back({entry.first, sp.minDelay + (std::rand() % span)});
+    }
+
+    if (dead.empty() && newDelays.empty()) return;
+    std::lock_guard lk(spawnersMutex_);
+    for (const u64 k : dead) spawners_.erase(k);
+    for (const auto& d : newDelays) {
+        auto it = spawners_.find(d.first);
+        if (it != spawners_.end()) it->second.delay = d.second;
+    }
+}
+
+// CONTAINER_V2: один такт воронки — один предмет вниз/вперёд и один из того, что сверху.
+void NetherCraftServer::tickHopperAt(u64 key, i32 st, i32 bx, i32 by, i32 bz, std::vector<u64>& refresh) {
+    i32 dx = 0, dy = -1, dz = 0;
+    hopperFacingOffset(st, dx, dy, dz);
+    const i32 tx = bx + dx, ty = by + dy, tz = bz + dz;
+    const i32 tKind = containerKindOfState(world_.getBlock(tx, ty, tz));
+    const u64 tKey = chestPosKey(tx, ty, tz);
+    const i32 aKind = containerKindOfState(world_.getBlock(bx, by + 1, bz));
+    const u64 aKey = chestPosKey(bx, by + 1, bz);
+    const bool pushOk = (tKind != CK_NONE && tKind != CK_ENDER);
+    const bool pullOk = (aKind != CK_NONE && aKind != CK_ENDER);
+    if (!pushOk && !pullOk) return;
+
+    // CONTAINER_V3: лежащий сверху дроп втягивается целиком — раньше воронка
+    // видела только контейнеры, и автосборщик под фермой не работал.
+    // Берём до chestsMutex_: обратный порядок блокировок где-то ещё даст взаимную.
+    std::vector<std::pair<i32, i32>> sucked; // itemId, count
+    std::vector<i32> suckedEids;
+    {
+        std::lock_guard dl(itemDropsMutex_);
+        for (auto it = itemDrops_.begin(); it != itemDrops_.end();) {
+            const bool inside = it->itemId > 0 && it->count > 0 &&
+                std::fabs(it->x - (static_cast<f64>(bx) + 0.5)) <= 0.75 &&
+                std::fabs(it->z - (static_cast<f64>(bz) + 0.5)) <= 0.75 &&
+                it->y >= static_cast<f64>(by) + 0.5 && it->y <= static_cast<f64>(by) + 1.9;
+            if (!inside) { ++it; continue; }
+            sucked.push_back({it->itemId, it->count});
+            suckedEids.push_back(it->eid);
+            it = itemDrops_.erase(it);
+        }
+    }
+    if (!suckedEids.empty()) {
+        const auto bytes = packets::buildRemoveEntities(suckedEids); /* PACKETS_V15 */
+        for (auto& p : getAllPlayersCopy())
+            if (p && p->isAlive()) p->getConnection()->sendPacket(0x42, bytes);
+    }
+
+    std::lock_guard lk(chestsMutex_);
+    // сначала создаём все записи, иначе рехеш протухнет ссылки (как в CHEST_V3)
+    (void)chests_[key];
+    if (pushOk) (void)chests_[tKey];
+    if (pullOk) (void)chests_[aKey];
+    ChestData& h = chests_[key];
+
+    for (const auto& s : sucked) { // CONTAINER_V3: сначала в частичные стопки, потом в пустые
+        i32 left = s.second;
+        for (int i = 0; i < 5 && left > 0; ++i)
+            if (h.count[i] > 0 && h.itemId[i] == s.first && h.count[i] < 64) {
+                const i32 add = std::min(left, 64 - h.count[i]);
+                h.count[i] += add; left -= add;
+            }
+        for (int i = 0; i < 5 && left > 0; ++i)
+            if (h.count[i] <= 0) {
+                const i32 add = std::min(left, 64);
+                h.itemId[i] = s.first; h.count[i] = add; left -= add;
+            }
+        if (left > 0) spawnItemDrop(static_cast<f64>(bx) + 0.5, static_cast<f64>(by) + 1.0,
+                                    static_cast<f64>(bz) + 0.5, s.first, left,
+                                    0.0, 0.05, 0.0, 20); // не влезло — вернём миру
+        refresh.push_back(key);
+    }
+
+    if (pushOk) {
+        ChestData& dst = chests_[tKey];
+        const int dstSlots = containerSlotsOf(tKind);
+        const bool dstFurnace = (tKind == CK_FURNACE || tKind == CK_BLAST_FURNACE || tKind == CK_SMOKER);
+        for (int s = 0; s < 5; ++s) {
+            if (h.count[s] <= 0 || h.itemId[s] <= 0) continue;
+            int lo = 0, hi = dstSlots;
+            if (dstFurnace) { // сверху сырьё, сбоку топливо — как в ванилле
+                if (dy == 0) { lo = 1; hi = 2; } else { lo = 0; hi = 1; }
+            }
+            int into = -1;
+            for (int d = lo; d < hi; ++d)
+                if (dst.count[d] > 0 && dst.itemId[d] == h.itemId[s] && dst.count[d] < 64) { into = d; break; }
+            if (into < 0)
+                for (int d = lo; d < hi; ++d)
+                    if (dst.count[d] <= 0) { into = d; dst.itemId[d] = h.itemId[s]; dst.count[d] = 0; break; }
+            if (into < 0) continue;
+            ++dst.count[into];
+            if (--h.count[s] <= 0) { h.count[s] = 0; h.itemId[s] = 0; }
+            refresh.push_back(key);
+            refresh.push_back(tKey);
+            break;
+        }
+    }
+
+    if (pullOk) {
+        ChestData& src = chests_[aKey];
+        const bool srcFurnace = (aKind == CK_FURNACE || aKind == CK_BLAST_FURNACE || aKind == CK_SMOKER);
+        int lo = 0, hi = containerSlotsOf(aKind);
+        if (srcFurnace) { lo = 2; hi = 3; } // из печки тянем только готовое
+        int from = -1;
+        for (int s = lo; s < hi; ++s)
+            if (src.count[s] > 0 && src.itemId[s] > 0) { from = s; break; }
+        if (from >= 0) {
+            int into = -1;
+            for (int s = 0; s < 5; ++s)
+                if (h.count[s] > 0 && h.itemId[s] == src.itemId[from] && h.count[s] < 64) { into = s; break; }
+            if (into < 0)
+                for (int s = 0; s < 5; ++s)
+                    if (h.count[s] <= 0) { into = s; h.itemId[s] = src.itemId[from]; h.count[s] = 0; break; }
+            if (into >= 0) {
+                ++h.count[into];
+                if (--src.count[from] <= 0) { src.count[from] = 0; src.itemId[from] = 0; }
+                refresh.push_back(key);
+                refresh.push_back(aKey);
+            }
+        }
+    }
+}
+
+// CONTAINER_V2: главный тик блок-сущностей. Сначала снимаем список под блокировкой,
+// потом работаем без неё: рассылка пакетов сама берёт chestsMutex_.
+void NetherCraftServer::tickBlockEntities() {
+    std::vector<std::pair<u64, i32>> ents;
+    {
+        std::lock_guard lk(chestsMutex_);
+        if (blockEnts_.empty()) return;
+        ents.reserve(blockEnts_.size());
+        for (const auto& e : blockEnts_) ents.push_back(e);
+    }
+    static const i32 kLavaBucketId = nc::gen::itemIdByName("lava_bucket");
+    static const i32 kBucketId = nc::gen::itemIdByName("bucket");
+    const bool hopperTick = (tickCounter_ % 8) == 0;
+
+    struct LitChange { i32 x; i32 y; i32 z; bool lit; };
+    std::vector<LitChange> litChanges;
+    std::vector<u64> refresh;
+    std::vector<std::pair<u64, FurnaceData>> props;
+
+    for (const auto& ent : ents) {
+        const u64 key = ent.first;
+        const i32 kind = ent.second;
+        i32 bx = 0, by = 0, bz = 0;
+        world::extra::unpackPos(static_cast<i64>(key), bx, by, bz);
+        const i32 st = world_.getBlock(bx, by, bz);
+        if (containerKindOfState(st) != kind) { forgetBlockEntity(key); continue; } // блок ушёл
+
+        if (kind == CK_HOPPER) {
+            if (hopperTick) tickHopperAt(key, st, bx, by, bz, refresh);
+            continue;
+        }
+
+        bool wasLit = false, nowLit = false, changed = false;
+        FurnaceData snapshot;
+        {
+            std::lock_guard lk(chestsMutex_);
+            ChestData& c = chests_[key];
+            FurnaceData& f = furnaces_[key];
+            wasLit = f.burn > 0;
+            if (f.burn > 0) --f.burn;
+            const i32 result = (c.count[0] > 0) ? smeltResultFor(c.itemId[0], kind) : 0;
+            const bool outOk = result > 0 &&
+                (c.count[2] <= 0 || (c.itemId[2] == result && c.count[2] < 64));
+            if (outOk && f.burn == 0 && c.itemId[1] > 0 && c.count[1] > 0) {
+                const i32 ft = fuelBurnTicksFor(c.itemId[1]);
+                if (ft > 0) { // коптильня и домна жгут вдвое быстрее
+                    f.burnTotal = f.burn = (kind == CK_FURNACE) ? ft : ft / 2;
+                    if (kLavaBucketId > 0 && c.itemId[1] == kLavaBucketId && kBucketId > 0) c.itemId[1] = kBucketId;
+                    else if (--c.count[1] <= 0) { c.count[1] = 0; c.itemId[1] = 0; }
+                    changed = true;
+                }
+            }
+            if (outOk && f.burn > 0) {
+                f.cookTotal = (kind == CK_FURNACE) ? 200 : 100;
+                if (++f.cook >= f.cookTotal) {
+                    f.cook = 0;
+                    if (c.count[2] <= 0) { c.itemId[2] = result; c.count[2] = 1; }
+                    else ++c.count[2];
+                    if (--c.count[0] <= 0) { c.count[0] = 0; c.itemId[0] = 0; }
+                    changed = true;
+                }
+            } else if (f.cook > 0) {
+                f.cook -= 2; // ванильное остывание вдвое быстрее нагрева
+                if (f.cook < 0) f.cook = 0;
+            }
+            nowLit = f.burn > 0;
+            snapshot = f;
+            const bool idle = !nowLit && f.cook == 0 &&
+                c.count[0] <= 0 && c.count[1] <= 0 && c.count[2] <= 0;
+            if (idle) furnaces_.erase(key);
+        }
+        if (nowLit != wasLit) litChanges.push_back(LitChange{bx, by, bz, nowLit});
+        if (nowLit || changed || wasLit) {
+            props.push_back({key, snapshot});
+            if (changed) refresh.push_back(key);
+        }
+    }
+
+    if (litChanges.empty() && refresh.empty() && props.empty()) return;
+    auto viewers = getAllPlayersCopy();
+
+    for (const auto& lc : litChanges) { // печка загорелась или погасла
+        const i32 cur = world_.getBlock(lc.x, lc.y, lc.z);
+        const i32 ns = furnaceLitState(cur, lc.lit);
+        if (ns == cur) continue;
+        world_.setBlock(lc.x, lc.y, lc.z, ns);
+        for (auto& p : viewers)
+            if (p && p->isAlive()) packets::sendBlockUpdate(p, BlockPos{lc.x, lc.y, lc.z}, ns);
+    }
+
+    for (const auto& pr : props) { // полоски огня и стрелки у тех, кто смотрит в печку
+        for (auto& p : viewers) {
+            if (!p || !p->isAlive() || p->openWindowId == 0 || p->openIsEnder) continue;
+            if (p->openContainerKey != pr.first) continue;
+            const u8 wid = static_cast<u8>(p->openWindowId);
+            packets::sendContainerSetData(p, wid, 0, static_cast<i16>(std::min(pr.second.burn, 32767)));
+            packets::sendContainerSetData(p, wid, 1, static_cast<i16>(std::min(pr.second.burnTotal, 32767)));
+            packets::sendContainerSetData(p, wid, 2, static_cast<i16>(pr.second.cook));
+            packets::sendContainerSetData(p, wid, 3, static_cast<i16>(pr.second.cookTotal));
+        }
+    }
+
+    for (const u64 key : refresh) { // содержимое изменилось без участия игрока
+        for (auto& p : viewers)
+            if (p && p->isAlive() && p->openWindowId != 0 && !p->openIsEnder &&
+                (p->openContainerKey == key || (p->openIsDouble && p->openContainerKey2 == key)))
+                sendContainerContent(p);
+    }
+}
+
 void NetherCraftServer::sendContainerContent(const std::shared_ptr<entity::Player>& player) {
     if (!player || !player->isAlive() || player->openWindowId == 0) return;
-    const int cont = player->openIsDouble ? 54 : 27; // CHEST_V3: двойной сундук = 54 слота
+    const int cont = player->openIsDouble ? 54 : player->openContSlots; // CHEST_V3 / CONTAINER_V1: 54 у двойного сундука, иначе размер контейнера
     i32 ids[54] = {}; i32 cnts[54] = {};
     if (player->openIsEnder) {
         for (int i = 0; i < 27; ++i) { ids[i] = player->enderItemId[i]; cnts[i] = player->enderCount[i]; }
@@ -9421,7 +10796,7 @@ void NetherCraftServer::sendContainerContent(const std::shared_ptr<entity::Playe
 
 // ============================================================
 // WORLDSAVE_V1: данные игроков (world/playerdata/<ник>.txt).
-// Удалить игрока = удалить его файл в этой папке.
+// удалить игрока = удалить его файл в этой папке.
 // ============================================================
 
 // ASYNCSAVE_V1: содержимое файла игрока формируем в строку на tick-потоке
@@ -9438,13 +10813,26 @@ static std::string buildPlayerDataContent(const std::shared_ptr<entity::Player>&
     f << "\n";
     f << "MINIEDIT1 " << (player->builderWandOwned ? 1 : 0) << "\n";
     f << "TPSBAR1 " << (player->tpsBossbarEnabled ? 1 : 0) << "\n";
+    // ENDERSAVE_V1: the ender chest is personal - it lives on the player, not in
+    // chests_, so world/extra.dat never saw it and it was wiped on every restart.
+    f << "ENDER1";
+    for (int i = 0; i < 27; ++i) f << " " << player->enderItemId[i] << " " << player->enderCount[i];
+    f << "\n";
     // SKINPERSIST_V1: base64 textures/signature не содержит пробелов, поэтому формат безопасно расширяем.
     if (!player->texturesValue.empty()) f << "SKINV1 " << player->texturesValue << " " << player->texturesSignature << "\n";
+    // CAPE_V1: id плаща — одно слово без пробелов, сам URL уже внутри SKINV1.
+    { const std::string capeId = ncCapeOf(player->getName()); if (!capeId.empty()) f << "CAPEV1 " << capeId << "\n"; }
     return f.str();
 }
 
 void NetherCraftServer::savePlayerData(std::shared_ptr<entity::Player> player) {
     if (!player || player->getName().empty()) return;
+    // V57_PLAYERTAG_V1: запоминаем состояние, пока игрок ещё жив: на остановке
+    // зеркало пишется уже после кика, и брать позицию было бы не у кого.
+    if (player->dimension == 0) {
+        lastPlayerExport_ = makePlayerExport(player);
+        haveLastPlayerExport_ = true;
+    }
     std::error_code ec;
     std::filesystem::create_directories("world/playerdata", ec);
     const std::string path = "world/playerdata/" + player->getName() + ".txt";
@@ -9465,7 +10853,9 @@ void NetherCraftServer::loadPlayerData(std::shared_ptr<entity::Player> player) {
     f64 x = 0, y = 0, z = 0;
     f32 yaw = 0, pitch = 0; i32 savedMode = -1;
     if (f >> x >> y >> z >> yaw >> pitch) {
-        if ((f >> savedMode) && savedMode >= 0 && savedMode <= 3) player->gameMode = savedMode;
+        // FORCEGM_V1: раньше ключ force-gamemode только писался в файл и нигде не читался.
+        // true = сохранённый режим игнорируем, игрок возвращается в config_.gamemode.
+        if ((f >> savedMode) && savedMode >= 0 && savedMode <= 3 && !config_.forceGamemode) player->gameMode = savedMode;
         for (int slot = 0; slot < 9; ++slot) { i32 savedState = -1; if (!(f >> savedState)) break; player->hotbarBlockState[slot] = savedState; }
         // INVENTORY_V3: читаем полный инвентарь, если он записан (обратная совместимость со старым форматом)
         std::string invTag;
@@ -9494,12 +10884,26 @@ void NetherCraftServer::loadPlayerData(std::shared_ptr<entity::Player> player) {
                 sawMiniEditTag = true;
             } else if (optionalTag == "TPSBAR1") {
                 i32 enabled = 1; if (f >> enabled) player->tpsBossbarEnabled = enabled != 0;
+            } else if (optionalTag == "ENDER1") { // ENDERSAVE_V1
+                for (int i = 0; i < 27; ++i) {
+                    i32 id = 0, cnt = 0;
+                    if (!(f >> id >> cnt)) break;
+                    player->enderItemId[i] = id;
+                    player->enderCount[i] = cnt;
+                }
             } else if (optionalTag == "SKINV1") {
                 std::string savedTextures, savedSignature;
                 if (f >> savedTextures) {
                     f >> savedSignature;
                     player->texturesValue = std::move(savedTextures);
                     player->texturesSignature = std::move(savedSignature);
+                }
+            } else if (optionalTag == "CAPEV1") { // CAPE_V1
+                std::string savedCape;
+                if (f >> savedCape) {
+                    std::lock_guard<std::mutex> lkCape(g_ncCapeMutex);
+                    if (savedCape.empty()) g_ncCapeByPlayer.erase(player->getName());
+                    else g_ncCapeByPlayer[player->getName()] = savedCape;
                 }
             }
         }
@@ -9529,20 +10933,13 @@ void NetherCraftServer::streamChunks(std::shared_ptr<entity::Player> player) {
             for (i32 oz = oldCz - ur; oz <= oldCz + ur; ++oz) {
                 if (std::abs(ox - cx) <= ur && std::abs(oz - cz) <= ur) continue;
                 if (!player->hasSeenChunk(ox, oz)) continue;
-                net::Buffer uc;
-                uc.writeI32(oz); // protocol order: chunkZ then chunkX
-                uc.writeI32(ox);
-                player->getConnection()->sendPacket(0x21, std::vector<u8>(uc.writtenSpan().begin(), uc.writtenSpan().end()));
+                packets::sendUnloadChunk(player, ox, oz);
                 player->forgetChunk(ox, oz);
             }
         }
     }
 
-    net::Buffer viewBuf;
-    viewBuf.writeVarInt(cx);
-    viewBuf.writeVarInt(cz);
-    player->getConnection()->sendPacket(0x54,
-        std::vector<u8>(viewBuf.writtenSpan().begin(), viewBuf.writtenSpan().end()));
+    packets::sendSetCenterChunk(player, cx, cz); /* PACKETS_V10 */
 
     i32 r = config_.viewDistance; // VIEWDIST_V1: полный радиус, чтобы край мира не торчал до тумана
     if (r < 2) r = 2;
@@ -9560,7 +10957,7 @@ void NetherCraftServer::streamChunks(std::shared_ptr<entity::Player> player) {
 void NetherCraftServer::softReload() {
     const auto t0 = std::chrono::steady_clock::now();
     const bool ru = (config_.language == "rus");
-    { // RELOADBANNER_V1: крупный баннер — р��старт должно быть видно в консоли
+    { // RELOADBANNER_V1: крупный баннер — рестарт должно быть видно в консоли
         const char* rbBar = "============================================================";
         std::cout << "\n\033[33m" << rbBar << "\n"
                   << (ru ? ">>>            МЯГКИЙ РЕСТАРТ СЕРВЕРА            <<<\n"
@@ -9581,7 +10978,7 @@ void NetherCraftServer::softReload() {
     for (auto& p : all) if (p && p->isAlive())
         p->kick(ru ? "§eСервер перезагружается..." : "§eServer is restarting...");
 
-    // 3) сохранить мир СИНХРО��НО (внутри — атомарная подмена файла, мир не потеряется)
+    // 3) сохранить мир СИНХРОННО (внутри — атомарная подмена файла, мир не потеряется)
     saveWorlds(); // DIMSAVE_V1
 
     // 4) очистить серверное состояние (disconnect-коллбэки повторный erase переживут)
@@ -9613,9 +11010,13 @@ void NetherCraftServer::softReload() {
     if (!configPath_.empty()) config_ = ServerConfig::loadFrom(configPath_);
     world_.setLanguageRu(config_.language == "rus");
 
-    // 7) поднять мир обратно с только что сохранённого файла (в фоне, как при старте)
-    if (!world_.startBackgroundLoad("world/overworld/world.dat")) {
-        NC_WARN("Server", ru ? "��ягкий рестарт: world.dat не прочитан — чанки сгенерируются на лету" : "Soft reload: world.dat unreadable - chunks will regenerate on the fly");
+    // 7) поднять мир обратно с только что сохранённого ванильного сейва (синхронно, как при старте)
+    world::extra::Snapshot restartExtras; // V56_VANILLAONLY_V1
+    std::string restartErr;
+    if (!world::anvil::importFromVanilla(world_, "world", &restartErr, &restartExtras)) {
+        NC_WARN("Server", ru ? "мягкий рестарт: world/region не прочитан — чанки сгенерируются на лету" : "Soft reload: world/region unreadable - chunks will regenerate on the fly");
+    } else {
+        restoreExtras(restartExtras); // V56_VANILLAONLY_V1: сундуки/таблички/мобы/дроп/транспорт после мягкого рестарта
     }
 
     const f64 reloadMs = std::chrono::duration<f64, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -9626,7 +11027,7 @@ void NetherCraftServer::softReload() {
             ? std::format(">>>   МЯГКИЙ РЕСТАРТ ЗАВЕРШЁН за {:.0f}мс   <<<", reloadMs)
             : std::format(">>>   SOFT RESTART DONE in {:.0f}ms   <<<", reloadMs);
         std::cout << "\n\033[32m" << rbBar << "\n" << rbDone << "\n"
-                  << (ruRb ? ">>>   серв��р снова принимает иг��оков   <<<\n"
+                  << (ruRb ? ">>>   сервер снова принимает игроков   <<<\n"
                            : ">>>   the server is accepting players again   <<<\n")
                   << rbBar << "\033[0m\n" << std::flush;
         nc::log::rawLine(rbDone);
@@ -9676,8 +11077,9 @@ void NetherCraftServer::processConsoleCommands() {
         std::string cmd;
         iss >> cmd;
         if (cmd.empty()) continue;
+        nc::log::commandLine(rconItem.result ? "RCON" : "Console", command); // CMDLOG_V2
         if (cmd == "help") {
-            NC_INFO("Console", "Commands: help, list, say <text>, gamemode <mode> <player>, gm0..gm3 <player>, kick <player>, time set <t>, weather <clear|rain|thunder>, save-all, export-vanilla [dir], import-vanilla <dir>, crash, stop, reload"); // CONSOLE_V3 // ANVIL_CONVERT_V1 // CRASHTEST_V1
+            NC_INFO("Console", "Commands: help, list, say <text>, gamemode <mode> <player>, gm0..gm3 <player>, kick <player>, time set <t>, weather <clear|rain|thunder>, save, save-all, export-vanilla [dir], import-vanilla <dir>, crash, stop, reload"); // CONSOLE_V3 // ANVIL_CONVERT_V1 // CRASHTEST_V1
         } else if (cmd == "list") {
             auto all = getAllPlayersCopy();
             std::string names;
@@ -9782,10 +11184,7 @@ void NetherCraftServer::processConsoleCommands() {
             }
             if (t < 0) { NC_INFO("Console", "Usage: time set <day|noon|night|midnight|ticks>"); continue; }
             g_timeOfDay = t;
-            net::Buffer tb;
-            tb.writeI64(t);
-            tb.writeI64(t);
-            auto vec = std::vector<u8>(tb.writtenSpan().begin(), tb.writtenSpan().end());
+            auto vec = packets::buildUpdateTime(t, t); /* PACKETS_V16 */
             for (auto& p : getAllPlayersCopy()) if (p && p->isAlive() && p->getState() == entity::PlayerState::Play) p->getConnection()->sendPacket(0x64, vec);
             NC_INFO("Console", "Time set to {}", t);
         } else if (cmd == "warprandomtick") { // RANDOMTICK_WARP_V1: консольный вариант, см. версию из чата.
@@ -9803,9 +11202,19 @@ void NetherCraftServer::processConsoleCommands() {
             for (auto& target : getAllPlayersCopy()) sendWeatherState(target);
             NC_INFO("Console", "Weather: {}", w);
         } else if (cmd == "save-all" || cmd == "save") {
+            // SAVECMD_V1: раньше команда молча ждала секунды и не говорила, сколько заняла.
+            const auto tSave = std::chrono::steady_clock::now();
             saveWorlds(); // DIMSAVE_V1
-            for (const auto& p : getAllPlayersCopy()) if (p) savePlayerData(p);
-            NC_INFO("Console", "World and player data saved");
+            size_t savedPlayers = 0;
+            for (const auto& p : getAllPlayersCopy()) if (p) { savePlayerData(p); ++savedPlayers; }
+            const double saveCmdMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tSave).count();
+            if (config_.language == "rus")
+                NC_INFO("Console", "Мир и данные игроков сохранены за {:.0f} мс (игроков: {})", saveCmdMs, savedPlayers);
+            else NC_INFO("Console", "World and player data saved in {:.0f} ms ({} player(s))", saveCmdMs, savedPlayers);
+            for (const auto& p : getAllPlayersCopy())
+                if (p && p->isAlive() && nc::opLevelOf(config_.ops, p->getName()) > 0)
+                    p->sendSystemMessage("§aМир сохранён за " + std::to_string(static_cast<i64>(saveCmdMs)) + " мс");
         } else if (cmd == "export-vanilla") {
             // ANVIL_CONVERT_V1: export the live world to a vanilla-loadable
             // singleplayer/server save. Usage: export-vanilla [dir]
@@ -9813,8 +11222,36 @@ void NetherCraftServer::processConsoleCommands() {
             if (!dir.empty() && dir[0] == ' ') dir.erase(0, 1);
             if (dir.empty()) dir = "vanilla_export";
             std::string err;
-            if (world::anvil::exportToVanilla(world_, dir, config_.levelName, config_.levelSeed, g_spawnX, g_spawnY, g_spawnZ, &err)) {
+            // V56_VANILLAONLY_V1: свежий снимок сундуков/табличек/сущностей из RAM едет с миром.
+            world::extra::Snapshot xsnap = buildExtrasSnapshot();
+            for (auto& ep : getAllPlayersCopy()) { // V57_PLAYERTAG_V1
+                if (!ep || ep->dimension != 0) continue;
+                lastPlayerExport_ = makePlayerExport(ep);
+                haveLastPlayerExport_ = true;
+                break;
+            }
+            if (world::anvil::exportToVanilla(world_, dir, config_.levelName, config_.levelSeed, g_spawnX, g_spawnY, g_spawnZ, &err, &xsnap,
+                                              gameTypeFromName(config_.gamemode),
+                                              haveLastPlayerExport_ ? &lastPlayerExport_ : nullptr)) {
                 NC_INFO("Console", "Exported world to '{}' (vanilla Anvil format)", dir);
+                // PLAYERCONV_V1: players and the player lists travel with the world.
+                for (const auto& p : getAllPlayersCopy()) if (p) savePlayerData(p);
+                world::playerconv::ConvertStats pstats;
+                std::string perr;
+                if (world::playerconv::exportPlayers("world/playerdata", dir, &pstats, &perr))
+                    NC_INFO("Console", "Converted {} player file(s) to vanilla playerdata ({} skipped)", pstats.converted, pstats.skipped);
+                else
+                    NC_WARN("Console", "playerdata export failed: {}", perr);
+                std::error_code lec;
+                world::playerconv::ConvertStats lstats;
+                world::playerconv::copyPlayerLists(std::filesystem::current_path(lec), dir, &lstats, nullptr);
+                NC_INFO("Console", "Copied {} player list file(s) (ops/whitelist/bans)", lstats.converted);
+                // DIMCONV_V1: the Nether and the End ride along when they exist.
+                std::string derr;
+                if (netherReady_ && !world::anvil::exportDimension(nether_, dir, world::anvil::Dimension::Nether, config_.levelSeed, &derr, &xsnap))
+                    NC_WARN("Console", "nether export failed: {}", derr);
+                if (endReady_ && !world::anvil::exportDimension(end_, dir, world::anvil::Dimension::End, config_.levelSeed, &derr, &xsnap))
+                    NC_WARN("Console", "end export failed: {}", derr);
             } else {
                 NC_WARN("Console", "export-vanilla failed: {}", err);
             }
@@ -9827,8 +11264,36 @@ void NetherCraftServer::processConsoleCommands() {
                 NC_WARN("Console", "Usage: import-vanilla <dir>");
             } else {
                 std::string err;
-                if (world::anvil::importFromVanilla(world_, dir, &err)) {
+                world::extra::Snapshot xsnap; // BLOCKENT_V1 / ENTSAVE_V1
+                if (world::anvil::importFromVanilla(world_, dir, &err, &xsnap)) {
                     NC_INFO("Console", "Imported vanilla world from '{}'", dir);
+                    // PLAYERCONV_V1: names come from usercache.json when the save has one.
+                    // DIMCONV_V1: vanilla DIM-1/DIM1 and the Bukkit sibling layout.
+                    std::string derr;
+                    if (netherReady_ && world::anvil::importDimension(nether_, dir, world::anvil::Dimension::Nether, &derr, &xsnap))
+                        NC_INFO("Console", "Imported nether chunks");
+                    if (endReady_ && world::anvil::importDimension(end_, dir, world::anvil::Dimension::End, &derr, &xsnap))
+                        NC_INFO("Console", "Imported end chunks");
+                    // V56_VANILLAONLY_V1: снимок поднимается прямо в живой мир, без файла extra.dat.
+                    if (!xsnap.empty()) {
+                        restoreExtras(xsnap);
+                    }
+                    world::playerconv::ConvertStats pstats;
+                    std::string perr;
+                    if (world::playerconv::importPlayers(dir, "world/playerdata", &pstats, &perr))
+                        NC_INFO("Console", "Converted {} vanilla playerdata file(s) ({} skipped)", pstats.converted, pstats.skipped);
+                    else
+                        NC_WARN("Console", "playerdata import failed: {}", perr);
+                    std::error_code lec;
+                    world::playerconv::ConvertStats lstats;
+                    world::playerconv::copyPlayerLists(dir, std::filesystem::current_path(lec), &lstats, nullptr);
+                    if (lstats.converted > 0) {
+                        nc::OpManager::instance().load();
+                        nc::BanManager::instance().load();
+                        nc::IpBanManager::instance().load();
+                        whitelist_.load();
+                        NC_INFO("Console", "Imported {} player list file(s), reloaded ops/whitelist/bans", lstats.converted);
+                    }
                 } else {
                     NC_WARN("Console", "import-vanilla failed: {}", err);
                 }
@@ -9860,8 +11325,11 @@ void NetherCraftServer::processConsoleCommands() {
                         for (auto& p : getAllPlayersCopy()) {
                             if (!p || !p->isAlive()) continue;
                             std::string a = p->getName(), b = arg;
-                            std::transform(a.begin(), a.end(), a.begin(), ::tolower);
-                            std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+                            // WARNFIX_V3: ::tolower возвращает int, прямая запись в char даёт C4244
+                            std::transform(a.begin(), a.end(), a.begin(),
+                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            std::transform(b.begin(), b.end(), b.begin(),
+                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                             if (a == b) p->kick("\xc2\xa7" "c\xd0\xa3\xd0\xb1\xd1\x80\xd0\xb0\xd0\xbd \xd0\xb8\xd0\xb7 \xd0\xb1\xd0\xb5\xd0\xbb.\xd1\x81\xd0\xbf\xd0\xb8\xd1\x81\xd0\xba\xd0\xb0");
                         }
                     }
@@ -9900,7 +11368,7 @@ void NetherCraftServer::processConsoleCommands() {
                 }
             }
         } else if (isPlayerOnlyCommand(cmd)) { // CONSOLEHUMAN_V1
-            if (config_.language == "rus") NC_ERROR("Console", "\033[31mКоманду '/{}' может выполнить только игрок. Консоль не человек.\033[0m", cmd);
+            if (config_.language == "rus") NC_ERROR("Console", "\033[31mКоманду '/{}' может выполнять только игрок. Консоль не человек.\033[0m", cmd);
             else NC_ERROR("Console", "\033[31m'/{}' can only be run by a player. The console is not a human.\033[0m", cmd);
         } else if (auto* pc = nc::cmd::CommandRegistry::instance().find(cmd); pc && pc->handler) {
             // PLUGINCMD_V1: the console is the server owner, so it always counts as
@@ -9914,10 +11382,17 @@ void NetherCraftServer::processConsoleCommands() {
             std::string __tok;
             while (iss >> __tok) ctx.args.push_back(__tok);
             ctx.reply = [](const std::string& msg) { NC_INFO("Console", "{}", msg); };
-            NC_INFO("Console", "Running plugin command '{}' (source: {})", cmd, pc->source);
+            // LANGFIX_V1: эти две строки были зашиты только по-английски, хотя весь остальной лог умеет переключаться на русский.
+            if (config_.language == "rus")
+                NC_INFO("Console", "\xd0\x92\xd1\x8b\xd0\xbf\xd0\xbe\xd0\xbb\xd0\xbd\xd1\x8f\xd1\x8e \xd0\xba\xd0\xbe\xd0\xbc\xd0\xb0\xd0\xbd\xd0\xb4\xd1\x83 \xd0\xbf\xd0\xbb\xd0\xb0\xd0\xb3\xd0\xb8\xd0\xbd\xd0\xb0 '{}' (\xd0\xb8\xd1\x81\xd1\x82\xd0\xbe\xd1\x87\xd0\xbd\xd0\xb8\xd0\xba: {})", cmd, pc->source);
+            else
+                NC_INFO("Console", "Running plugin command '{}' (source: {})", cmd, pc->source);
             pc->handler(ctx);
         } else {
-            NC_WARN("Console", "Unknown command '{}'. Type help.", cmd);
+            if (config_.language == "rus")
+                NC_WARN("Console", "\xd0\x9d\xd0\xb5\xd0\xb8\xd0\xb7\xd0\xb2\xd0\xb5\xd1\x81\xd1\x82\xd0\xbd\xd0\xb0\xd1\x8f \xd0\xba\xd0\xbe\xd0\xbc\xd0\xb0\xd0\xbd\xd0\xb4\xd0\xb0 '{}'. \xd0\x92\xd0\xb2\xd0\xb5\xd0\xb4\xd0\xb8\xd1\x82\xd0\xb5 help.", cmd);
+            else
+                NC_WARN("Console", "Unknown command '{}'. Type help.", cmd);
         }
     }
 }
@@ -10071,7 +11546,7 @@ void NetherCraftServer::tickFluidsIn(i32 dimIndex, const std::vector<u64>& batch
     };
     // FluidState.canBeReplacedWith: одно семейство напрямую не перезаписывается.
     auto canPassSide = [&](i32 s, i32 b) { return !sameFam(s, b) && canHoldFluid(s, b); };
-    // isWaterHole: под клеткой можно провалиться (в��здух/та же жидкость) — клетка «над ямой».
+    // isWaterHole: под клеткой можно провалиться (воздух/та же жидкость) — клетка «над ямой».
     auto belowIsHole = [&](i32 X, i32 Y, i32 Z, i32 b) {
         const i32 bs = sid(X, Y - 1, Z);
         return sameFam(bs, b) || canHoldFluid(bs, b);
@@ -10141,7 +11616,7 @@ void NetherCraftServer::tickFluidsIn(i32 dimIndex, const std::vector<u64>& batch
         }
     };
 
-    // place: setBlock + рассылка 0x09 + переплани��овать соседей.
+    // place: setBlock + рассылка 0x09 + перепланировать соседей.
     auto place = [&](i32 X, i32 Y, i32 Z, i32 st, i32 selfDelay = -1) {
         if (world_.getBlock(X, Y, Z) == st) return;
         world_.setBlock(X, Y, Z, st);
@@ -10340,7 +11815,7 @@ void NetherCraftServer::tickFireIn(i32 dimIndex, const std::vector<u64>& batch) 
             wet |= isWater(s); hasFuel |= flammable(s);
         }
         u8 age;
-        { std::lock_guard lk(fireMutex_); age = fireAge_[k] = std::min<int>(15, fireAge_[k] + 1); }
+        { std::lock_guard lk(fireMutex_); age = static_cast<u8>(fireAge_[k] = static_cast<u8>(std::min<int>(15, fireAge_[k] + 1))); }
         const bool support = below != 0 && !isWater(below) && !isFire(below);
         const auto* belowInfo = registries::RegistryManager::instance().blockStates().getById(below);
         const std::string_view belowName = belowInfo ? std::string_view(belowInfo->name) : std::string_view{};
@@ -11469,7 +12944,7 @@ void NetherCraftServer::tickRandomBlockUpdatesIn(i32 dimIndex) {
     }
 }
 
-// ENV_V1: урон окружением по тикам — ��аморозка в рыхлом снегу (state 22318) и урон лавой (96–111).
+// ENV_V1: урон окружением по тикам — заморозка в рыхлом снегу (state 22318) и урон лавой (96–111).
 void NetherCraftServer::tickPlayerEnvironment() {
     auto isLavaState = [](i32 s) { return s >= 96 && s <= 111; };
     auto isWaterState = [](i32 s) { return (s >= 80 && s <= 95) || s == 12960 || s == 12961; }; // + bubble columns
@@ -11479,9 +12954,7 @@ void NetherCraftServer::tickPlayerEnvironment() {
 
         // PEARL_V3: ItemCooldowns advances once per server tick, not by wall clock.
         if (player->enderPearlCooldownTicks > 0 && --player->enderPearlCooldownTicks == 0) {
-            net::Buffer cd; cd.writeVarInt(993); cd.writeVarInt(0);
-            player->getConnection()->sendPacket(0x17,
-                std::vector<u8>(cd.writtenSpan().begin(), cd.writtenSpan().end()));
+            packets::sendSetCooldown(player, 993, 0); /* PACKETS_V10 */
         }
 
         // ELYTRA_STOP_V3: clear both the shared flag and pose as soon as the player
@@ -11543,18 +13016,12 @@ void NetherCraftServer::tickPlayerEnvironment() {
 
         const bool onFireNow = player->remainingFireTicks > 0;
         if (onFireNow != player->fireFlagSynced) {
-            net::Buffer fm;
-            fm.writeVarInt(static_cast<i32>(player->getEntityId()));
-            fm.writeByte(0); fm.writeVarInt(0); // DATA_SHARED_FLAGS, BYTE
-            u8 flags = onFireNow ? 0x01 : 0x00;
-            if (player->sneaking) flags |= 0x02;
-            if (player->sprinting) flags |= 0x08;
-            fm.writeByte(flags);
-            fm.writeByte(0xFF);
-            auto fv = std::vector<u8>(fm.writtenSpan().begin(), fm.writtenSpan().end());
+            /* PACKETS_V21 */
+            const auto fv = packets::buildEntitySharedFlags(static_cast<i32>(player->getEntityId()),
+                packets::sharedFlagsByte(onFireNow, player->sneaking, player->sprinting, false));
             for (auto& target : getAllPlayersCopy())
                 if (target && target->isAlive() && target->getState() == entity::PlayerState::Play)
-                    target->getConnection()->sendPacket(0x58, fv);
+                    target->getConnection()->sendPacket(packets::cb::SetEntityMetadata, fv);
             player->fireFlagSynced = onFireNow;
         }
 
@@ -11629,7 +13096,7 @@ void NetherCraftServer::tickPlayerEnvironment() {
             // с моментом, когда у клиента опустели пузыри (раньше проверка по груди y+1.1 била на суше).
             // ENVWATER_V4: погружение ГЛАЗ считаем РОВНО как ванильный Entity.updateFluidOnEyes/
             // isEyeInFluid: берём высоту воды в блоке глаз (исток/полный столб = 1.0, поток = amount/9)
-            // и то��им ТОЛЬКО если поверхность выше точной высоты глаз. Иначе клиент считает голову
+            // и топим ТОЛЬКО если поверхность выше точной высоты глаз. Иначе клиент считает голову
             // над водой (пузыри полны) — и сервер тоже НЕ должен топить (раньше топил в потоке — «где пузыри»).
             const f64 eyeExact = player->getY() + 1.62;
             const i32 eyeY = static_cast<i32>(std::floor(eyeExact));
@@ -11645,11 +13112,7 @@ void NetherCraftServer::tickPlayerEnvironment() {
                  isWaterState(bEye)  || isLavaState(bEye))) {
                 auto syncFluidBlock = [&](i32 y, i32 state) {
                     if (!isWaterState(state) && !isLavaState(state)) return;
-                    net::Buffer bu;
-                    bu.writePosition(BlockPos{px, y, pz});
-                    bu.writeVarInt(state);
-                    player->getConnection()->sendPacket(0x09,
-                        std::vector<u8>(bu.writtenSpan().begin(), bu.writtenSpan().end()));
+                    packets::sendBlockUpdate(player, BlockPos{px, y, pz}, state); /* PACKETS_V10 */
                 };
                 syncFluidBlock(feetY, bFeet);
                 if (eyeY != feetY) syncFluidBlock(eyeY, bEye);
@@ -11687,29 +13150,24 @@ void NetherCraftServer::tickPlayerEnvironment() {
 
         // FREEZE_V1: синхронизируем «иней» на экране (метаданные DATA_TICKS_FROZEN, индекс 7, тип VarInt=1)
         if (player->ticksFrozen != player->frozenSynced) {
-            net::Buffer md;
-            md.writeVarInt(static_cast<i32>(player->getEntityId()));
-            md.writeByte(7); md.writeVarInt(1); md.writeVarInt(player->ticksFrozen);
-            md.writeByte(0xFF);
-            auto mv = std::vector<u8>(md.writtenSpan().begin(), md.writtenSpan().end());
+            /* PACKETS_V21 */
+            const auto mv = packets::buildEntityTicksFrozen(static_cast<i32>(player->getEntityId()),
+                player->ticksFrozen);
             for (auto& t : getAllPlayersCopy())
                 if (t && t->isAlive() && t->getState() == entity::PlayerState::Play)
-                    t->getConnection()->sendPacket(0x58, mv);
+                    t->getConnection()->sendPacket(packets::cb::SetEntityMetadata, mv);
             player->frozenSynced = player->ticksFrozen;
         }
 
         // ENVWATER_V3: пузыри воздуха рисует клиент по DATA_AIR_SUPPLY (index 1), которое шлёт
-        // сервер. Значение = airSupply, посчитанный по ГЛАЗАМ (см. выше), поэтому бар убывает ровно
-        // тогда же, когда идёт урон — без прежнего десинка «бар полный, а ��ьёт».
+        // сервер. Значение = airSupply, посчитанный по ГЛАЗАМ (см. выше), поэтому бар убивает ровно
+        // тогда же, когда идёт урон — без прежнего десинка «бар полный, а бьёт».
         {
             const i32 airShow = std::max(0, std::min(300, player->airSupply));
             if (airShow != player->airSynced) {
-                net::Buffer ad;
-                ad.writeVarInt(static_cast<i32>(player->getEntityId()));
-                ad.writeByte(1); ad.writeVarInt(1); ad.writeVarInt(airShow); // index 1, type VarInt=1, воздух
-                ad.writeByte(0xFF);
-                auto av = std::vector<u8>(ad.writtenSpan().begin(), ad.writtenSpan().end());
-                if (player->getConnection()) player->getConnection()->sendPacket(0x58, av);
+                /* PACKETS_V21 */
+                const auto av = packets::buildEntityAirSupply(static_cast<i32>(player->getEntityId()), airShow);
+                if (player->getConnection()) player->getConnection()->sendPacket(packets::cb::SetEntityMetadata, av);
                 player->airSynced = airShow;
             }
         }
@@ -11720,14 +13178,10 @@ void NetherCraftServer::tickPlayerEnvironment() {
             for (i32 as = 5; as <= 8; ++as)
                 if (player->invCount[as] > 0) armorStats(player->invItemId[as], armor, tough);
             if (armor != player->armorSynced) {
-                net::Buffer at;
-                at.writeVarInt(static_cast<i32>(player->getEntityId()));
-                at.writeVarInt(1);                     // одно свойство
-                at.writeVarInt(0);                     // attribute id 0 = generic.armor
-                at.writeF64(static_cast<f64>(armor));  // базовое значение
-                at.writeVarInt(0);                     // 0 модификаторов
-                auto atv = std::vector<u8>(at.writtenSpan().begin(), at.writtenSpan().end());
-                if (player->getConnection()) player->getConnection()->sendPacket(0x75, atv);
+                /* PACKETS_V18 / PACKETS_V21 */
+                const auto atv = packets::buildUpdateAttributes(static_cast<i32>(player->getEntityId()),
+                    {{packets::attr::Armor, static_cast<f64>(armor)}});
+                if (player->getConnection()) player->getConnection()->sendPacket(packets::cb::UpdateAttributes, atv);
                 player->armorSynced = armor;
             }
         }
@@ -11742,8 +13196,9 @@ void NetherCraftServer::tickPlayerEnvironment() {
 // ============================================================
 static bool mobStateIsSolid(i32 s) {
     if (s <= 0) return false;
-    if (s >= 80 && s <= 111) return false;   // ��ода и лава со всеми уровнями
+    if (s >= 80 && s <= 111) return false;   // вода и лава со всеми уровнями
     if (s == 12958 || s == 12959) return false; // void/cave air
+    if (s == 2391 || s == 2872) return false;   // MOBFIRE_V1: fire / soul_fire is not a floor
     return true;
 }
 
@@ -11761,6 +13216,16 @@ static void sendMobSpawnTo(const std::shared_ptr<entity::Player>& viewer, const 
     sp.writeVarInt(0); // data
     sp.writeI16(0); sp.writeI16(0); sp.writeI16(0);
     viewer->getConnection()->sendPacket(0x01, std::vector<u8>(sp.writtenSpan().begin(), sp.writtenSpan().end()));
+
+    // MOBFIRE_V3: a viewer that was out of range never got the fire flag (or its
+    // clear packet), so mobs could look permanently on fire. Resend real state.
+    if (m.fireTimer > 0) {
+        net::Buffer fmd;
+        fmd.writeVarInt(m.eid);
+        fmd.writeByte(0); fmd.writeVarInt(0); fmd.writeByte(0x01);
+        fmd.writeByte(0xFF);
+        viewer->getConnection()->sendPacket(0x58, std::vector<u8>(fmd.writtenSpan().begin(), fmd.writtenSpan().end()));
+    }
 }
 
 void NetherCraftServer::sendMobsTo(const std::shared_ptr<entity::Player>& player) {
@@ -12000,7 +13465,7 @@ void NetherCraftServer::tickMobs() {
     // LLAMA_CARAVAN_V1: WanderingTraderSpawner — попытка выставить караван
     // раз в 10 минут реального времени, сама функция ещё бросает кубик.
     if (tickCounter_ % 12000 == 0) spawnTraderCaravan();
-    // MOBS_V1b: раньше тик работал по КОПИИ mobs_, а в конце ��озвращал её целиком
+    // MOBS_V1b: раньше тик работал по КОПИИ mobs_, а в конце возвращал её целиком
     // (mobs_ = mobs). Всё, что успевал записать mobAttack между копией и записью
     // (HP, hurtCooldown, dead, отбрасывание), стиралось — мобы были неубиваемыми
     // «призраками». Теперь список тикается на месте под mobsMutex_.
@@ -12027,9 +13492,29 @@ void NetherCraftServer::tickMobs() {
                 pl->getConnection()->sendPacket(packetId, v);
     };
 
+    // MOBHURT_V4: урон от среды (огонь, лава, солнце) раньше просто вычитал
+    // health и ничего не шло клиенту: моб горел и молча умирал без красной
+    // вспышки, в отличие от игрока, где вспышку даёт applyDamage(). Ванильный набор:
+    // Entity Event (анимация) + Hurt Animation + Damage Event (именно он красит модель).
+    // damageTypeId — индекс в minecraft:damage_type из sendRegistry(): in_fire 20, lava 23, on_fire 29.
+    auto envHurtFx = [&](const entity::Mob& mm, i32 damageTypeId, bool mobDied) {
+        net::Buffer ev; ev.writeI32(mm.eid); ev.writeByte(mobDied ? 3 : 2);
+        sendAll(0x1F, ev); // Entity Event: I32 eid, не VarInt
+        if (mobDied) return;
+        net::Buffer ha; ha.writeVarInt(mm.eid); ha.writeF32(0.0f);
+        sendAll(0x24, ha); // Hurt Animation
+        net::Buffer d;
+        d.writeVarInt(mm.eid);
+        d.writeVarInt(damageTypeId);
+        d.writeVarInt(0); // sourceCauseId: 0 = нет виновника
+        d.writeVarInt(0); // sourceDirectId
+        d.writeBool(false);
+        sendAll(0x1A, d); // Damage Event
+    };
+
     std::vector<i32> removed;
     std::vector<f64> eggDrops; // x,y,z тройками: spawnItemDrop() нельзя звать под mobsMutex_
-    // MOBS_ALL_V1: удары по игрокам копи�� и применяем после снятия mobsMutex_.
+    // MOBS_ALL_V1: удары по игрокам копим и применяем после снятия mobsMutex_.
     struct MobHit { std::shared_ptr<entity::Player> victim; f32 damage; std::string mob; };
     std::vector<MobHit> mobHits;
     // MOBS_AI_V1: выстрелы, взрывы и звуки нельзя выполнять под mobsMutex_.
@@ -12125,7 +13610,7 @@ void NetherCraftServer::tickMobs() {
         // MOBS_AI_V1: цель берётся только при прямой видимости, дальше работают
         // способности: подрыв крипера, стрельба, прыжок паука, ближний бой.
         std::shared_ptr<entity::Player> victim;
-        // SPIDER_DAY_V1: SpiderTargetGoal не ��ыбирает цель при ярком дневном времени.
+        // SPIDER_DAY_V1: SpiderTargetGoal не выбирает цель при ярком дневном времени.
         // Если игрок ударил паука, angryTimer оставляет самооборону до его истечения.
         const i32 mobDayTime = static_cast<i32>(((g_timeOfDay % 24000) + 24000) % 24000);
         const bool spiderDayPassive = (m.isKind("spider") || m.isKind("cave_spider")) &&
@@ -12156,7 +13641,7 @@ void NetherCraftServer::tickMobs() {
                     const f64 ly = -std::sin(rp);
                     const f64 lz = std::cos(ry) * std::cos(rp);
                     const f64 dot = (lx * sdx + ly * sdy + lz * sdz) / sd;
-                    if (dot < 0.985) continue;   // взгляд мимо — эндермен спок��ен
+                    if (dot < 0.985) continue;   // взгляд мимо — эндермен спокоен
                     if (!mobSeesPoint(phys, m, pl->getX(), pl->getY() + 1.4, pl->getZ())) continue;
                     m.angryTimer = 400;
                     mobSounds.push_back(MobSound{ "minecraft:entity.enderman.stare", m.x, m.y, m.z });
@@ -12180,7 +13665,7 @@ void NetherCraftServer::tickMobs() {
         if (m.shootCooldown > 0) --m.shootCooldown;
         if (m.leapCooldown > 0) --m.leapCooldown;
         if (m.tpCooldown > 0) --m.tpCooldown;
-        // WARDEN_VIBRATION_V1: Warden.java + VibrationSystem — варден слепой. Цель ��ерётся
+        // WARDEN_VIBRATION_V1: Warden.java + VibrationSystem — варден слепой. Цель берётся
         // не по прямой видимости, а по вибрациям: бег шумит сильнее шага, присед почти
         // не шумит и ловится только нюхом вплотную. Порог агрессии — 40 единиц гнева.
         if (!m.dead && m.isKind("warden")) {
@@ -12265,6 +13750,58 @@ void NetherCraftServer::tickMobs() {
                 }
             }
         }
+        // MOBFIRE_V2: огонь и лава жгут мобов. Раньше урон от огня получал только
+        // игрок, а мобы стояли в пламени невредимыми. fireImmune (блейз, ифрит,
+        // магма-куб, зомби-пиглин, страйдер...) не горят - как в ванилле.
+        if (!m.dead && !m.def().fireImmune) {
+            world::World& fw = worldFor(m.dimension);
+            const i32 fbx = static_cast<i32>(std::floor(m.x));
+            const i32 fby = static_cast<i32>(std::floor(m.y));
+            const i32 fbz = static_cast<i32>(std::floor(m.z));
+            const i32 fFeet = fw.getBlock(fbx, fby, fbz);
+            const i32 fHead = fw.getBlock(fbx, fby + 1, fbz);
+            auto isFireSt = [](i32 st) { return (st >= 2391 && st < 2872) || st == 2872; };
+            auto isLavaSt = [](i32 st) { return st >= 96 && st <= 111; };
+            const bool inFire = isFireSt(fFeet) || isFireSt(fHead);
+            const bool inLava = isLavaSt(fFeet) || isLavaSt(fHead);
+            // FIREDBG_V1: огонь не жгёт мобов и даже звука нет, а по коду всё верно.
+            // Печатаем раз в секунду факты из рантайма: что читается под ногами,
+            // считается ли это огнём и живёт ли таймер горения.
+            if ((tickCounter_ % 20) == 0 && (inFire || inLava || m.fireTimer > 0)) {
+                NC_INFO("Mobs", "FIREDBG {} eid={} ноги={} голова={} огонь={} лава={} таймер={} hp={} иммун={}",
+                        m.def().name, m.eid, fFeet, fHead, inFire ? 1 : 0, inLava ? 1 : 0,
+                        m.fireTimer, m.health, m.def().fireImmune ? 1 : 0);
+            }
+            if (inFire || inLava) {
+                if (m.fireTimer <= 0) {
+                    net::Buffer fmd;
+                    fmd.writeVarInt(m.eid);
+                    fmd.writeByte(0); fmd.writeVarInt(0); fmd.writeByte(0x01); // DATA_SHARED_FLAGS: горит
+                    fmd.writeByte(0xFF);
+                    sendAll(0x58, fmd);
+                }
+                m.fireTimer = std::max(m.fireTimer, inLava ? 160 : 60); // MOBFIRE_V3: shorter burn - 3s from fire, 8s from lava
+            }
+            // тик урона только для тех, кого не обслуживает SUN_BURN_V1 ниже,
+            // иначе горящий на солнце зомби получал бы двойной урон.
+            if (!entity::mobBurnsInSun(m.def().name) && m.fireTimer > 0) {
+                if (--m.fireTimer % 20 == 0) {
+                    m.health -= inLava ? 4 : 1;
+                    mobSounds.push_back(MobSound{ "minecraft:entity.generic.burn", m.x, m.y, m.z });
+                    const bool fireKilled = m.health <= 0;
+                    // MOBHURT_V4: вспышка на каждый тик урона, как у игрока.
+                    envHurtFx(m, inLava ? 23 : 20, fireKilled); // lava / in_fire
+                    if (fireKilled) { m.dead = true; m.deathTimer = 20; continue; }
+                }
+                if (m.fireTimer <= 0) {
+                    net::Buffer fmd;
+                    fmd.writeVarInt(m.eid);
+                    fmd.writeByte(0); fmd.writeVarInt(0); fmd.writeByte(0x00);
+                    fmd.writeByte(0xFF);
+                    sendAll(0x58, fmd);
+                }
+            }
+        }
         // SUN_BURN_V1: Mob.aiStep() — нежить под открытым небом загорается днём.
         // Проверка неба раз в секунду, чтобы не сканировать колонку каждый тик.
         if (m.dimension == 0 && !m.dead && entity::mobBurnsInSun(m.def().name)) {
@@ -12291,7 +13828,9 @@ void NetherCraftServer::tickMobs() {
                 if (--m.fireTimer % 20 == 0) {
                     --m.health;
                     mobSounds.push_back(MobSound{ "minecraft:entity.generic.burn", m.x, m.y, m.z });
-                    if (m.health <= 0) { m.dead = true; m.deathTimer = 20; continue; }
+                    const bool sunKilled = m.health <= 0;
+                    envHurtFx(m, 29, sunKilled); // MOBHURT_V4: on_fire
+                    if (sunKilled) { m.dead = true; m.deathTimer = 20; continue; }
                 }
                 if (m.fireTimer <= 0) {   // ушёл в тень — снимаем визуал огня
                     net::Buffer md;
@@ -12365,7 +13904,7 @@ void NetherCraftServer::tickMobs() {
                 } else {
                     // GUARDIAN_BEAM_V2: луч рисуется клиентом по метаданным стража:
                     // индекс 16 — шипы прижаты/расправлены, индекс 17 — eid жертвы.
-                    const i32 beamEid = victim->getEntityId();
+                    const i32 beamEid = static_cast<i32>(victim->getEntityId());
                     if (m.beamTarget != beamEid) {
                         m.beamTarget = beamEid;
                         net::Buffer md;
@@ -12567,7 +14106,7 @@ void NetherCraftServer::tickMobs() {
                     const f64 ex = dx, ez = dz;
                     const f64 ey = (victim->getY() + 1.0) - (m.y + static_cast<f64>(m.def().eyeHeight));
                     const bool grav = !fireball && !smallBall && !shulker;
-                    // Зелье летит по навесной дуге — ванильная ведьма целит заметно выше цели.
+                    // Зелье летит по навесной дуге — ванильная весьма целит заметно выше цели.
                     const f64 aim = potion ? ey + len * 0.35 : (grav ? ey + len * 0.15 : ey);
                     const f64 nrm = std::max(0.001, std::sqrt(ex * ex + aim * aim + ez * ez));
                     const f64 pSpeed = fireball ? 0.6 : (smallBall ? 0.7 : (potion ? 0.75
@@ -12677,7 +14216,7 @@ void NetherCraftServer::tickMobs() {
             }
         }
         // CREEPER_AVOID_CAT_V1: Creeper.registerGoals() — крипер шарахается от кошек
-        // и оцелотов в радиусе 8 блоков, даж�� если рядом есть игрок.
+        // и оцелотов в радиусе 8 блоков, даже если рядом есть игрок.
         if (m.isKind("creeper")) {
             const entity::Mob* scaryCat = nullptr;
             f64 catD2 = 64.0;
@@ -12868,13 +14407,40 @@ void NetherCraftServer::tickMobs() {
             const f64 dx = pl->getX() - m.x, dz = pl->getZ() - m.z;
             nearest = std::min(nearest, dx * dx + dz * dz);
         }
-        if (nearest > 128.0 * 128.0) { removed.push_back(m.eid); continue; }
+        // MOBSAVE_V1: stop() kicks everyone BEFORE saveWorlds(), and the tick kept
+        // running - with zero players nearest stayed 1e18 and every mob was despawned
+        // before extra.dat was written. No players online means nobody to despawn for.
+        if (!players.empty() && nearest > 128.0 * 128.0) { removed.push_back(m.eid); continue; }
 
-        // синхронизация позиции — Teleport Entity 0x70, раз в 2 тик�� и только при движении
-        const bool moved = std::abs(m.x - m.lastSentX) > 0.01 || std::abs(m.y - m.lastSentY) > 0.01 ||
-                           std::abs(m.z - m.lastSentZ) > 0.01 || std::abs(m.yaw - m.lastSentYaw) > 1.0f;
-        if (moved && (tickCounter_ % 2 == 0)) {
-            const auto ang = [](f32 deg) { return static_cast<u8>(static_cast<i32>(deg * 256.0f / 360.0f) & 0xFF); };
+        // MOBMOVE_V4: absolute Teleport Entity every 2nd tick made mobs glide like on
+        // ice: the client snapped/lerped whole 2-tick jumps and never ran the walk
+        // animation. Vanilla streams small relative moves (0x2F) every tick and only
+        // teleports on big jumps, so send that and keep a periodic absolute resync.
+        const auto ang = [](f32 deg) { return static_cast<u8>(static_cast<i32>(deg * 256.0f / 360.0f) & 0xFF); };
+        const f64 ddx = m.x - m.lastSentX, ddy = m.y - m.lastSentY, ddz = m.z - m.lastSentZ;
+        const bool turned = std::abs(m.yaw - m.lastSentYaw) > 1.0f;
+        const bool moved = std::abs(ddx) > 0.002 || std::abs(ddy) > 0.002 || std::abs(ddz) > 0.002 || turned;
+        const bool farJump = std::abs(ddx) >= 7.5 || std::abs(ddy) >= 7.5 || std::abs(ddz) >= 7.5;
+        const bool resync = (tickCounter_ % 100) == 0;
+        if (moved && !farJump && !resync) {
+            // Update Entity Position and Rotation: deltas in 1/4096 of a block.
+            const i16 qx = static_cast<i16>(std::llround(ddx * 4096.0));
+            const i16 qy = static_cast<i16>(std::llround(ddy * 4096.0));
+            const i16 qz = static_cast<i16>(std::llround(ddz * 4096.0));
+            net::Buffer mv;
+            mv.writeVarInt(m.eid);
+            mv.writeI16(qx); mv.writeI16(qy); mv.writeI16(qz);
+            mv.writeByte(ang(m.yaw)); mv.writeByte(ang(m.pitch));
+            mv.writeBool(m.onGround);
+            sendAll(0x2F, mv);
+            net::Buffer hr; hr.writeVarInt(m.eid); hr.writeByte(ang(m.headYaw));
+            sendAll(0x48, hr); // Set Head Rotation
+            // Advance by the quantised delta only, otherwise rounding error drifts.
+            m.lastSentX += static_cast<f64>(qx) / 4096.0;
+            m.lastSentY += static_cast<f64>(qy) / 4096.0;
+            m.lastSentZ += static_cast<f64>(qz) / 4096.0;
+            m.lastSentYaw = m.yaw;
+        } else if (moved || resync) {
             net::Buffer tp;
             tp.writeVarInt(m.eid);
             tp.writeF64(m.x); tp.writeF64(m.y); tp.writeF64(m.z);
@@ -12882,7 +14448,7 @@ void NetherCraftServer::tickMobs() {
             tp.writeBool(m.onGround);
             sendAll(0x70, tp);
             net::Buffer hr; hr.writeVarInt(m.eid); hr.writeByte(ang(m.headYaw));
-            sendAll(0x48, hr); // Set Head Rotation �� иначе голова смотрит в одну сторону
+            sendAll(0x48, hr); // Set Head Rotation
             m.lastSentX = m.x; m.lastSentY = m.y; m.lastSentZ = m.z; m.lastSentYaw = m.yaw;
         }
     }
@@ -13047,7 +14613,7 @@ void NetherCraftServer::tickMobProjectiles() {
     std::vector<Hit> hits;
     for (auto& q : list) {
         ++q.age;
-        // SHULKER_BULLET_V2: пуля шалкера живёт дольше — она догоняет, а не летит по прямо��.
+        // SHULKER_BULLET_V2: пуля шалкера живёт дольше — она догоняет, а не летит по прямой.
         if (q.age > (q.homing ? 400 : 200)) { gone.push_back(q.eid); continue; }
         if (q.homing) {
             // ShulkerBullet.tick(): снаряд постоянно доворачивает к цели,
@@ -13106,13 +14672,9 @@ void NetherCraftServer::tickMobProjectiles() {
         }
         q.x = nx; q.y = ny; q.z = nz;
         if (q.gravity) q.vy -= 0.05;   // Arrow/Snowball
-        net::Buffer tp;
-        tp.writeVarInt(q.eid);
-        tp.writeF64(q.x); tp.writeF64(q.y); tp.writeF64(q.z);
-        tp.writeByte(0); tp.writeByte(0); tp.writeBool(false);
-        const auto tpBytes = std::vector<u8>(tp.writtenSpan().begin(), tp.writtenSpan().end());
+        const auto tpBytes = packets::buildTeleportEntity(q.eid, q.x, q.y, q.z, static_cast<u8>(0), static_cast<u8>(0), false); /* PACKETS_V16 */
         for (auto& p : players)
-            if (p && p->isAlive() && p->dimension == q.dim) p->getConnection()->sendPacket(0x70, tpBytes);
+            if (p && p->isAlive() && p->dimension == q.dim) p->getConnection()->sendPacket(0x70, tpBytes, true); /* NETQUEUE_V1 */
     }
     {
         std::lock_guard lk(mobProjectilesMutex_);
@@ -13126,10 +14688,7 @@ void NetherCraftServer::tickMobProjectiles() {
                 }), mobProjectiles_.end());
     }
     if (!gone.empty()) {
-        net::Buffer rm;
-        rm.writeVarInt(static_cast<i32>(gone.size()));
-        for (i32 eid : gone) rm.writeVarInt(eid);
-        const auto rmBytes = std::vector<u8>(rm.writtenSpan().begin(), rm.writtenSpan().end());
+        const auto rmBytes = packets::buildRemoveEntities(gone); /* PACKETS_V15 */
         for (auto& p : players) if (p && p->isAlive()) p->getConnection()->sendPacket(0x42, rmBytes);
     }
     for (auto& h : hits) {
@@ -13153,14 +14712,7 @@ void NetherCraftServer::sendMobEffect(const std::shared_ptr<entity::Player>& pla
                                       i32 amplifier, i32 durationTicks) {
     if (!player || effectId < 0 || durationTicks <= 0) return;
     if (!player->isAlive() || !player->getConnection()) return;
-    net::Buffer eff;
-    eff.writeVarInt(player->getEntityId());
-    eff.writeVarInt(effectId);
-    eff.writeByte(static_cast<u8>(amplifier));
-    eff.writeVarInt(durationTicks);
-    eff.writeByte(0x02 | 0x04);
-    const auto bytes = std::vector<u8>(eff.writtenSpan().begin(), eff.writtenSpan().end());
-    player->getConnection()->sendPacket(0x76, bytes);
+    packets::sendUpdateMobEffect(player, static_cast<i32>(player->getEntityId()), effectId, static_cast<u8>(amplifier), durationTicks, static_cast<u8>(0x02 | 0x04)); /* PACKETS_V18 */
 }
 
 // EFFECTS_V2: LivingEntity.addEffect() — эффект теперь живёт на сервере, а не только
@@ -13204,10 +14756,7 @@ void NetherCraftServer::removePlayerEffect(const std::shared_ptr<entity::Player>
         break;
     }
     if (!had || !player->getConnection()) return;
-    net::Buffer rm;
-    rm.writeVarInt(player->getEntityId());
-    rm.writeVarInt(effectId);
-    player->getConnection()->sendPacket(0x43, std::vector<u8>(rm.writtenSpan().begin(), rm.writtenSpan().end()));
+    packets::sendRemoveMobEffect(player, static_cast<i32>(player->getEntityId()), effectId); /* PACKETS_V18 */
 }
 
 // EFFECTS_APPLY_V1: MobEffectInstance.tick() — периодика яда, иссушения и регенерации
@@ -13235,10 +14784,7 @@ void NetherCraftServer::tickPlayerEffects() {
                 const i32 period = std::max(10, 50 / step);
                 if (player->effectPulse % period == 0 && player->health < 20.0f) {
                     player->health = std::min(20.0f, player->health + 1.0f);
-                    net::Buffer hp;
-                    hp.writeF32(player->health); hp.writeVarInt(20); hp.writeF32(5.0f);
-                    player->getConnection()->sendPacket(0x5D,
-                        std::vector<u8>(hp.writtenSpan().begin(), hp.writtenSpan().end()));
+                    packets::sendSetHealth(player, player->health, 20, 5.0f); /* PACKETS_V10 */
                 }
             }
         }
@@ -13356,10 +14902,7 @@ void NetherCraftServer::tickEvokerFangs() {
                 }), evokerFangs_.end());
     }
     if (!gone.empty()) {
-        net::Buffer rm;
-        rm.writeVarInt(static_cast<i32>(gone.size()));
-        for (i32 eid : gone) rm.writeVarInt(eid);
-        const auto rmBytes = std::vector<u8>(rm.writtenSpan().begin(), rm.writtenSpan().end());
+        const auto rmBytes = packets::buildRemoveEntities(gone); /* PACKETS_V15 */
         for (auto& p : players) if (p && p->isAlive()) p->getConnection()->sendPacket(0x42, rmBytes);
     }
     for (auto& h : hits) {
@@ -13390,7 +14933,7 @@ bool NetherCraftServer::mobAttack(const std::shared_ptr<entity::Player>& player,
             if (handHit < 0.0f) handHit = 0.0f;
             m.health -= static_cast<i32>(handHit + 0.5f);                       // базовый удар рукой; урон оружия — заход 2
             m.hurtCooldown = 10;                 // invulnerableTime
-            m.panicTimer = 100; // PanicGoal около 5 секунд
+            m.panicTimer = 40; // MOBPANIC_V1: 5 секунд бега уносили моба за 30 блоков — теперь 2 секунды
             m.panicX = player->getX(); m.panicZ = player->getZ();
             // MOBS_ALL_V1: нейтральные (эндермен, свинозомби, волк…) злятся на 400 тиков
             if (m.neutral()) { m.angryTimer = 400; m.targetEid = static_cast<i32>(player->getEntityId()); }
@@ -13441,7 +14984,7 @@ bool NetherCraftServer::mobAttack(const std::shared_ptr<entity::Player>& player,
 
     // GROUP_ANGER_V1: NearestAttackableTargetGoal + HurtByTargetGoal.setAlertOthers().
     // Волчья стая, свинозомби, пчёлы и прочие нейтралы злятся всей группой,
-    // а взрослые вступаются за своих детёнышей (белый медв��дь, хоглин).
+    // а взрослые вступаются за своих детёнышей (белый медведь, хоглин).
     if (hit.neutral()) {
         const f64 alertRange = hit.isKind("zombified_piglin") ? 32.0
             : (hit.isKind("bee") ? 20.0 : 16.0);
@@ -13472,9 +15015,28 @@ bool NetherCraftServer::mobAttack(const std::shared_ptr<entity::Player>& player,
     // Не смешивать форматы: VarInt в 0x1F даёт клиенту пакет длиной 3 байта и DecoderException.
     net::Buffer ev; ev.writeI32(hit.eid); ev.writeByte(died ? 3 : 2);
     sendAll(0x1F, ev);
+    // MOBHURT_V3: Hurt Animation alone gave no red flash and no knockback on the
+    // client. Vanilla also sends Damage Event (0x1A) + Set Entity Velocity (0x5A),
+    // so the client tints the mob red and simulates the throw itself.
+    const f64 hdx = hit.x - player->getX(), hdz = hit.z - player->getZ();
+    f64 hlen = std::sqrt(hdx * hdx + hdz * hdz); if (hlen < 1e-4) hlen = 1.0;
     if (!died) {
-        net::Buffer hurt; hurt.writeVarInt(hit.eid); hurt.writeF32(0.0f);
+        const f32 hurtYaw = static_cast<f32>(std::atan2(hdz, hdx) * 180.0 / 3.14159265358979323846 - 90.0);
+        net::Buffer hurt; hurt.writeVarInt(hit.eid); hurt.writeF32(hurtYaw);
         sendAll(0x24, hurt); // Hurt Animation
+        net::Buffer d; // Damage Event (0x1A)
+        d.writeVarInt(hit.eid);
+        d.writeVarInt(32); // player_attack
+        d.writeVarInt(static_cast<i32>(player->getEntityId()) + 1); // sourceCauseId (+1: 0 = none)
+        d.writeVarInt(static_cast<i32>(player->getEntityId()) + 1); // sourceDirectId
+        d.writeBool(false);
+        sendAll(0x1A, d);
+        // MOBKB_V1: здесь уходил Set Entity Velocity (0x5A) с тем же отбросом, который
+        // сервер уже применил к m.vx/m.vy/m.vz и сам симулирует, рассылая позиции.
+        // Клиент, получив этот пакет, начинал симулировать полёт ВТОРОЙ раз — два
+        // независимых потока движения на одну сущность, отсюда отлёт на десятки блоков
+        // и у мирных, и у враждебных. Красную вспышку даёт Damage Event (0x1A), не он.
+        (void)hlen;
     }
     const char* soundBase = hit.def().name;
     if (hit.isKind("mooshroom")) soundBase = "cow";
@@ -13542,7 +15104,7 @@ bool NetherCraftServer::mobInteract(const std::shared_ptr<entity::Player>& playe
                 if (std::rand() % 3 == 0) {
                     m.tamed = true;
                     m.owner = static_cast<i32>(player->getEntityId());
-                    m.health = m.def().maxHealth; // полное исцеление при успешном приручении
+                    m.health = static_cast<i32>(m.def().maxHealth); // WARNFIX_V2: полное исцеление при приручении
                 }
             } else if (m.tamed && m.owner == static_cast<i32>(player->getEntityId()) && held <= 0) {
                 // WOLF_SIT_V1: ПКМ пустой рукой по своему питомцу — сесть/встать.
@@ -13562,7 +15124,7 @@ bool NetherCraftServer::mobInteract(const std::shared_ptr<entity::Player>& playe
             } else if (m.isKind("piglin") && !m.baby && held == entity::ITEM_GOLD_INGOT && m.specialTimer <= 0) {
                 // BARTER_V1: PiglinBarterGoal — отдаёт золото, через короткий кулдаун роняет предмет обратно.
                 if (player->gameMode != 1 && player->invCount[slot] > 0) --player->invCount[slot];
-                m.specialTimer = 40; // ~2 секунды на "осм��тр слитка"
+                m.specialTimer = 40; // ~2 секунды на "осмотр слитка"
                 const i32 lootId = entity::mobBarterLoot(std::rand());
                 spawnItemDrop(m.x, m.y + 1.0, m.z, lootId, 1 + (std::rand() % 3), 0.0, 0.15, 0.0, 10);
             }
@@ -13573,16 +15135,12 @@ bool NetherCraftServer::mobInteract(const std::shared_ptr<entity::Player>& playe
 
     // синхронизировать слот с клиентом (Set Container Slot 0x15)
     const i32 slot = 36 + player->heldSlot;
-    net::Buffer sb;
-    sb.writeByte(0); sb.writeVarInt(0); sb.writeI16(static_cast<i16>(slot));
-    sb.writeVarInt(player->invCount[slot]);
-    if (player->invCount[slot] > 0) { sb.writeVarInt(player->invItemId[slot]); sb.writeVarInt(0); sb.writeVarInt(0); }
-    player->getConnection()->sendPacket(0x15, std::vector<u8>(sb.writtenSpan().begin(), sb.writtenSpan().end()));
+    packets::sendContainerSlot(player, 0, 0, static_cast<i16>(slot), player->invItemId[slot], player->invCount[slot]); /* PACKETS_V15 */
     // ZOMBIE_CONVERT_V1: звук начавшегося лечения — уже без mobsMutex_.
     if (curedSound)
         broadcastBlockSound("minecraft:entity.zombie_villager.cure", static_cast<i32>(std::floor(target.x)),
                             static_cast<i32>(std::floor(target.y)), static_cast<i32>(std::floor(target.z)), 1.0f, 1.0f);
-    // VILLAGER_TRADE_V1: окно торговли открываем после синхронизации слота.
+    // VILLAGER_TRADE_V1: окно торговли открываем после синхронизации слотов.
     if (openTrade != 0) openVillagerTradeFor(player, target);
     return true;
 }
@@ -13617,11 +15175,7 @@ void NetherCraftServer::openVillagerTradeFor(const std::shared_ptr<entity::Playe
     const i32 level = tradeXp >= 250 ? 5 : tradeXp >= 150 ? 4 : tradeXp >= 70 ? 3 : tradeXp >= 10 ? 2 : 1;
     const i32 unlocked = std::min(static_cast<i32>(offers.size()), level + 1);
 
-    net::Buffer open;
-    open.writeVarInt(wid);
-    open.writeVarInt(19); // minecraft:merchant
-    writeTextComponent(open, entity::villagerProfessionName(profession));
-    player->getConnection()->sendPacket(0x33, std::vector<u8>(open.writtenSpan().begin(), open.writtenSpan().end()));
+    packets::sendOpenScreen(player, wid, 19, entity::villagerProfessionName(profession)); /* PACKETS_V16 */
 
     net::Buffer mo;
     mo.writeVarInt(wid);
@@ -13806,7 +15360,7 @@ void NetherCraftServer::spawnRaidWave(Raid& r) {
                         static_cast<i32>(std::floor(r.y)), static_cast<i32>(std::floor(r.z)), 8.0f, 1.0f);
 }
 
-// RAID_WAVES_V1: тик рейдов — вызыва��тся раз в 20 тиков.
+// RAID_WAVES_V1: тик рейдов — вызывается раз в 20 тиков.
 void NetherCraftServer::tickRaids() {
     if (config_.difficulty == 0) return; // Raids.java: на peaceful рейдов нет
     // 1. Старт: игрок с Дурным предзнаменованием зашёл в деревню.
@@ -13868,7 +15422,7 @@ void NetherCraftServer::tickRaids() {
 
 void NetherCraftServer::tick() {
     // TICKPROF_V1: микро-профайлер тика — ищет, что ест TPS. Замер общего времени
-    // тика и ��яжёлых ��аз; при тике >52мс (просадка ниже 20 TPS) пишет виновника в лог.
+    // тика и тяжёлых фаз; при тике >52мс (просадка ниже 20 TPS) пишет виновника в лог.
     using namespace std::chrono;
     const auto _tp_start = steady_clock::now();
     auto _tp_mark = _tp_start;
@@ -13901,7 +15455,7 @@ void NetherCraftServer::tick() {
     }
     _tp_tab = _tp_lap(); // TICKPROF_V2
 
-    tickItemDrops(); // ITEMDROP_V1: фи��ика/подбор выпавших предметов
+    tickItemDrops(); // ITEMDROP_V1: физика/подбор выпавших предметов
     tickFluids();    // FLUID_V1: динамика воды/лавы (поток, высыхание, камень/обсидиан)
     tickFire();      // FIRE_V2: scheduled decay, spread, TNT ignition
     tickFallingBlocks(); // FALLING_V1: scheduled blocks + FallingBlockEntity motion/landing
@@ -13911,6 +15465,8 @@ void NetherCraftServer::tick() {
     tickProjectiles(); // PROJECTILE_V1: raycast, drag/gravity, ender pearl teleport
     tickExperienceOrbs(); // XP_ORB_V1: gravity, magnet pickup, grantExperience on collect
     tickVehicles(); // VEHICLE_PHYSICS_V1: rail following, boat float, passenger sync
+    tickBlockEntities(); // CONTAINER_V2: плавка печек и перекачка воронок
+    tickSpawners();      // SPAWNER_V1
     tickMobs(); // MOBS_V1: спавн/физика/деспавн мобов
     tickMobProjectiles(); // MOBS_AI_V1: стрелы/фаерболы/снежки мобов
     tickPortals();
@@ -13958,13 +15514,21 @@ void NetherCraftServer::tick() {
     }
     _tp_keep = _tp_lap(); // TICKPROF_V2
 
-    // WORLDSAVE_V1: автосохранение каждые 5 минут (6000 тиков)
-    if (tickCounter_ % 6000 == 0) {
+    // AUTOSAVE_V3: интервал и вкл/выкл берутся из settings.properties (auto-save, auto-save-interval).
+    // Раньше было жёстко 6000 тиков, и ответ в мастере ни на что не влиял.
+    const i32 autoSaveTicks = config_.autoSave
+        ? std::max(600, config_.autoSaveInterval * 20) // не чаще одного раза в 30 секунд
+        : 0;
+    if (autoSaveTicks > 0 && tickCounter_ % autoSaveTicks == 0) {
         // ASYNCSAVE_V1: раньше сериализация всех блоков + запись на диск шли в tick-потоке
         // (тик #6000 = 282мс). Теперь tick только снапшотит данные игроков в строку,
         // а сериализацию мира и запись делает фоновый поток.
-        if (saveBusy_.load(std::memory_order_acquire)) {
-            if (config_.language == "rus") NC_WARN("Server", "Автосохранение пропущено: пр��дыдущее ещё пишется");
+        // AUTOSAVE_V3: ни одного изменённого блока с прошлого сейва и никого в сети — писать нечего.
+        const u64 curEditSeq = world_.editSeq();
+        if (curEditSeq == lastAutoSaveSeq_ && getAllPlayersCopy().empty()) {
+            // тихо пропускаем: диск и журнал не тревожим
+        } else if (saveBusy_.load(std::memory_order_acquire)) {
+            if (config_.language == "rus") NC_WARN("Server", "Автосохранение пропущено: предыдущее ещё пишется");
             else NC_WARN("Server", "Auto-save skipped: previous one still running");
         } else {
             std::vector<std::pair<std::string, std::string>> pdata; // ник -> содержимое файла
@@ -13972,6 +15536,7 @@ void NetherCraftServer::tick() {
                 if (p && !p->getName().empty()) pdata.emplace_back(p->getName(), buildPlayerDataContent(p));
             if (saveThread_.joinable()) saveThread_.join(); // прошлый уже отработал — просто прибрать
             saveBusy_.store(true, std::memory_order_release);
+            lastAutoSaveSeq_ = curEditSeq; // AUTOSAVE_V3
             const bool ruLang = (config_.language == "rus");
             saveThread_ = std::thread([this, ruLang, pdata = std::move(pdata)]() mutable {
                 const auto t0 = std::chrono::steady_clock::now();
@@ -13992,6 +15557,11 @@ void NetherCraftServer::tick() {
                 const f64 saveMs = std::chrono::duration<f64, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 if (ruLang) NC_INFO("Server", "Автосохранение (фон): мир + игроки за {:.0f}мс, тики не тронуты", saveMs);
                 else NC_INFO("Server", "Auto-save (background): world + players in {:.0f}ms, ticks untouched", saveMs);
+                // AUTOSAVE_V3: сейв идёт в фоне, но если он длиннее двух секунд — пора делать инкрементальный формат.
+                if (saveMs > 2000.0) {
+                    if (ruLang) NC_WARN("Server", "Автосохранение заняло {:.0f}мс — много изменённых чанков в этом цикле (SAVEFAST_V1: неизменённые не пережимаются)", saveMs);
+                    else NC_WARN("Server", "Auto-save took {:.0f}ms — the world file is rewritten as a whole", saveMs);
+                }
                 saveBusy_.store(false, std::memory_order_release);
             });
         }
@@ -14016,7 +15586,7 @@ void NetherCraftServer::tick() {
         NC_DEBUG("TickProf", "МЕДЛЕННЫЙ тик #{}: {:.1f}мс (>50 = просадка TPS) | виновник={} | boss={:.1f} keep={:.1f} save={:.1f} прочее={:.1f}",
                 tickCounter_, _tp_total, _tp_who(), _tp_console, _tp_drain, _tp_boss, _tp_tab, _tp_time, _tp_keep, _tp_save, _tp_other);
     }
-    // рекорд худшего тика за 5с ��� ловит даже редкие 0.4-TPS икоты в соло
+    // рекорд худшего тика за 5с — ловит даже редкие 0.4-TPS икоты в соло
     static f64 s_tp_wmax = 0.0; static const char* s_tp_wwho = "-"; static i32 s_tp_wtick = 0;
     if (_tp_total > s_tp_wmax) { s_tp_wmax = _tp_total; s_tp_wwho = _tp_who(); s_tp_wtick = tickCounter_; }
     if (tickCounter_ % 100 == 0) {
@@ -14032,15 +15602,7 @@ void NetherCraftServer::sendTpsBossbar(const std::shared_ptr<entity::Player>& pl
 
     if (add || !player->tpsBossbarShown) {
         // Clientbound Boss Event 0x0A, operation ADD=0.
-        net::Buffer out;
-        out.writeUUID(TPS_BOSSBAR_ID);
-        out.writeVarInt(0);
-        writeTextComponent(out, title); // Component NBT
-        out.writeF32(progress);
-        out.writeVarInt(tpsBossColor(tps_)); // BossBarColor
-        out.writeVarInt(0);         // BossBarOverlay.PROGRESS
-        out.writeByte(0);           // no darken screen / music / fog
-        player->getConnection()->sendPacket(0x0A, std::vector<u8>(out.writtenSpan().begin(), out.writtenSpan().end()));
+        packets::sendBossBarAdd(player, TPS_BOSSBAR_ID, title, progress, tpsBossColor(tps_), 0, static_cast<u8>(0)); /* PACKETS_V16 */
         player->tpsBossbarShown = true;
         player->tpsBossbarColor = tpsBossColor(tps_); // BOSSCOLOR_V1
         return;
@@ -14050,34 +15612,18 @@ void NetherCraftServer::sendTpsBossbar(const std::shared_ptr<entity::Player>& pl
     // только после перезахода. Теперь при смене цвета шлём UPDATE_STYLE=4 автоматом.
     const i32 color = tpsBossColor(tps_);
     if (color != player->tpsBossbarColor) {
-        net::Buffer style;
-        style.writeUUID(TPS_BOSSBAR_ID);
-        style.writeVarInt(4);     // ClientboundBossEventPacket.OperationType.UPDATE_STYLE
-        style.writeVarInt(color); // BossBarColor
-        style.writeVarInt(0);     // BossBarOverlay.PROGRESS
-        player->getConnection()->sendPacket(0x0A, std::vector<u8>(style.writtenSpan().begin(), style.writtenSpan().end()));
+        packets::sendBossBarStyle(player, TPS_BOSSBAR_ID, color, 0); /* PACKETS_V16 */
         player->tpsBossbarColor = color;
     }
 
     // UPDATE_NAME=3 and UPDATE_PROGRESS=2 are small packets, sent once per second.
-    net::Buffer name;
-    name.writeUUID(TPS_BOSSBAR_ID);
-    name.writeVarInt(3);
-    writeTextComponent(name, title);
-    player->getConnection()->sendPacket(0x0A, std::vector<u8>(name.writtenSpan().begin(), name.writtenSpan().end()));
-    net::Buffer value;
-    value.writeUUID(TPS_BOSSBAR_ID);
-    value.writeVarInt(2);
-    value.writeF32(progress);
-    player->getConnection()->sendPacket(0x0A, std::vector<u8>(value.writtenSpan().begin(), value.writtenSpan().end()));
+    packets::sendBossBarName(player, TPS_BOSSBAR_ID, title); /* PACKETS_V16 */
+    packets::sendBossBarProgress(player, TPS_BOSSBAR_ID, progress); /* PACKETS_V16 */
 }
 
 void NetherCraftServer::removeTpsBossbar(const std::shared_ptr<entity::Player>& player) {
     if (!player || !player->isAlive() || !player->tpsBossbarShown) return;
-    net::Buffer out;
-    out.writeUUID(TPS_BOSSBAR_ID);
-    out.writeVarInt(1); // ClientboundBossEventPacket.OperationType.REMOVE
-    player->getConnection()->sendPacket(0x0A, std::vector<u8>(out.writtenSpan().begin(), out.writtenSpan().end()));
+    packets::sendBossBarRemove(player, TPS_BOSSBAR_ID); /* PACKETS_V16 */
     player->tpsBossbarShown = false;
 }
 
@@ -14094,18 +15640,39 @@ void NetherCraftServer::updateTpsBossbar() {
     // при почти идеальных >=19.99 (чистим суб-мс джиттер спин-планировщика),
     // а любой реальный лаг показываем как есть.
     // BOSSFAST_V1: при лаге бар тормозил — EMA тянул вниз несколько секунд (показывал 19.85,
-    // когда реально было 1.8). Теперь пр��садку показываем МГНОВЕННО, а подъём сглаживаем.
+    // когда реально было 1.8). Теперь просадку показываем МГНОВЕННО, а подъём сглаживаем.
     if (instant >= 19.99f) tps_ = 20.0f;
     else if (instant < tps_) tps_ = instant;          // падение — сразу, без EMA-лага
     else tps_ = tps_ * 0.5f + instant * 0.5f;         // восстановление — плавно, чтобы бар не мигал
     tpsSampleTicks_ = 0;
     tpsSampleStart_ = now;
     sampleProcessStats(); // HUD_V1: refresh real RAM/CPU once per second, same cadence as TPS
+
+    // TITLESTATS_V1: те же цифры, что и в игровом босс-баре, но в заголовке окна и на панели
+    // задач — видно состояние сервера, даже когда окно свёрнуто. Раз в секунду: SetWindowTextW
+    // шлёт сообщение в UI-поток, чаще — бессмысленная нагрузка и мельтешение текста.
+    if (nc::console::isRunning()) {
+        static std::chrono::steady_clock::time_point s_lastTitle{};
+        if (s_lastTitle.time_since_epoch().count() == 0 ||
+            std::chrono::duration<f64>(now - s_lastTitle).count() >= 1.0) {
+            s_lastTitle = now;
+            const unsigned cores = std::thread::hardware_concurrency()
+                                       ? std::thread::hardware_concurrency() : 1u;
+            const i32 online = static_cast<i32>(getAllPlayersCopy().size());
+            const bool ruTitle = (config_.language == "rus");
+            const std::string title = ruTitle
+                ? std::format("Zevvoryn \xe2\x80\x94 {} \xe2\x94\x82 TPS {:.2f} \xe2\x94\x82 \xd0\x9e\xd0\x97\xd0\xa3 {:.0f} \xd0\x9c\xd0\x91 \xe2\x94\x82 \xd0\xa6\xd0\x9f {:.0f}% \xe2\x94\x82 {} \xd1\x8f\xd0\xb4\xd0\xb5\xd1\x80 \xe2\x94\x82 \xd0\xb8\xd0\xb3\xd1\x80\xd0\xbe\xd0\xba\xd0\xbe\xd0\xb2 {}/{}",
+                              config_.motd, tps_, ramMb_, cpuPercent_, cores, online, config_.maxPlayers)
+                : std::format("Zevvoryn \xe2\x80\x94 {} \xe2\x94\x82 TPS {:.2f} \xe2\x94\x82 RAM {:.0f} MB \xe2\x94\x82 CPU {:.0f}% \xe2\x94\x82 {} cores \xe2\x94\x82 players {}/{}",
+                              config_.motd, tps_, ramMb_, cpuPercent_, cores, online, config_.maxPlayers);
+            nc::console::setTitle(title);
+        }
+    }
     for (auto& player : getAllPlayersCopy()) {
         if (player && player->tpsBossbarEnabled) sendTpsBossbar(player, false);
     }
 
-    // TPSCHAT_V1: когда TPS прос��дает до 15 или ниже — пишем ВСЕМ в чат текущий TPS,
+    // TPSCHAT_V1: когда TPS проседает до 15 или ниже — пишем ВСЕМ в чат текущий TPS,
     // чтобы лаги были видны без включённого босс-бара и было понятно, что метр не врёт.
     // Троттлинг 3 с, чтобы не заспамить чат (и не добавить лагов рассылкой) при долгой просадке.
     if (tps_ <= 15.0f) {
@@ -14113,7 +15680,7 @@ void NetherCraftServer::updateTpsBossbar() {
             std::chrono::duration<f64>(now - lastLowTpsWarn_).count() >= 3.0) {
             lastLowTpsWarn_ = now;
             const bool ru = (config_.language == "rus");
-            // TPSCHAT_V1: без спецсимволов/эмодзи — к��иент 1.21.1 роняет system_chat с непечатным
+            // TPSCHAT_V1: без спецсимволов/эмодзи — клиент 1.21.1 роняет system_chat с непечатным
             // символом (DecoderException / "Соединение потеряно"). Только текст + §-цвета.
             // TPSCHAT_V1 fix: u8"..." -> real UTF-8 bytes on the wire. Plain \u escapes were encoded
             // by MSVC in the exec charset (CP-1251) as a single byte -> client crashed decoding

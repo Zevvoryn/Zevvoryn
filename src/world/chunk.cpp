@@ -231,6 +231,7 @@ i32 ChunkColumn::getBlock(i32 x, i32 y, i32 z) const {
 }
 
 void ChunkColumn::writeTo(net::Buffer& buf, bool includeBiomes) const {
+    (void)includeBiomes; // WARNFIX_V1: биомы всегда пишутся в 1.21.1
     // 1.21.1 Chunk Data payload:
     // i32: heightmap type (0 = World surface)
     // varint: primary bit mask (какие секции отправляем)
@@ -402,7 +403,7 @@ static i32 wgMaterialId(const World::WorldGenState& S, wg::SurfaceMaterial m) {
     }
 }
 
-static wg::u64 wgMix(wg::u64 v) { // deterministic per-world bedrock variation
+[[maybe_unused]] static wg::u64 wgMix(wg::u64 v) { // WARNFIX_V1 // deterministic per-world bedrock variation
     v += 0x9E3779B97F4A7C15ULL; v = (v ^ (v >> 30)) * 0xBF58476D1CE4E5B9ULL;
     v = (v ^ (v >> 27)) * 0x94D049BB133111EBULL; return v ^ (v >> 31);
 }
@@ -644,7 +645,7 @@ void World::startGenPool() {
     // CPU_V1: было hc-1 (на 12 потоках — 11 генераторов). Они грызут все ядра
     // сразу, поэтому CPU улетал в 50%+, а клиент на той же машине лагал (ему
     // нужны ядра на рендер и свой chunk builder). Генерация от этого не ускорялась:
-    // узкое место — отдача чанков игроку, а не шум. Стало: четверть ядер, 2..6.
+    // узкое место — отдача чанков игрокам, а не шум. Стало: четверть ядер, 2..6.
     // CPU_V2: hc/4 (3 потока на 12 ядрах) убило скорость загрузки при view-distance 16:
     // это 1089 колонн на игрока. Стало: половина ядер, 4..8 — есть запас для
     // клиента на той же машине, но пул больше не является узким местом.
@@ -1157,17 +1158,49 @@ bool World::startBackgroundLoad(const std::string& path) {
             off += n;
             return true;
         };
+        // BGLOADPERF_V1: раньше каждая распаршенная колонна сразу лочила loadMutex_ — на больших мирах
+        // (десятки тысяч колонн) это давало лишние тысячи блокировок в секунду и заметно
+        // тормозило фоновую загрузку. Теперь копим пачками и отдаём разом, а также раз в ~10%
+        // пишем прогресс в лог, чтобы было видно, что загрузка идёт, а не зависла.
+        std::vector<std::shared_ptr<ChunkColumn>> batch;
+        batch.reserve(256);
+        i32 lastReportedPct = -1;
+        auto flushBatch = [&]() {
+            if (batch.empty()) return;
+            std::lock_guard<std::mutex> lk(loadMutex_);
+            for (auto& b : batch) loadReady_.push_back(std::move(b));
+            batch.clear();
+        };
         for (i32 c = 0; c < count && !loadStop_.load(); ++c) {
             i32 cx = 0, cz = 0; u32 blockCount = 0;
             if (!readRaw(&cx, 4) || !readRaw(&cz, 4) || !readRaw(&blockCount, 4)) break;
             auto col = std::make_shared<ChunkColumn>(cx, cz);
+            bool truncated = false;
             for (u32 i = 0; i < blockCount; ++i) {
                 u8 lx = 0, lz = 0; i16 y = 0; i32 id = 0;
-                if (!readRaw(&lx, 1) || !readRaw(&y, 2) || !readRaw(&lz, 1) || !readRaw(&id, 4)) { loadDone_.store(true); return; }
+                if (!readRaw(&lx, 1) || !readRaw(&y, 2) || !readRaw(&lz, 1) || !readRaw(&id, 4)) { truncated = true; break; }
                 col->setBlock(cx * 16 + lx, static_cast<i32>(y), cz * 16 + lz, id);
             }
+            if (truncated) { flushBatch(); loadDone_.store(true); return; }
             col->clearDirty();
-            { std::lock_guard<std::mutex> lk(loadMutex_); loadReady_.push_back(std::move(col)); }
+            batch.push_back(std::move(col));
+            if (batch.size() >= 256) flushBatch();
+            if (count > 0) {
+                // BGLOADPCT_V1: раньше печатались кривые шаги (11%, 22%, 33%… и без 100%),
+                // потому что порог считался от фактического процента. Теперь ровные десятки: 10…20%…100%.
+                const i32 pct  = static_cast<i32>((static_cast<i64>(c + 1) * 100) / count);
+                const i32 step = (pct / 10) * 10;
+                if (step >= 10 && step > lastReportedPct && step < 100) {
+                    lastReportedPct = step;
+                    if (langRu_) NC_INFO("World", "Фоновая загрузка мира: {}%", step);
+                    else         NC_INFO("World", "Background world load: {}%", step);
+                }
+            }
+        }
+        flushBatch();
+        if (!loadStop_.load()) { // BGLOADPCT_V1: финальные 100% — раньше их не было вообще
+            if (langRu_) NC_INFO("World", "Фоновая загрузка мира: 100%");
+            else         NC_INFO("World", "Background world load: 100%");
         }
         loadDone_.store(true);
     });

@@ -8,6 +8,7 @@
 #include <memory>
 #include <vector>
 #include <queue>
+#include <deque>   // NETQUEUE_V1
 #include <mutex>
 #include <atomic>
 #include <span>
@@ -70,6 +71,11 @@ public:
     void sendPacket(i32 packetId, const std::vector<u8>& payload, bool droppable = false);
     void sendPacket(i32 packetId, std::span<const u8> payload, bool droppable = false);
 
+    // PKTLIMIT_V1: предел длины входящего пакета из max-packet-size.
+    // Общий для всех соединений, ставится один раз при старте сервера.
+    static void setMaxPacketSize(i32 bytes);
+    static i32 getMaxPacketSize();
+
     // Отправка буфера напрямую (для raw-данных, например статус-ответ)
     void sendRaw(std::span<const u8> data);
 
@@ -106,6 +112,14 @@ public:
         return std::static_pointer_cast<T>(userData_);
     }
 
+    // NETQUEUE_V1: выкинуть из очереди всё необязательное (движение, частицы, звуки).
+    // Зовётся перед телепортом: критичные чанки и позиция не должны ждать мегабайты устаревших апдейтов.
+    // Возвращает число выброшенных кадров.
+    size_t dropQueuedDroppable();
+    // NETQUEUE_V1: сколько байт сейчас ждёт отправки (для диагностики / бэкпрешера)
+    size_t pendingBytes() const;
+    u64 getDroppedPackets() const { return droppedPackets_.load(std::memory_order_relaxed); }
+
     // Запланировать отправку (потокобезопасно)
     void queueSend(const std::vector<u8>& data, bool droppable = false);
     void queueSend(std::vector<u8>&& data, bool droppable = false);
@@ -114,6 +128,8 @@ private:
     void doRead();
     void processPacket(i32 length, i32 packetId, Buffer& payload);
     void writerLoop(); // NETASYNC_V2: тело выделенного потока-писателя
+    size_t dropDroppableLocked();                      // NETQUEUE_V1 (вызывать под writeMutex_)
+    bool enqueueFrame(std::vector<u8>&& data, bool droppable); // NETQUEUE_V1
 
     socket_t socket_;
     Server& server_;
@@ -129,7 +145,13 @@ private:
 
     // NETASYNC_V2: очередь обслуживает ВЫДЕЛЕННЫЙ поток-писатель (writerLoop).
     // queueSend() только кладёт данные и будит поток — никаких ::send() в потоке вызывающего.
-    std::queue<std::vector<u8>> writeQueue_;
+    // NETQUEUE_V1: теперь храним признак «можно выкинуть» рядом с кадром,
+    // чтобы при переполнении чистить только мусор, а не рвать соединение.
+    struct QueuedFrame {
+        std::vector<u8> data;
+        bool droppable = false;
+    };
+    std::deque<QueuedFrame> writeQueue_;
     std::mutex writeMutex_;
     std::condition_variable writeCv_;   // NETASYNC_V2
     std::thread writerThread_;          // NETASYNC_V2

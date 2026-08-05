@@ -6,6 +6,18 @@
 // прямо сюда — в единственный world/biomegen.cpp, который сборка уже точно собирает и линкует.
 // Никаких правок CMakeLists.txt больше не нужно. Файлы .inc нарочно не попадают ни в один
 // известный CMake glob для *.cpp — никакого риска двойной компиляции/символов.
+// WARNFIX_V1: cubiomes — чужой C-код, его предупреждения мы не правим в исходниках (чтобы не ломать
+// обновления upstream), а глушим ровно на время включения его файлов.
+#if defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable: 4201) // безымянные struct/union
+#  pragma warning(disable: 4244) // сужение типов
+#  pragma warning(disable: 4245) // signed/unsigned
+#  pragma warning(disable: 4305) // double -> float
+#  pragma warning(disable: 4701) // возможно неинициализированная переменная
+#  pragma warning(disable: 4702) // недостижимый код
+#  pragma warning(disable: 4706) // присваивание в условии
+#endif
 extern "C" {
 #include "../thirdparty/cubiomes/generator.h"
 #include "../thirdparty/cubiomes/util.h"
@@ -19,6 +31,9 @@ extern "C" {
 #include "../thirdparty/cubiomes/util.inc"
 #include "../thirdparty/cubiomes/generator.inc"
 }
+#if defined(_MSC_VER)
+#  pragma warning(pop) // WARNFIX_V1: дальше снова полный /W4 для нашего кода
+#endif
 
 namespace nc::world::biome {
 

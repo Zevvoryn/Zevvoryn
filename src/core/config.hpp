@@ -5,6 +5,8 @@
 #include <fstream>
 #include <filesystem>
 #include <iostream>
+#include <streambuf> // WIZTEE_V1
+#include <memory>    // WIZTEE_V1
 #include <sstream>
 #include <random>
 #include <string>
@@ -26,7 +28,7 @@
 namespace nc {
 
 // VERSION_V1: единая версия ядра. Менять ТОЛЬКО здесь.
-inline constexpr const char* NC_VERSION = "0.1.0";
+inline constexpr const char* NC_VERSION = "0.2.0";
 inline constexpr const char* NC_CODENAME = "Zevvoryn";
 
 // ============================================================
@@ -61,12 +63,18 @@ struct ServerConfig {
     // ── Геймплей ──
     std::string gamemode        = "creative";
     bool forceGamemode          = false;
+    // DISCMSG_V1: true = пускаем только 1.21.1 (767). false = никого не вышвыриваем
+    // насильно — на случай прокси/плагина вроде ViaVersion перед сервером.
+    bool strictVersionCheck     = true;
+    // GUICON_V1: classic = обычное консольное окно (как было), gui = собственный терминал.
+    // Любое другое значение, не Windows или ошибка создания окна — тихий откат к classic.
+    std::string consoleMode     = "classic";
     bool pvp                    = true;
     i32 difficulty              = 2;
+    bool difficultyLocked       = false; // ALLPACKETS_V3: Lock Difficulty (0x19) is now real state
     bool showCoordinates        = true;
-    i32 spawnProtection         = 16;
+    i32 spawnProtection         = 0;   // SETTINGS_V10: по умолчанию защита спавна выключена
     std::string ops             = ""; // OPS_V1
-    bool allowFlight            = false;
 
     // ── Аутентификация ──
     bool xboxAuth               = false;
@@ -81,6 +89,12 @@ struct ServerConfig {
     // ── Сохранение ──
     bool autoSave               = true;
     i32 autoSaveInterval        = 300;
+    // VANILLA_MIRROR_V1: рядом с world.dat пишется настоящая ванильная раскладка
+    // (world/level.dat + region/ + entities/ + DIM-1 + DIM1 + playerdata/*.dat).
+    // Источник истины пока всё равно world.dat — зеркало только для того,
+    // чтобы папку можно было сразу открыть клиентом или ява-ядром, без export-vanilla.
+    bool vanillaMirror          = true;
+    i32 vanillaMirrorInterval   = 300; // секунды; 0 = писать каждое сохранение
 
     // ── Логирование ──
     std::string logLevel        = "INFO";
@@ -92,7 +106,7 @@ struct ServerConfig {
     i32  rconMaxClients      = 4;
     bool rconLogCommands     = false; // RCONQUIET_V1: панель опрашивает сервер постоянно — по умолчанию молчим
 
-    // AUTOSTARTPANEL_V1: автозапуск Discord-бота/веб-панели (DiscordBotRcon) вместе с zevvoryn.exe
+    // AUTOSTARTPANEL_V1: автозапуск Discord-бота/веб-панели (DiscrordBotRcon) вместе с zevvoryn.exe
     bool autoStartPanel      = false;
 
     // ── Парсинг key=value ──
@@ -110,7 +124,8 @@ struct ServerConfig {
         if (val.empty()) return;
 
         auto toLower = [](std::string s) {
-            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            std::transform(s.begin(), s.end(), s.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); }); // WARNFIX_V1
             return s;
         };
 
@@ -144,12 +159,13 @@ struct ServerConfig {
         else if (lk == "enable-end")            enableEnd = toBool(val);    // DIMTOGGLE_V1
         else if (lk == "gamemode")              gamemode = toLower(val);
         else if (lk == "force-gamemode")        forceGamemode = toBool(val);
+        else if (lk == "strict-version-check")  strictVersionCheck = toBool(val); // DISCMSG_V1
+        else if (lk == "console-mode")          consoleMode = toLower(val);  // GUICON_V1
         else if (lk == "pvp")                   pvp = toBool(val);
         else if (lk == "difficulty")            { difficulty = toInt(val, difficulty); if (difficulty < 0) difficulty = 0; if (difficulty > 3) difficulty = 3; }
         else if (lk == "show-coordinates")      showCoordinates = toBool(val);
         else if (lk == "spawn-protection")      spawnProtection = toInt(val, spawnProtection);
         else if (lk == "ops")                   ops = toLower(val); // OPS_V1
-        else if (lk == "allow-flight")          allowFlight = toBool(val);
         else if (lk == "xbox-auth")             xboxAuth = toBool(val);
         else if (lk == "white-list")            whiteList = toBool(val);
         else if (lk == "server-ip")             serverIp = val;
@@ -158,6 +174,8 @@ struct ServerConfig {
         else if (lk == "compression-threshold") compressionThreshold = toInt(val, compressionThreshold);
         else if (lk == "auto-save")             autoSave = toBool(val);
         else if (lk == "auto-save-interval")    autoSaveInterval = toInt(val, autoSaveInterval);
+        else if (lk == "vanilla-mirror")         vanillaMirror = toBool(val);            // VANILLA_MIRROR_V1
+        else if (lk == "vanilla-mirror-interval") vanillaMirrorInterval = toInt(val, vanillaMirrorInterval); // VANILLA_MIRROR_V1
         else if (lk == "log-level")             logLevel = toUpper(val);
         // RCON_V1
         else if (lk == "enable-rcon")           enableRcon = toBool(val);
@@ -169,7 +187,8 @@ struct ServerConfig {
     }
 
     static std::string toUpper(std::string s) {
-        std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); }); // WARNFIX_V2
         return s;
     }
 
@@ -198,119 +217,186 @@ struct ServerConfig {
     }
 
     // ── Сохранение в settings.properties ──
+    // SETTINGS_V10: все комментарии пишутся через cm(ru, en), чтобы ни одна
+    // строка не осталась без перевода.
     void saveTo(const std::filesystem::path& path) const {
-        bool ru = (language == "rus");
-
+        const bool ru = (language == "rus");
         std::ofstream out(path);
-        out << "# ============================================\n";
-        out << (ru ? "# \xd0\x9a\xd0\xbe\xd0\xbd\xd1\x84\xd0\xb8\xd0\xb3\xd1\x83\xd1\x80\xd0\xb0\xd1\x86\xd0\xb8\xd1\x8f \xd1\x81\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80\xd0\xb0 Zevvoryn\n" : "# Zevvoryn Server Configuration\n");
-        out << (ru ? "# \xd0\xa1\xd0\xbe\xd0\xb7\xd0\xb4\xd0\xb0\xd0\xbd\xd0\xbe \xd0\xbc\xd0\xb0\xd1\x81\xd1\x82\xd0\xb5\xd1\x80\xd0\xbe\xd0\xbc \xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xba\xd0\xb8\n" : "# Generated by Setup Wizard\n");
-        out << "# ============================================\n";
-        out << "\n";
+        auto cm = [&](const char* r, const char* e) { out << (ru ? r : e) << "\n"; };
+        auto blank = [&]() { out << "\n"; };
 
-        out << (ru ? "# \xd0\xaf\xd0\xb7\xd1\x8b\xd0\xba \xd0\xb2\xd1\x8b\xd0\xb2\xd0\xbe\xd0\xb4\xd0\xb0 \xd0\xb2 \xd0\xba\xd0\xbe\xd0\xbd\xd1\x81\xd0\xbe\xd0\xbb\xd0\xb8\n" : "# Language for server console output\n");
-        out << (ru ? "# \xd0\x92\xd0\xb0\xd1\x80\xd0\xb8\xd0\xb0\xd0\xbd\xd1\x82\xd1\x8b: eng, rus\n" : "# Options: eng, rus\n");
+        out << "# ============================================\n";
+        cm("# Конфигурация сервера Zevvoryn", "# Zevvoryn Server Configuration");
+        cm("# Создано мастером установки", "# Generated by the setup wizard");
+        out << "# ============================================\n";
+        blank();
+
+        cm("# Язык вывода в консоли и в этом файле", "# Language of the console output and of this file");
+        cm("# Варианты: eng, rus", "# Options: eng, rus");
         out << "language=" << language << "\n";
-        out << "\n";
+        blank();
 
-        out << (ru ? "# === \xd0\xa1\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80 ===\n" : "# === Server ===\n");
-        out << (ru ? "# MOTD \xe2\x80\x94 \xd1\x82\xd0\xb5\xd0\xba\xd1\x81\xd1\x82 \xd0\xbe\xd1\x82\xd0\xbe\xd0\xb1\xd1\x80\xd0\xb0\xd0\xb6\xd0\xb5\xd0\xbd\xd0\xb8\xd1\x8f \xd1\x81\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80\xd0\xb0 \xd0\xb2 \xd1\x81\xd0\xbf\xd0\xb8\xd1\x81\xd0\xba\xd0\xb5 \xd1\x81\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80\xd0\xbe\xd0\xb2 (Message Of The Day)\n" : "# MOTD \xe2\x80\x94 server name shown in the Minecraft server list (Message Of The Day)\n");
+        cm("# === Сервер ===", "# === Server ===");
+        cm("# MOTD — первая строка описания сервера в списке серверов",
+           "# MOTD — first line of the server description in the server list");
         out << "motd=" << motd << "\n";
-        out << "brand=" << brand << "\n"; // BRAND_V1
-        out << (ru ? "# \xd0\x92\xd1\x82\xd0\xbe\xd1\x80\xd0\xb0\xd1\x8f \xd1\x81\xd1\x82\xd1\x80\xd0\xbe\xd0\xba\xd0\xb0 MOTD (\xd0\xbe\xd0\xbf\xd1\x86\xd0\xb8\xd0\xbe\xd0\xbd\xd0\xb0\xd0\xbb\xd1\x8c\xd0\xbd\xd0\xbe)\n" : "# Second line of the MOTD (optional)\n");
+        cm("# Имя ядра, которое клиент показывает в F3",
+           "# Server brand shown by the client in the F3 screen");
+        out << "brand=" << brand << "\n";
+        cm("# Вторая строка MOTD. Пусто = описание в одну строку",
+           "# Second MOTD line. Empty = single-line description");
         out << "sub-motd=" << subMotd << "\n";
-        out << (ru ? "# \xd0\x9f\xd0\xbe\xd1\x80\xd1\x82 \xd0\xb4\xd0\xbb\xd1\x8f \xd0\xbf\xd0\xbe\xd0\xb4\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb8\xd1\x8f Java-\xd0\xba\xd0\xbb\xd0\xb8\xd0\xb5\xd0\xbd\xd1\x82\xd0\xbe\xd0\xb2 (TCP)\n" : "# Listening port for Java clients (TCP)\n");
+        cm("# Порт для подключения Java-клиентов (TCP)", "# Listening port for Java clients (TCP)");
         out << "server-port=" << port << "\n";
         if (portV6 > 0) {
-            out << (ru ? "# \xd0\x9f\xd0\xbe\xd1\x80\xd1\x82 \xd0\xb4\xd0\xbb\xd1\x8f IPv6 (\xd0\xbe\xd0\xbf\xd1\x86\xd0\xb8\xd0\xbe\xd0\xbd\xd0\xb0\xd0\xbb\xd1\x8c\xd0\xbd\xd0\xbe)\n" : "# IPv6 listening port (optional)\n");
+            cm("# Порт для IPv6 (опционально)", "# IPv6 listening port (optional)");
             out << "server-portv6=" << portV6 << "\n";
         }
-        out << (ru ? "# \xd0\x9c\xd0\xb0\xd0\xba\xd1\x81\xd0\xb8\xd0\xbc\xd0\xb0\xd0\xbb\xd1\x8c\xd0\xbd\xd0\xbe\xd0\xb5 \xd0\xba\xd0\xbe\xd0\xbb\xd0\xb8\xd1\x87\xd0\xb5\xd1\x81\xd1\x82\xd0\xb2\xd0\xbe \xd0\xb8\xd0\xb3\xd1\x80\xd0\xbe\xd0\xba\xd0\xbe\xd0\xb2 \xd0\xbd\xd0\xb0 \xd1\x81\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80\xd0\xb5\n" : "# Maximum number of players allowed on the server\n");
+        cm("# Максимальное количество игроков на сервере", "# Maximum number of players on the server");
         out << "max-players=" << maxPlayers << "\n";
-        out << (ru ? "# \xd0\x94\xd0\xb0\xd0\xbb\xd1\x8c\xd0\xbd\xd0\xbe\xd1\x81\xd1\x82\xd1\x8c \xd0\xbf\xd1\x80\xd0\xbe\xd1\x80\xd0\xb8\xd1\x81\xd0\xbe\xd0\xb2\xd0\xba\xd0\xb8 (\xd0\xb2 \xd1\x87\xd0\xb0\xd0\xbd\xd0\xba\xd0\xb0\xd1\x85)\n" : "# View distance in chunks\n");
+        cm("# Дальность прорисовки в чанках (сколько мира видит игрок)",
+           "# View distance in chunks (how much world the player sees)");
         out << "view-distance=" << viewDistance << "\n";
-        out << (ru ? "# \xd0\x94\xd0\xb0\xd0\xbb\xd1\x8c\xd0\xbd\xd0\xbe\xd1\x81\xd1\x82\xd1\x8c \xd1\x81\xd0\xb8\xd0\xbc\xd1\x83\xd0\xbb\xd1\x8f\xd1\x86\xd0\xb8\xd0\xb8 \xd1\x8d\xd0\xbd\xd1\x82\xd0\xb8\xd1\x82\xd0\xb8 (\xd0\xbd\xd0\xb8\xd0\xb6\xd0\xb5 = \xd0\xbc\xd0\xb5\xd0\xbd\xd1\x8c\xd1\x88\xd0\xb5 CPU)\n" : "# Simulation distance (lower = less CPU)\n");
+        cm("# Дальность симуляции в чанках: ближе этого радиуса тикают мобы,",
+           "# Simulation distance in chunks: mobs, redstone and physics only tick");
+        cm("# редстоун и физика. Ниже значение = меньше нагрузки на CPU",
+           "# inside this radius. Lower value = less CPU load");
         out << "simulation-distance=" << simulationDistance << "\n";
-        out << (ru ? "\x23\x20\xd0\x9b\xd0\xb8\xd0\xbc\xd0\xb8\xd1\x82\x20\xd0\x9e\xd0\x97\xd0\xa3\x20\xd0\xb2\x20\xd0\x93\xd0\x91\x20\x28\x30\x20\x3d\x20\xd0\xb1\xd0\xb5\xd0\xb7\x20\xd0\xbb\xd0\xb8\xd0\xbc\xd0\xb8\xd1\x82\xd0\xb0\x20\x2f\x20\xd0\xb0\xd0\xb2\xd1\x82\xd0\xbe\x29\n" : "# RAM limit in GB (0 = no limit / auto)\n");
+        cm("# Подсказка по памяти в ГБ (0 = без лимита). Это не жёсткий потолок:",
+           "# Memory hint in GB (0 = no limit). This is not a hard cap:");
+        cm("# сервер по нему подбирает размеры кэшей чанков",
+           "# the server uses it to pick chunk cache sizes");
         out << "max-ram-gb=" << maxRamGb << "\n";
-        out << (ru ? "\x23\x20\xd0\xaf\xd0\xb4\xd1\x80\xd0\xb0\x20\x43\x50\x55\x20\xd0\xb4\xd0\xbb\xd1\x8f\x20\xd0\xb3\xd0\xb5\xd0\xbd\xd0\xb5\xd1\x80\xd0\xb0\xd1\x86\xd0\xb8\xd0\xb8\x20\xd0\xbc\xd0\xb8\xd1\x80\xd0\xb0\x20\x28\x30\x20\x3d\x20\xd0\xb0\xd0\xb2\xd1\x82\xd0\xbe\x29\n" : "# CPU cores for world generation (0 = auto)\n");
+        cm("# Сколько ядер CPU отдать генерации мира (0 = авто по числу ядер)",
+           "# CPU cores used for world generation (0 = auto-detect)");
         out << "max-cores=" << maxCores << "\n";
-        out << "\n";
+        blank();
 
-        out << (ru ? "# === \xd0\x9c\xd0\xb8\xd1\x80 ===\n" : "# === World ===\n");
-        out << (ru ? "# \xd0\x98\xd0\xbc\xd1\x8f \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb8 \xd1\x81 \xd0\xbc\xd0\xb8\xd1\x80\xd0\xbe\xd0\xbc\n" : "# World folder name\n");
+        cm("# === Мир ===", "# === World ===");
+        cm("# Имя папки с миром", "# World folder name");
         out << "level-name=" << levelName << "\n";
-        out << (ru ? "# \xd0\x93\xd0\xb5\xd0\xbd\xd0\xb5\xd1\x80\xd0\xb0\xd1\x82\xd0\xbe\xd1\x80: DEFAULT (\xd0\xbe\xd0\xb1\xd1\x8b\xd1\x87\xd0\xbd\xd1\x8b\xd0\xb9), FLAT (\xd0\xbf\xd0\xbb\xd0\xbe\xd1\x81\xd0\xba\xd0\xb8\xd0\xb9), VOID (\xd0\xbf\xd1\x83\xd1\x81\xd1\x82\xd0\xbe\xd0\xb9)\n" : "# Generator: DEFAULT (normal), FLAT (superflat), VOID (empty)\n");
+        cm("# Генератор: DEFAULT (обычный), FLAT (плоский), VOID (пустой)",
+           "# Generator: DEFAULT (normal), FLAT (superflat), VOID (empty)");
         out << "generator=" << generator << "\n";
-        out << (ru ? "# \xd0\xa1\xd0\xb8\xd0\xb4 \xd0\xbc\xd0\xb8\xd1\x80\xd0\xb0 (0 = \xd1\x81\xd0\xbb\xd1\x83\xd1\x87\xd0\xb0\xd0\xb9\xd0\xbd\xd0\xbe\xd0\xb5)\n" : "# World seed (0 = random)\n");
+        cm("# Сид мира (0 = случайный)", "# World seed (0 = random)");
         out << "level-seed=" << levelSeed << "\n";
-        // DIMTOGGLE_V1
-        out << (ru ? "# Создавать мир Ада (Nether). false = измерения нет, порталы не зажигаются\n"
-                   : "# Generate the Nether. false = no such dimension, portals stay dead\n");
+        cm("# Создавать мир Ада (Nether). false = измерения нет, порталы не зажигаются",
+           "# Generate the Nether. false = no such dimension, portals stay dead");
         out << "enable-nether=" << boolToStr(enableNether) << "\n";
-        out << (ru ? "# Создавать мир Энда (End). false = измерения нет, око Эндера не сработает\n"
-                   : "# Generate the End. false = no such dimension, the eye of ender does nothing\n");
+        cm("# Создавать мир Энда (End). false = измерения нет, око Эндера не сработает",
+           "# Generate the End. false = no such dimension, the eye of ender does nothing");
         out << "enable-end=" << boolToStr(enableEnd) << "\n";
-        out << "\n";
+        blank();
 
-        out << (ru ? "# === \xd0\x93\xd0\xb5\xd0\xb9\xd0\xbc\xd0\xbf\xd0\xbb\xd0\xb5\xd0\xb9 ===\n" : "# === Gameplay ===\n");
-        out << (ru ? "# \xd0\xa0\xd0\xb5\xd0\xb6\xd0\xb8\xd0\xbc \xd0\xbf\xd0\xbe \xd1\x83\xd0\xbc\xd0\xbe\xd0\xbb\xd1\x87\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x8e: survival, creative, adventure, spectator\n" : "# Default gamemode: survival, creative, adventure, spectator\n");
+        cm("# === Геймплей ===", "# === Gameplay ===");
+        cm("# Режим игры для новичков: survival, creative, adventure, spectator",
+           "# Game mode for new players: survival, creative, adventure, spectator");
         out << "gamemode=" << gamemode << "\n";
-        out << (ru ? "# \xd0\x9f\xd1\x80\xd0\xb8\xd0\xbd\xd1\x83\xd0\xb4\xd0\xb8\xd1\x82\xd0\xb5\xd0\xbb\xd1\x8c\xd0\xbd\xd0\xbe \xd0\xb7\xd0\xb0\xd0\xbf\xd1\x80\xd0\xb5\xd1\x82\xd0\xb8\xd1\x82\xd1\x8c \xd1\x80\xd0\xb5\xd0\xb6\xd0\xb8\xd0\xbc \xd0\xb2\xd1\x81\xd0\xb5\xd0\xbc \xd0\xb8\xd0\xb3\xd1\x80\xd0\xbe\xd0\xba\xd0\xb0\xd0\xbc (\xd0\xb8\xd0\xb3\xd0\xbd\xd0\xbe\xd1\x80\xd0\xb8\xd1\x80\xd1\x83\xd0\xb5\xd1\x82 \xd0\xb2\xd1\x8b\xd0\xb1\xd0\xbe\xd1\x80 \xd0\xb8\xd0\xb3\xd1\x80\xd0\xbe\xd0\xba\xd0\xb0)\n" : "# Force gamemode on all players (overrides individual choice)\n");
+        cm("# true = каждый вход возвращает игрока в режим gamemode выше,",
+           "# true = every login puts the player back into the gamemode above,");
+        cm("# даже если ему меняли режим через /gamemode. false = режим запоминается",
+           "# even if it was changed with /gamemode. false = the mode is remembered");
         out << "force-gamemode=" << boolToStr(forceGamemode) << "\n";
-        out << (ru ? "# \xd0\xa0\xd0\xb0\xd0\xb7\xd1\x80\xd0\xb5\xd1\x88\xd0\xb5\xd0\xbd\xd0\xb8\xd0\xb5 \xd0\xbf\xd0\xbe \xd0\xb1\xd0\xb8\xd1\x82\xd1\x8c\xd0\xb5 \xd0\xbc\xd0\xb5\xd0\xb6\xd0\xb4\xd1\x83 \xd0\xb8\xd0\xb3\xd1\x80\xd0\xbe\xd0\xba\xd0\xb0\xd0\xbc\xd0\xb8\n" : "# Allow players to fight each other\n");
+        cm("# true = пускаем только клиентов 1.21.1 (протокол 767), остальным показываем",
+           "# true = only 1.21.1 clients (protocol 767) may join, everyone else gets");
+        cm("# вежливое сообщение. false = версию не проверяем — нужно, если впереди",
+           "# a polite message. false = no version check - needed when a proxy or a");
+        cm("# стоит прокси или плагин вроде ViaVersion, который сам переводит протокол",
+           "# ViaVersion-like plugin in front of the server translates the protocol");
+        out << "strict-version-check=" << boolToStr(strictVersionCheck) << "\n"; // DISCMSG_V1
+        cm("# Оболочка сервера: classic = обычное окно консоли (cmd/Windows Terminal),",
+           "# Server shell: classic = the usual console window (cmd/Windows Terminal),");
+        cm("# gui = собственное окно с цветным логом и корректным закрытием по крестику.",
+           "# gui = our own window with a colored log and a proper close-button shutdown.");
+        cm("# Вне Windows и при любой ошибке значение gui тихо становится classic.",
+           "# Outside Windows, or on any failure, gui silently falls back to classic.");
+        out << "console-mode=" << consoleMode << "\n"; // GUICON_V1
+        cm("# Разрешить игрокам бить друг друга. false = удары по игрокам не наносят урона",
+           "# Allow players to damage each other. false = hits on players deal no damage");
         out << "pvp=" << boolToStr(pvp) << "\n";
-        out << (ru ? "# \xd0\xa1\xd0\xbb\xd0\xbe\xd0\xb6\xd0\xbd\xd0\xbe\xd1\x81\xd1\x82\xd1\x8c: 0=\xd0\x9c\xd0\xb8\xd1\x80\xd0\xbd\xd1\x8b\xd0\xb9, 1=\xd0\x9b\xd0\xb5\xd0\xb3\xd0\xba\xd0\xbe, 2=\xd0\x9d\xd0\xbe\xd1\x80\xd0\xbc\xd0\xb0, 3=\xd0\xa1\xd0\xbb\xd0\xbe\xd0\xb6\xd0\xbd\xd0\xbe\n" : "# Difficulty: 0=Peaceful, 1=Easy, 2=Normal, 3=Hard\n");
+        cm("# Сложность: 0=Мирный, 1=Легко, 2=Норма, 3=Сложно",
+           "# Difficulty: 0=Peaceful, 1=Easy, 2=Normal, 3=Hard");
         out << "difficulty=" << difficulty << "\n";
-        out << (ru ? "# \xd0\x9f\xd0\xbe\xd0\xba\xd0\xb0\xd0\xb7\xd1\x8b\xd0\xb2\xd0\xb0\xd1\x82\xd1\x8c \xd0\xba\xd0\xbe\xd0\xbe\xd1\x80\xd0\xb4\xd0\xb8\xd0\xbd\xd0\xb0\xd1\x82\xd1\x8b XYZ \xd0\xb2 \xd0\xb8\xd0\xb3\xd1\x80\xd0\xb5\n" : "# Show XYZ coordinates in game\n");
-        out << "show-coordinates=" << boolToStr(showCoordinates) << "\n";
-        out << (ru ? "# \xd0\xa0\xd0\xb0\xd0\xb4\xd0\xb8\xd1\x83\xd1\x81 \xd0\xb7\xd0\xb0\xd1\x89\xd0\xb8\xd1\x82\xd1\x8b \xd1\x81\xd0\xbf\xd0\xb0\xd0\xb2\xd0\xbd\xd0\xb0 (\xd0\xb2 \xd0\xb1\xd0\xbb\xd0\xbe\xd0\xba\xd0\xb0\xd1\x85, 0=\xd0\xb2\xd1\x8b\xd0\xba\xd0\xbb)\n" : "# Spawn protection radius (in blocks, 0=off)\n");
+        cm("# Радиус защиты спавна в блоках (0 = выкл). Внутри радиуса",
+           "# Spawn protection radius in blocks (0 = off). Inside the radius");
+        cm("# ставить и ломать блоки могут только операторы из ops.json",
+           "# only operators listed in ops.json can place and break blocks");
         out << "spawn-protection=" << spawnProtection << "\n";
-        out << (ru ? "# \xd0\x9e\xd0\xbf\xd0\xb5\xd1\x80\xd0\xb0\xd1\x82\xd0\xbe\xd1\x80\xd1\x8b (\xd1\x87\xd0\xb5\xd1\x80\xd0\xb5\xd0\xb7 \xd0\xb7\xd0\xb0\xd0\xbf\xd1\x8f\xd1\x82\xd1\x83\xd1\x8e): \xd0\xbe\xd0\xb1\xd1\x85\xd0\xbe\xd0\xb4\xd1\x8f\xd1\x82 \xd0\xb7\xd0\xb0\xd1\x89\xd0\xb8\xd1\x82\xd1\x83 \xd1\x81\xd0\xbf\xd0\xb0\xd0\xb2\xd0\xbd\xd0\xb0, \xd0\xbc\xd0\xbe\xd0\xb3\xd1\x83\xd1\x82 /tp /gamemode /time \xd0\xb8 \xd1\x82.\xd0\xb4.\n" : "# Server operators (comma-separated): bypass spawn protection, can use admin commands\n");
-        out << "ops=" << ops << "\n";
-        out << (ru ? "# \xd0\xa0\xd0\xb0\xd0\xb7\xd1\x80\xd0\xb5\xd1\x88\xd0\xb8\xd1\x82\xd1\x8c \xd0\xbf\xd0\xbe\xd0\xbb\xd1\x91\xd1\x82 \xd0\xb2 \xd1\x80\xd0\xb5\xd0\xb6\xd0\xb8\xd0\xbc\xd0\xb5 \xd0\xb2\xd1\x8b\xd0\xb6\xd0\xb8\xd0\xb2\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x8f\n" : "# Allow flying in survival mode\n");
-        out << "allow-flight=" << boolToStr(allowFlight) << "\n";
-        out << "\n";
+        blank();
 
-        out << (ru ? "# === \xd0\x90\xd1\x83\xd1\x82\xd0\xb5\xd0\xbd\xd1\x82\xd0\xb8\xd1\x84\xd0\xb8\xd0\xba\xd0\xb0\xd1\x86\xd0\xb8\xd1\x8f ===\n" : "# === Authentication ===\n");
-        out << (ru ? "# \xd0\xa2\xd1\x80\xd0\xb5\xd0\xb1\xd0\xbe\xd0\xb2\xd0\xb0\xd1\x82\xd1\x8c \xd0\xb0\xd1\x83\xd1\x82\xd0\xb5\xd0\xbd\xd1\x82\xd0\xb8\xd1\x84\xd0\xb8\xd0\xba\xd0\xb0\xd1\x86\xd0\xb8\xd1\x8e \xd0\xbe\xd1\x82 Microsoft/Xbox (\xd0\xb2\xd1\x8b\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb8\xd1\x82\xd1\x8c \xd0\xb4\xd0\xbb\xd1\x8f \xd0\xbf\xd0\xb8\xd1\x80\xd0\xb0\xd1\x82\xd0\xbe\xd0\xba\xd0\xb8\xd1\x85 \xd1\x81\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80\xd0\xbe\xd0\xb2)\n" : "# Require Microsoft/Xbox authentication (disable for cracked servers)\n");
+        cm("# === Microsoft Auth ===", "# === Microsoft Auth ===");
+        cm("# Требовать аутентификацию Microsoft. true = пускаем только владельцев",
+           "# Require Microsoft authentication. true = only players who own");
+        cm("# лицензионного Minecraft, false = пускаем также пиратские клиенты",
+           "# a licensed Minecraft account, false = cracked clients are allowed too");
         out << "xbox-auth=" << boolToStr(xboxAuth) << "\n";
-        out << (ru ? "# \xd0\xa2\xd0\xbe\xd0\xbb\xd1\x8c\xd0\xba\xd0\xbe \xd0\xb4\xd0\xbb\xd1\x8f \xd1\x80\xd0\xb0\xd0\xb7\xd1\x80\xd0\xb5\xd1\x88\xd1\x91\xd0\xbd\xd0\xbd\xd1\x8b\xd1\x85 \xd0\xb8\xd0\xb3\xd1\x80\xd0\xbe\xd0\xba\xd0\xbe\xd0\xb2 (\xd0\xb2\xd0\xb0\xd0\xb9\xd1\x82)\n" : "# Only allow whitelisted players (whitelist)\n");
+        cm("# Пускать только игроков из whitelist.json",
+           "# Only allow players listed in whitelist.json");
         out << "white-list=" << boolToStr(whiteList) << "\n";
-        out << "\n";
+        blank();
 
-        out << (ru ? "# === \xd0\xa1\xd0\xb5\xd1\x82\xd1\x8c ===\n" : "# === Network ===\n");
-        out << (ru ? "# \xd0\x90\xd0\xb4\xd1\x80\xd0\xb5\xd1\x81 \xd0\xbf\xd1\x80\xd0\xb8\xd0\xb2\xd1\x8f\xd0\xb7\xd0\xba\xd0\xb8 (\xd0\xbe\xd1\x81\xd1\x82\xd0\xb0\xd0\xb2\xd1\x8c\xd1\x82\xd0\xb5 \xd0\xbf\xd1\x83\xd1\x81\xd1\x82\xd1\x8b\xd0\xbc \xd0\xb4\xd0\xbb\xd1\x8f \xd0\xb2\xd1\x81\xd0\xb5\xd1\x85 \xd0\xb8\xd0\xbd\xd1\x82\xd0\xb5\xd1\x80\xd1\x84\xd0\xb5\xd0\xb9\xd1\x81\xd0\xbe\xd0\xb2)\n" : "# Bind address (leave empty for all interfaces)\n");
+        cm("# === Сеть ===", "# === Network ===");
+        cm("# На каком IP-адресе машины слушать. Пусто = на всех сетевых",
+           "# Which local IP address to listen on. Empty = listen on every network");
+        cm("# интерфейсах (обычно именно это и нужно)",
+           "# interface (this is what you normally want)");
         out << "server-ip=" << serverIp << "\n";
-        out << (ru ? "# \xd0\x92\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb8\xd1\x82\xd1\x8c \xd0\xbf\xd0\xbe\xd0\xb4\xd0\xb4\xd0\xb5\xd1\x80\xd0\xb6\xd0\xba\xd1\x83 IPv6\n" : "# Enable IPv6 support\n");
+        cm("# Принимать подключения по IPv6. true = слушаем dual-stack сокет,",
+           "# Accept IPv6 connections. true = listen on a dual-stack socket,");
+        cm("# то есть СРАЗУ и IPv4, и IPv6 на том же порту. Нужно только",
+           "# meaning BOTH IPv4 and IPv6 on the same port. Only needed if some");
+        cm("# если у части игроков провайдер без IPv4 (редкость)",
+           "# of your players have an IPv6-only provider (rare)");
         out << "enable-ipv6=" << boolToStr(enableIpv6) << "\n";
-        out << (ru ? "# \xd0\x9c\xd0\xb0\xd0\xba\xd1\x81\xd0\xb8\xd0\xbc\xd0\xb0\xd0\xbb\xd1\x8c\xd0\xbd\xd1\x8b\xd0\xb9 \xd1\x80\xd0\xb0\xd0\xb7\xd0\xbc\xd0\xb5\xd1\x80 \xd0\xbf\xd0\xb0\xd0\xba\xd0\xb5\xd1\x82\xd0\xb0 (\xd0\xb2 \xd0\xb1\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb0\xd1\x85)\n" : "# Maximum packet size (in bytes)\n");
+        cm("# Защита от мусорных пакетов: всё, что больше этого размера, рвёт соединение",
+           "# Junk-packet guard: anything larger than this size drops the connection");
         out << "max-packet-size=" << maxPacketSize << "\n";
-        out << (ru ? "# \xd0\xa1\xd0\xb6\xd0\xb8\xd0\xbc\xd0\xb0\xd1\x82\xd1\x8c \xd0\xbf\xd0\xb0\xd0\xba\xd0\xb5\xd1\x82\xd1\x8b \xd0\xb1\xd0\xbe\xd0\xbb\xd1\x8c\xd1\x88\xd0\xb5 \xd1\x8d\xd1\x82\xd0\xbe\xd0\xb3\xd0\xbe \xd1\x80\xd0\xb0\xd0\xb7\xd0\xbc\xd0\xb5\xd1\x80\xd0\xb0 (\xd0\xb2 \xd0\xb1\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb0\xd1\x85)\n" : "# Compress packets larger than this size (in bytes)\n");
+        cm("# Сжимать пакеты больше этого размера в байтах. -1 = сжатие выключено",
+           "# Compress packets larger than this size in bytes. -1 = compression off");
+        cm("# (быстрее CPU, но сильно больше трафика; ванильное значение 256)",
+           "# (less CPU but far more traffic; the vanilla value is 256)");
         out << "compression-threshold=" << compressionThreshold << "\n";
-        out << "\n";
+        blank();
 
-        out << (ru ? "# === \xd0\x90\xd0\xb2\xd1\x82\xd0\xbe\xd1\x81\xd0\xbe\xd1\x85\xd1\x80\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbd\xd0\xb8\xd0\xb5 ===\n" : "# === Auto-Save ===\n");
-        out << (ru ? "# \xd0\x90\xd0\xb2\xd1\x82\xd0\xbe\xd0\xbc\xd0\xb0\xd1\x82\xd0\xb8\xd1\x87\xd0\xb5\xd1\x81\xd0\xba\xd0\xb8 \xd1\x81\xd0\xbe\xd1\x85\xd1\x80\xd0\xb0\xd0\xbd\xd1\x8f\xd1\x82\xd1\x8c \xd0\xbc\xd0\xb8\xd1\x80 \xd0\xbf\xd0\xbe \xd1\x80\xd0\xb0\xd1\x81\xd0\xbf\xd0\xb8\xd1\x81\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x8e\n" : "# Automatically save the world periodically\n");
+        cm("# === Автосохранение ===", "# === Auto-save ===");
+        cm("# Автоматически сохранять мир по расписанию", "# Automatically save the world on a schedule");
         out << "auto-save=" << boolToStr(autoSave) << "\n";
-        out << (ru ? "# \xd0\x98\xd0\xbd\xd1\x82\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb0\xd0\xbb \xd1\x81\xd0\xbe\xd1\x85\xd1\x80\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbd\xd0\xb8\xd1\x8f (\xd0\xb2 \xd1\x81\xd0\xb5\xd0\xba\xd1\x83\xd0\xbd\xd0\xb4\xd0\xb0\xd1\x85, \xd0\xbc\xd0\xb8\xd0\xbd\xd0\xb8\xd0\xbc\xd1\x83\xd0\xbc 30)\n" : "# Save interval in seconds (minimum 30)\n");
+        cm("# Интервал сохранения в секундах (минимум 30)", "# Save interval in seconds (minimum 30)");
         out << "auto-save-interval=" << autoSaveInterval << "\n";
-        out << "\n";
+        out << "vanilla-mirror=" << boolToStr(vanillaMirror) << "\n";                 // VANILLA_MIRROR_V1
+        out << "vanilla-mirror-interval=" << vanillaMirrorInterval << "\n";            // VANILLA_MIRROR_V1
+        blank();
 
-        out << (ru ? "# === \xd0\x9b\xd0\xbe\xd0\xb3\xd0\xb8\xd1\x80\xd0\xbe\xd0\xb2\xd0\xb0\xd0\xbd\xd0\xb8\xd0\xb5 ===\n" : "# === Logging ===\n");
-        out << (ru ? "# \xd0\xa3\xd1\x80\xd0\xbe\xd0\xb2\xd0\xb5\xd0\xbd\xd1\x8c \xd0\xbb\xd0\xbe\xd0\xb3\xd0\xb8\xd1\x80\xd0\xbe\xd0\xb2: TRACE, DEBUG, INFO, WARN, ERROR\n" : "# Console log level: TRACE, DEBUG, INFO, WARN, ERROR\n");
+        cm("# === Логирование ===", "# === Logging ===");
+        cm("# Уровень логов: TRACE, DEBUG, INFO, WARN, ERROR", "# Log level: TRACE, DEBUG, INFO, WARN, ERROR");
         out << "log-level=" << logLevel << "\n";
-        out << "\n";
-        // RCON_V1
-        out << "# === RCON (nuzhen dlya Discord-bota i veb-paneli) ===\n";
-        out << "enable-rcon=" << (enableRcon ? "true" : "false") << "\n";
+        blank();
+
+        cm("# === RCON ===", "# === RCON ===");
+        cm("# RCON — удалённое управление консолью сервера. Нужно",
+           "# RCON is remote access to the server console. Required by");
+        cm("# Discord-боту и веб-панели, иначе они не смогут выполнять команды",
+           "# the Discord bot and the web panel, otherwise they cannot run commands");
+        out << "enable-rcon=" << boolToStr(enableRcon) << "\n";
+        cm("# Порт RCON (не открывай его наружу без необходимости)",
+           "# RCON port (do not expose it to the internet unless you must)");
         out << "rcon.port=" << rconPort << "\n";
+        cm("# Пароль RCON — это полный доступ к консоли, никому его не показывай",
+           "# The RCON password grants full console access, never share it");
         out << "rcon.password=" << rconPassword << "\n";
+        cm("# Сколько RCON-клиентов могут быть подключены одновременно",
+           "# How many RCON clients may be connected at the same time");
         out << "rcon.max-clients=" << rconMaxClients << "\n";
-        out << "rcon.log-commands=" << (rconLogCommands ? "true" : "false") << "\n";
-        // AUTOSTARTPANEL_V1
-        out << (ru ? "# \xd0\x90\xd0\xb2\xd1\x82\xd0\xbe\xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba Discord-\xd0\xb1\xd0\xbe\xd1\x82\xd0\xb0/\xd0\xb2\xd0\xb5\xd0\xb1-\xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd0\xb8 \xd0\xb2\xd0\xbc\xd0\xb5\xd1\x81\xd1\x82\xd0\xb5 \xd1\x81 \xd1\x81\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80\xd0\xbe\xd0\xbc (Windows: node.exe \xd0\xb2 \xd1\x84\xd0\xbe\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbe\xd0\xbc \xd0\xbe\xd0\xba\xd0\xbd\xd0\xb5)\n" : "# Auto-start Discord bot/web panel together with the server (Windows: background node.exe)\n");
-        out << "auto-start-panel=" << (autoStartPanel ? "true" : "false") << "\n";
+        cm("# Записывать в лог каждую команду, выполненную через RCON",
+           "# Write every command executed through RCON into the log");
+        out << "rcon.log-commands=" << boolToStr(rconLogCommands) << "\n";
+        blank();
+
+        cm("# Запускать Discord-бота и веб-панель вместе с сервером",
+           "# Start the Discord bot and the web panel together with the server");
+        cm("# (Windows: node.exe запускается в фоновом окне)",
+           "# (Windows: node.exe runs in a background window)");
+        out << "auto-start-panel=" << boolToStr(autoStartPanel) << "\n";
     }
 
 private:
@@ -330,54 +416,133 @@ inline bool isBackInput(const std::string& input) {
     return input == "b" || input == "B" || input == "back" || input == "\xd0\xbd\xd0\xb0\xd0\xb7\xd0\xb0\xd0\xb4";
 }
 
+// WIZTEE_V1: в gui-режиме stdout уведён в NUL, а сама консоль отвязана через
+// FreeConsole(). Из-за этого весь текст мастера, напечатанный обычным std::cout
+// (списки вариантов, пояснения, предупреждения), просто пропадал: в окне
+// оставались только заголовок шага и строка ввода, и было непонятно, из чего
+// вообще выбираешь. Перехватываем std::cout построчно и отдаём в окно.
+inline bool g_coutTee = false;
+
+class GuiCoutTee : public std::streambuf {
+public:
+    GuiCoutTee() {
+        prev_ = std::cout.rdbuf(this);
+        g_coutTee = true;
+    }
+    ~GuiCoutTee() override {
+        if (!line_.empty()) flushLine();
+        std::cout.rdbuf(prev_);
+        g_coutTee = false;
+    }
+
+protected:
+    int overflow(int ch) override {
+        if (ch == traits_type::eof()) return 0;
+        const char c = static_cast<char>(ch);
+        if (c == static_cast<char>(10)) flushLine();
+        else if (c != static_cast<char>(13)) line_ += c;
+        return ch;
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        for (std::streamsize i = 0; i < n; ++i) overflow(static_cast<unsigned char>(s[i]));
+        return n;
+    }
+
+private:
+    void flushLine() {
+        nc::log::rawLine(stripAnsi(line_));
+        line_.clear();
+    }
+    // Цвета в окне свои, ANSI-последовательности из std::cout срезаем,
+    // иначе в лог уедет мусор вида [36m.
+    static std::string stripAnsi(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == static_cast<char>(27)) {
+                while (i < s.size() && s[i] != 'm') ++i;
+                continue;
+            }
+            out += s[i];
+        }
+        return out;
+    }
+    std::streambuf* prev_ = nullptr;
+    std::string line_;
+};
+
 inline std::string readLine(const std::string& prompt, const std::string& defaultVal) {
     if (g_back) return defaultVal; // WIZARD_BACK_V1
     ++g_prompts;
-    std::cout << prompt << " [" << defaultVal << "]: ";
+    const std::string label = prompt + " [" + defaultVal + "]: ";
     std::string input;
-    std::getline(std::cin, input);
+    if (nc::log::hasGuiReadLine()) { // GUIWIZARD_V1: мастер идёт в окне-терминале
+        nc::log::guiLine(label, 6);
+        input = nc::log::guiReadLine();
+    } else {
+        std::cout << label;
+        std::getline(std::cin, input);
+    }
     if (isBackInput(input)) { g_back = true; return defaultVal; }
     const std::string val = input.empty() ? defaultVal : input;
-    nc::log::rawLine(prompt + " [" + defaultVal + "]: " + val); // LOGBANNER_V1: ответы мастера в лог
+    nc::log::rawLine(label + val); // LOGBANNER_V1: ответы мастера в лог
     return val;
 }
 
 inline i32 readInt(const std::string& prompt, i32 defaultVal) {
     if (g_back) return defaultVal; // WIZARD_BACK_V1
     ++g_prompts;
-    std::cout << prompt << " [" << defaultVal << "]: ";
+    const std::string label = prompt + " [" + std::to_string(defaultVal) + "]: ";
     std::string input;
-    std::getline(std::cin, input);
+    if (nc::log::hasGuiReadLine()) { // GUIWIZARD_V1
+        nc::log::guiLine(label, 6);
+        input = nc::log::guiReadLine();
+    } else {
+        std::cout << label;
+        std::getline(std::cin, input);
+    }
     if (isBackInput(input)) { g_back = true; return defaultVal; }
     i32 val = defaultVal;
     if (!input.empty()) { try { val = static_cast<i32>(std::stol(input)); } catch (...) {} }
-    nc::log::rawLine(prompt + " [" + std::to_string(defaultVal) + "]: " + std::to_string(val)); // LOGBANNER_V1
+    nc::log::rawLine(label + std::to_string(val)); // LOGBANNER_V1
     return val;
 }
 
 inline i64 readInt64(const std::string& prompt, i64 defaultVal) {
     if (g_back) return defaultVal; // WIZARD_BACK_V1
     ++g_prompts;
-    std::cout << prompt << " [" << defaultVal << "]: ";
+    const std::string label = prompt + " [" + std::to_string(defaultVal) + "]: ";
     std::string input;
-    std::getline(std::cin, input);
+    if (nc::log::hasGuiReadLine()) { // GUIWIZARD_V1
+        nc::log::guiLine(label, 6);
+        input = nc::log::guiReadLine();
+    } else {
+        std::cout << label;
+        std::getline(std::cin, input);
+    }
     if (isBackInput(input)) { g_back = true; return defaultVal; }
     i64 val = defaultVal;
     if (!input.empty()) { try { val = std::stoll(input); } catch (...) {} }
-    nc::log::rawLine(prompt + " [" + std::to_string(defaultVal) + "]: " + std::to_string(val)); // LOGBANNER_V1
+    nc::log::rawLine(label + std::to_string(val)); // LOGBANNER_V1
     return val;
 }
 
 inline bool readBool(const std::string& prompt, bool defaultVal) {
     if (g_back) return defaultVal; // WIZARD_BACK_V1
     ++g_prompts;
-    std::string def = defaultVal ? "y" : "n";
-    std::cout << prompt << " [" << def << "]: ";
+    const std::string def = defaultVal ? "y" : "n";
+    const std::string label = prompt + " [" + def + "]: ";
     std::string input;
-    std::getline(std::cin, input);
+    if (nc::log::hasGuiReadLine()) { // GUIWIZARD_V1
+        nc::log::guiLine(label, 6);
+        input = nc::log::guiReadLine();
+    } else {
+        std::cout << label;
+        std::getline(std::cin, input);
+    }
     if (isBackInput(input)) { g_back = true; return defaultVal; }
     const bool val = input.empty() ? defaultVal : (input[0] == 'y' || input[0] == 'Y');
-    nc::log::rawLine(prompt + " [" + def + "]: " + (val ? "y" : "n")); // LOGBANNER_V1
+    nc::log::rawLine(label + (val ? "y" : "n")); // LOGBANNER_V1
     return val;
 }
 
@@ -425,20 +590,10 @@ inline std::string boxRow(const std::string& content, int width) {
 }
 
 inline void printBanner() {
-    static const char* kArt[] = { // BIGBANNER_V1
-        "  ███████╗███████╗██╗   ██╗██╗   ██╗ ██████╗ ██████╗ ██╗   ██╗███╗   ██╗",
-        "  ╚══███╔╝██╔════╝██║   ██║██║   ██║██╔═══██╗██╔══██╗╚██╗ ██╔╝████╗  ██║",
-        "    ███╔╝ █████╗  ██║   ██║██║   ██║██║   ██║██████╔╝ ╚████╔╝ ██╔██╗ ██║",
-        "   ███╔╝  ██╔══╝  ╚██╗ ██╔╝╚██╗ ██╔╝██║   ██║██╔══██╗  ╚██╔╝  ██║╚██╗██║",
-        "  ███████╗███████╗ ╚████╔╝  ╚████╔╝ ╚██████╔╝██║  ██║   ██║   ██║ ╚████║",
-        "  ╚══════╝╚══════╝  ╚═══╝    ╚═══╝   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═══╝",
-    };
+    // NOPIXELART_V1: большой логотип из блоковых символов █ убран совсем — выглядел как грубые
+    // пиксели и бил по глазам, особенно ярким цветом. Остаём только аккуратную рамку-плашку.
     std::cout << "\n";
-    std::cout << "\033[32m\033[1m";
-    nc::log::rawLine(""); // LOGBANNER_V1: баннер мастера установки тоже пишется в лог
-    for (const char* a : kArt) { std::cout << a << "\n"; nc::log::rawLine(a); }
-    std::cout << "\033[0m\n";
-    std::cout << "\033[36m\033[1m";
+    std::cout << "\033[36m";
     int w = 58;
     const std::string kRows[] = {
         boxLine(w),
@@ -447,15 +602,16 @@ inline void printBanner() {
         boxRow("C++20 Native \xe2\x94\x82 No Java \xe2\x94\x82 No Wrappers", w),
         boxBottom(w),
     };
-    for (const auto& r : kRows) { std::cout << r << "\n"; nc::log::rawLine(r); }
+    if (!g_coutTee) nc::log::rawLine(""); // LOGBANNER_V1 / WIZTEE_V1
+    for (const auto& r : kRows) { std::cout << r << "\n"; if (!g_coutTee) nc::log::rawLine(r); }
     std::cout << "\033[0m\n";
-    nc::log::rawLine(""); // LOGBANNER_V1
+    if (!g_coutTee) nc::log::rawLine(""); // LOGBANNER_V1 / WIZTEE_V1
 }
 
 inline void printStep(int num, int total, const std::string& title) {
     std::cout << "  [" << num << "/" << total << "] " << title << "\n";
     std::cout << "  " << std::string(44, '-') << "\n";
-    nc::log::rawLine("  [" + std::to_string(num) + "/" + std::to_string(total) + "] " + title); // LOGBANNER_V1
+    if (!g_coutTee) nc::log::rawLine("  [" + std::to_string(num) + "/" + std::to_string(total) + "] " + title); // LOGBANNER_V1 / WIZTEE_V1
 }
 
 // RESOURCE_V1: определение железа (ядра + ОЗУ)
@@ -491,12 +647,12 @@ inline std::string makeSecret(std::size_t len = 24) {
     return out;
 }
 
-// SINGLEPASS_V1: если DiscordBotRcon/.env уже существует, подменяем в нём строку
+// SINGLEPASS_V1: если DiscrordBotRcon/.env уже существует, подменяем в нём строку
 // RCON_PASSWORD, чтобы панель и сервер никогда не разъехались по токену.
 inline void syncEnvRconPassword(const std::string& password) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    const fs::path envPath = fs::path("DiscordBotRcon") / ".env";
+    const fs::path envPath = fs::path("DiscrordBotRcon") / ".env";
     if (!fs::exists(envPath, ec)) return;
     std::ifstream in(envPath, std::ios::binary);
     if (!in.is_open()) return;
@@ -537,19 +693,23 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
     // WIZARD_WHITELIST_V1
     std::vector<std::string> wizardWhitelistNames;
 
+    // WIZTEE_V1: пока мастер идёт в окне-терминале, весь std::cout зеркалим в окно.
+    std::unique_ptr<GuiCoutTee> guiTee;
+    if (nc::log::hasGuiReadLine()) guiTee = std::make_unique<GuiCoutTee>();
+
     printBanner();
     std::cout << "  \xd0\x9f\xd0\xbe\xd0\xb4\xd1\x81\xd0\xba\xd0\xb0\xd0\xb7\xd0\xba\xd0\xb0\x3a\x20\xd0\xb2\xd0\xb2\xd0\xb5\xd0\xb4\xd0\xb8\xd1\x82\xd0\xb5\x20\x62\x20\x28\xd0\xb8\xd0\xbb\xd0\xb8\x20\"\xd0\xbd\xd0\xb0\xd0\xb7\xd0\xb0\xd0\xb4\"\x2c\x20\x62\x61\x63\x6b\x29\x2c\x20\xd1\x87\xd1\x82\xd0\xbe\xd0\xb1\xd1\x8b\x20\xd0\xb2\xd0\xb5\xd1\x80\xd0\xbd\xd1\x83\xd1\x82\xd1\x8c\xd1\x81\xd1\x8f\x20\xd0\xbd\xd0\xb0\x20\xd1\x88\xd0\xb0\xd0\xb3\x20\xd0\xbd\xd0\xb0\xd0\xb7\xd0\xb0\xd0\xb4\n";
     std::cout << "  Hint: type b (or \"back\") to return to the previous step\n\n";
 
     bool ru = true;
     int step = 1;
-    while (step <= 9) { // WIZARD_RCON_BOT_V1 WIZARD_WEB_V1 WIZARD_WHITELIST_V1
+    while (step <= 10) { // WIZARD_CONSOLE_V1 WIZARD_RCON_BOT_V1 WIZARD_WEB_V1 WIZARD_WHITELIST_V1
         g_back = false;
         g_prompts = 0;
         switch (step) {
         case 1: {
             // ── Шаг 1: Язык (первый, чтобы знать остальные) ──
-            printStep(1, 9, "Language / \xd0\xaf\xd0\xb7\xd1\x8b\xd0\xba");
+            printStep(1, 10, "Language / \xd0\xaf\xd0\xb7\xd1\x8b\xd0\xba");
             std::cout << "    1) \xd0\xa0\xd1\x83\xd1\x81\xd1\x81\xd0\xba\xd0\xb8\xd0\xb9 (Russian)\n";
             std::cout << "    2) English\n";
             std::string langChoice = readLine("  Select / \xd0\x92\xd1\x8b\xd0\xb1\xd0\xb5\xd1\x80\xd0\xb8\xd1\x82\xd0\xb5", "1");
@@ -560,7 +720,7 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
         }
         case 2: {
             // ── Шаг 2: Сервер ──
-            printStep(2, 9, ru ? "\xd0\xa1\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80" : "Server");
+            printStep(2, 10, ru ? "\xd0\xa1\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80" : "Server");
             cfg.motd = readLine(ru ? "  \xd0\x98\xd0\xbc\xd1\x8f (MOTD)" : "  Server name (MOTD)", cfg.motd);
             cfg.port = readInt(ru ? "  \xd0\x9f\xd0\xbe\xd1\x80\xd1\x82" : "  Port", cfg.port);
             cfg.maxPlayers = readInt(ru ? "  \xd0\x9c\xd0\xb0\xd0\xba\xd1\x81. \xd0\xb8\xd0\xb3\xd1\x80\xd0\xbe\xd0\xba\xd0\xbe\xd0\xb2" : "  Max players", cfg.maxPlayers);
@@ -571,7 +731,7 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
         }
         case 3: {
             // ── Шаг 3: Мир ──
-            printStep(3, 9, ru ? "\xd0\x9c\xd0\xb8\xd1\x80" : "World");
+            printStep(3, 10, ru ? "\xd0\x9c\xd0\xb8\xd1\x80" : "World");
             std::cout << "    1) DEFAULT" << (ru ? " (\xd0\xbe\xd0\xb1\xd1\x8b\xd1\x87\xd0\xbd\xd1\x8b\xd0\xb9 \xe2\x80\x94 \xd0\xb1\xd0\xb8\xd0\xbe\xd0\xbc\xd1\x8b, \xd1\x80\xd0\xb5\xd0\xbb\xd1\x8c\xd0\xb5\xd1\x84, \xd1\x80\xd0\xb5\xd0\xba\xd0\xbe\xd0\xbc\xd0\xb5\xd0\xbd\xd0\xb4\xd1\x83\xd0\xb5\xd1\x82\xd1\x81\xd1\x8f)" : " (normal - biomes & terrain, recommended)") << "\n";
             std::cout << "    2) FLAT   " << (ru ? "(\xd0\xbf\xd0\xbb\xd0\xbe\xd1\x81\xd0\xba\xd0\xb8\xd0\xb9 \xd0\xbc\xd0\xb8\xd1\x80)" : "(superflat)") << "\n";
             std::string genChoice = readLine(ru ? "  \xd0\x93\xd0\xb5\xd0\xbd\xd0\xb5\xd1\x80\xd0\xb0\xd1\x82\xd0\xbe\xd1\x80" : "  Generator", "1");
@@ -588,7 +748,7 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
         }
         case 4: {
             // ── Шаг 4: Геймплей ──
-            printStep(4, 9, ru ? "\xd0\x93\xd0\xb5\xd0\xb9\xd0\xbc\xd0\xbf\xd0\xbb\xd0\xb5\xd0\xb9" : "Gameplay");
+            printStep(4, 10, ru ? "\xd0\x93\xd0\xb5\xd0\xb9\xd0\xbc\xd0\xbf\xd0\xbb\xd0\xb5\xd0\xb9" : "Gameplay");
             std::cout << "    1) survival " << (ru ? "(\xd0\xb2\xd1\x8b\xd0\xb6\xd0\xb8\xd0\xb2\xd0\xb0\xd0\xbd\xd0\xb8\xd0\xb5)" : "(survival)") << "\n";
             std::cout << "    2) creative " << (ru ? "(\xd0\xba\xd1\x80\xd0\xb5\xd0\xb0\xd1\x82\xd0\xb8\xd0\xb2)" : "(creative)") << "\n";
             std::cout << "    3) adventure" << (ru ? " (\xd0\xbf\xd1\x80\xd0\xb8\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb8\xd0\xb5)" : " (adventure)") << "\n";
@@ -608,7 +768,7 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
         }
         case 5: {
             // ── Шаг 5: Продвинутое ──
-            printStep(5, 9, ru ? "\xd0\x94\xd0\xbe\xd0\xbf\xd0\xbe\xd0\xbb\xd0\xbd\xd0\xb8\xd1\x82\xd0\xb5\xd0\xbb\xd1\x8c\xd0\xbd\xd0\xbe" : "Advanced");
+            printStep(5, 10, ru ? "\xd0\x94\xd0\xbe\xd0\xbf\xd0\xbe\xd0\xbb\xd0\xbd\xd0\xb8\xd1\x82\xd0\xb5\xd0\xbb\xd1\x8c\xd0\xbd\xd0\xbe" : "Advanced");
             // RESOURCE_V1: RAM, cores and a recommended base derived from hardware + chosen limits
             {
                 SysInfo si = detectSysInfo();
@@ -682,7 +842,7 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
             break;
         }
         case 6: { // WIZARD_WHITELIST_V1
-            printStep(6, 9, ru ? "\xd0\x91\xd0\xb5\xd0\xbb\xd1\x8b\xd0\xb9 \xd1\x81\xd0\xbf\xd0\xb8\xd1\x81\xd0\xbe\xd0\xba" : "Whitelist");
+            printStep(6, 10, ru ? "\xd0\x91\xd0\xb5\xd0\xbb\xd1\x8b\xd0\xb9 \xd1\x81\xd0\xbf\xd0\xb8\xd1\x81\xd0\xbe\xd0\xba" : "Whitelist");
             if (ru) std::cout << "  \xd0\x91\xd0\xb5\xd0\xbb\xd1\x8b\xd0\xb9 \xd1\x81\xd0\xbf\xd0\xb8\xd1\x81\xd0\xbe\xd0\xba \xe2\x80\x94 \xd0\xbd\xd0\xb0 \xd1\x81\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80 \xd1\x81\xd0\xbc\xd0\xbe\xd0\xb3\xd1\x83\xd1\x82 \xd0\xb7\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb8 \xd1\x82\xd0\xbe\xd0\xbb\xd1\x8c\xd0\xba\xd0\xbe \xd1\x83\xd0\xba\xd0\xb0\xd0\xb7\xd0\xb0\xd0\xbd\xd0\xbd\xd1\x8b\xd0\xb5 \xd0\xbd\xd0\xb8\xd0\xba\xd0\xb8.\n";
             else std::cout << "  Whitelist - only listed nicknames can join the server.\n";
             cfg.whiteList = readBool(ru ? "  \xd0\x92\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb8\xd1\x82\xd1\x8c \xd0\xb1\xd0\xb5\xd0\xbb\xd1\x8b\xd0\xb9 \xd1\x81\xd0\xbf\xd0\xb8\xd1\x81\xd0\xbe\xd0\xba y/n" : "  Enable whitelist y/n", false);
@@ -704,7 +864,7 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
             break;
         }
         case 7: { // WIZARD_RCON_BOT_V1
-            printStep(7, 9, "RCON");
+            printStep(7, 10, "RCON");
             if (ru) std::cout << "  RCON \xe2\x80\x94 \xd1\x83\xd0\xb4\xd0\xb0\xd0\xbb\xd1\x91\xd0\xbd\xd0\xbd\xd0\xb0\xd1\x8f \xd0\xba\xd0\xbe\xd0\xbd\xd1\x81\xd0\xbe\xd0\xbb\xd1\x8c. \xd0\x9d\xd1\x83\xd0\xb6\xd0\xbd\xd0\xb0 \xd0\xb4\xd0\xbb\xd1\x8f Discord-\xd0\xb1\xd0\xbe\xd1\x82\xd0\xb0 \xd0\xb8 \xd0\xb2\xd0\xb5\xd0\xb1-\xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd0\xb8.\n";
             else std::cout << "  RCON - remote console. Required for Discord bot and web panel.\n";
             cfg.enableRcon = readBool(ru ? "  \xd0\x92\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb8\xd1\x82\xd1\x8c RCON y/n" : "  Enable RCON y/n", false);
@@ -723,7 +883,7 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
         }
         case 8: { // WIZARD_RCON_BOT_V1: Discord
             if (!cfg.enableRcon) break;
-            printStep(8, 9, ru ? "Discord-\xd0\xb1\xd0\xbe\xd1\x82" : "Discord bot");
+            printStep(8, 10, ru ? "Discord-\xd0\xb1\xd0\xbe\xd1\x82" : "Discord bot");
             if (ru) {
                 std::cout << "  !! \xd0\x9d\xd0\x90 WINDOWS \xd0\xb1\xd0\xbe\xd1\x82 \xd0\x90\xd0\x92\xd0\xa2\xd0\x9e\xd0\x9c\xd0\x90\xd0\xa2\xd0\x98\xd0\xa7\xd0\x95\xd0\xa1\xd0\x9a\xd0\x98 \xd0\x9d\xd0\x95 \xd0\x97\xd0\x90\xd0\x9f\xd0\xa3\xd0\xa1\xd0\xa2\xd0\x98\xd0\xa2\xd0\xa1\xd0\xaf.\n";
                 std::cout << "     \xd0\x94\xd0\xbb\xd1\x8f \xd0\xb0\xd0\xb2\xd1\x82\xd0\xbe\xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba\xd0\xb0: VPS/Linux + pm2.\n";
@@ -744,7 +904,7 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
         }
         case 9: { // WIZARD_WEB_V1: web panel
             if (!cfg.enableRcon) break;
-            printStep(9, 9, ru ? "\xd0\x92\xd0\xb5\xd0\xb1-\xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd1\x8c" : "Web panel");
+            printStep(9, 10, ru ? "\xd0\x92\xd0\xb5\xd0\xb1-\xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd1\x8c" : "Web panel");
             if (ru) {
                 std::cout << "  \xd0\x92\xd0\xb5\xd0\xb1-\xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd1\x8c RCON \xe2\x80\x94 \xd0\xb0\xd0\xb4\xd0\xbc\xd0\xb8\xd0\xbd\xd0\xba\xd0\xb0 \xd0\xb2 \xd0\xb1\xd1\x80\xd0\xb0\xd1\x83\xd0\xb7\xd0\xb5\xd1\x80\xd0\xb5.\n";
                 std::cout << "  \xd0\x94\xd0\xbe\xd1\x81\xd1\x82\xd1\x83\xd0\xbf\xd0\xbd\xd0\xb0 \xd1\x82\xd0\xbe\xd0\xbb\xd1\x8c\xd0\xba\xd0\xbe \xd1\x81 \xd1\x8d\xd1\x82\xd0\xbe\xd0\xb9 \xd0\xbc\xd0\xb0\xd1\x88\xd0\xb8\xd0\xbd\xd1\x8b (127.0.0.1).\n";
@@ -761,7 +921,7 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
                 std::cout << (ru ? "    2) 0.0.0.0   \xe2\x80\x94 \xd0\xbb\xd1\x8e\xd0\xb1\xd0\xbe\xd0\xb9 IP: \xd0\xbb\xd0\xbe\xd0\xba\xd0\xb0\xd0\xbb\xd0\xba\xd0\xb0, \xd0\xb4\xd1\x80\xd1\x83\xd0\xb3\xd0\xbe\xd0\xb9 \xd0\x9f\xd0\x9a, \xd0\xb8\xd0\xbd\xd1\x82\xd0\xb5\xd1\x80\xd0\xbd\xd0\xb5\xd1\x82 (\xd0\xbd\xd1\x83\xd0\xb6\xd0\xb5\xd0\xbd \xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c!)\n" : "    2) 0.0.0.0   - any IP: LAN, another PC, the internet (password required!)\n");
                 const i32 webHostChoice = readInt((ru ? "  \xd0\x92\xd1\x8b\xd0\xb1\xd0\xbe\xd1\x80" : "  Choice"), 1);
                 wizardWebHost = (webHostChoice == 2) ? "0.0.0.0" : "127.0.0.1";
-                std::cout << (ru ? "  \xd0\x9d\xd1\x83\xd0\xb6\xd0\xb5\xd0\xbd \xd0\xba\xd0\xbe\xd0\xbd\xd0\xba\xd1\x80\xd0\xb5\xd1\x82\xd0\xbd\xd1\x8b\xd0\xb9 IP \xd0\xb8\xd0\xbd\xd1\x82\xd0\xb5\xd1\x80\xd1\x84\xd0\xb5\xd0\xb9\xd1\x81\xd0\xb0? \xd0\x92\xd0\xbf\xd0\xb8\xd1\x88\xd0\xb8\xd1\x82\xd0\xb5 \xd0\xb5\xd0\xb3\xd0\xbe \xd0\xbf\xd0\xbe\xd1\x82\xd0\xbe\xd0\xbc \xd0\xb2 DiscordBotRcon/.env \xd0\xb2 WEB_HOST.\n" : "  Need a specific interface IP? Put it into WEB_HOST in DiscordBotRcon/.env later.\n");
+                std::cout << (ru ? "  \xd0\x9d\xd1\x83\xd0\xb6\xd0\xb5\xd0\xbd \xd0\xba\xd0\xbe\xd0\xbd\xd0\xba\xd1\x80\xd0\xb5\xd1\x82\xd0\xbd\xd1\x8b\xd0\xb9 IP \xd0\xb8\xd0\xbd\xd1\x82\xd0\xb5\xd1\x80\xd1\x84\xd0\xb5\xd0\xb9\xd1\x81\xd0\xb0? \xd0\x92\xd0\xbf\xd0\xb8\xd1\x88\xd0\xb8\xd1\x82\xd0\xb5 \xd0\xb5\xd0\xb3\xd0\xbe \xd0\xbf\xd0\xbe\xd1\x82\xd0\xbe\xd0\xbc \xd0\xb2 DiscrordBotRcon/.env \xd0\xb2 WEB_HOST.\n" : "  Need a specific interface IP? Put it into WEB_HOST in DiscrordBotRcon/.env later.\n");
                 wizardWebPort = readInt((ru ? "  \xd0\x9f\xd0\xbe\xd1\x80\xd1\x82 \xd0\xb2\xd0\xb5\xd0\xb1-\xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd0\xb8" : "  Web panel port"), 3000);
                 std::cout << (ru ? "  \xd0\x9f\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c \xd0\xbd\xd1\x83\xd0\xb6\xd0\xb5\xd0\xbd \xd0\xb4\xd0\xbb\xd1\x8f \xd0\xb2\xd1\x85\xd0\xbe\xd0\xb4\xd0\xb0 \xd0\xb2 \xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd1\x8c \xd0\xb2 \xd0\xb1\xd1\x80\xd0\xb0\xd1\x83\xd0\xb7\xd0\xb5\xd1\x80\xd0\xb5. \xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xbe = \xd0\xb2\xd1\x85\xd0\xbe\xd0\xb4 \xd0\xb1\xd0\xb5\xd0\xb7 \xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8f.\n" : "  The password is used to log into the panel in a browser. Empty = no login required.\n");
                 wizardWebPassword = readLine((ru ? "  \xd0\x9f\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c \xd0\xb2\xd0\xb5\xd0\xb1-\xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd0\xb8 (Enter = \xd0\xb1\xd0\xb5\xd0\xb7 \xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8f)" : "  Web panel password (Enter = none)"), "");
@@ -775,6 +935,23 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
                 wizardWebSessionTtl = readInt((ru ? "  \xd0\x96\xd0\xb8\xd0\xb7\xd0\xbd\xd1\x8c \xd1\x81\xd0\xb5\xd1\x81\xd1\x81\xd0\xb8\xd0\xb8 \xd0\xbf\xd0\xbe\xd1\x81\xd0\xbb\xd0\xb5 \xd0\xb2\xd1\x85\xd0\xbe\xd0\xb4\xd0\xb0, \xd0\xbc\xd0\xb8\xd0\xbd\xd1\x83\xd1\x82 (720 = 12 \xd1\x87\xd0\xb0\xd1\x81\xd0\xbe\xd0\xb2)" : "  Session lifetime after login, minutes (720 = 12 hours)"), wizardWebSessionTtl);
                 if (wizardWebSessionTtl <= 0) wizardWebSessionTtl = 720;
             }
+            std::cout << "\n";
+            break;
+        }
+        case 10: { // WIZARD_CONSOLE_V1: какая консоль открывается вместе с сервером
+            printStep(10, 10, ru ? "\xd0\x9a\xd0\xbe\xd0\xbd\xd1\x81\xd0\xbe\xd0\xbb\xd1\x8c" : "Console");
+            std::cout << (ru ? "    1) classic \xe2\x80\x94 \xd0\xbe\xd0\xba\xd0\xbd\xd0\xbe \xd0\xba\xd0\xbe\xd0\xbc\xd0\xb0\xd0\xbd\xd0\xb4\xd0\xbd\xd0\xbe\xd0\xb9 \xd1\x81\xd1\x82\xd1\x80\xd0\xbe\xd0\xba\xd0\xb8 Windows\n"
+                             : "    1) classic - the Windows command prompt window\n");
+            std::cout << (ru ? "    2) gui     \xe2\x80\x94 \xd1\x81\xd0\xbe\xd0\xb1\xd1\x81\xd1\x82\xd0\xb2\xd0\xb5\xd0\xbd\xd0\xbd\xd0\xbe\xd0\xb5 \xd0\xbe\xd0\xba\xd0\xbd\xd0\xbe-\xd1\x82\xd0\xb5\xd1\x80\xd0\xbc\xd0\xb8\xd0\xbd\xd0\xb0\xd0\xbb Zevvoryn\n"
+                             : "    2) gui     - Zevvoryn's own terminal window\n");
+            // CLASSICNOW_V1: выбор применяется сразу, а не со следующего запуска.
+            std::cout << (ru ? "    Сейчас ты в gui-окне: мастер всегда идёт в нём.\n"
+                             : "    You are in the gui window now: the wizard always runs there.\n");
+            std::cout << (ru ? "    Выберешь classic — сервер сразу переедет в терминал Windows.\n"
+                             : "    Pick classic and the server moves to the Windows terminal right away.\n");
+            const std::string consoleChoice = readLine(ru ? "  \xd0\x9a\xd0\xbe\xd0\xbd\xd1\x81\xd0\xbe\xd0\xbb\xd1\x8c" : "  Console",
+                                                       cfg.consoleMode == "gui" ? "2" : "1");
+            cfg.consoleMode = (consoleChoice == "2" || consoleChoice == "gui" || consoleChoice == "GUI") ? "gui" : "classic";
             std::cout << "\n";
             break;
         }
@@ -819,11 +996,11 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
         }
     }
 
-    // WIZARD_RCON_BOT_V1 / WIZARD_WEB_V1: write DiscordBotRcon/.env
+    // WIZARD_RCON_BOT_V1 / WIZARD_WEB_V1: write DiscrordBotRcon/.env
     if ((wizardBotSetup && !wizardBotToken.empty()) || wizardWebEnabled) {
         std::error_code ec;
-        std::filesystem::create_directories("DiscordBotRcon", ec);
-        std::ofstream ev("DiscordBotRcon/.env", std::ios::trunc);
+        std::filesystem::create_directories("DiscrordBotRcon", ec);
+        std::ofstream ev("DiscrordBotRcon/.env", std::ios::trunc);
         if (ev.is_open()) {
             // WIZARD_ENVDOC_V1: .env пишется с комментариями на языке, выбранном на шаге 1
             const std::string envRule(75, '=');
@@ -867,14 +1044,14 @@ inline ServerConfig runWizard() { // WIZARD_BACK_V1
             ev << (ru ? "# \xd0\xaf\xd0\xb7\xd1\x8b\xd0\xba \xd0\xb8\xd0\xbd\xd1\x82\xd0\xb5\xd1\x80\xd1\x84\xd0\xb5\xd0\xb9\xd1\x81\xd0\xb0 \xd0\xbf\xd0\xb0\xd0\xbd\xd0\xb5\xd0\xbb\xd0\xb8 \xd0\xbf\xd0\xbe \xd1\x83\xd0\xbc\xd0\xbe\xd0\xbb\xd1\x87\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x8e: ru \xd0\xb8\xd0\xbb\xd0\xb8 en (\xd0\xb2 \xd0\xb1\xd1\x80\xd0\xb0\xd1\x83\xd0\xb7\xd0\xb5\xd1\x80\xd0\xb5 \xd0\xb5\xd1\x81\xd1\x82\xd1\x8c \xd0\xbf\xd0\xb5\xd1\x80\xd0\xb5\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb0\xd1\x82\xd0\xb5\xd0\xbb\xd1\x8c).\r\n" : "# Default panel UI language: ru or en (there is a switch in the browser).\r\n");
             ev << "WEB_LANG=" << (ru ? "ru" : "en") << "\r\n";
             ev.close();
-            std::cout << "  [OK] DiscordBotRcon/.env " << (ru ? "\xd1\x81\xd0\xbe\xd0\xb7\xd0\xb4\xd0\xb0\xd0\xbd" : "created") << "\n";
+            std::cout << "  [OK] DiscrordBotRcon/.env " << (ru ? "\xd1\x81\xd0\xbe\xd0\xb7\xd0\xb4\xd0\xb0\xd0\xbd" : "created") << "\n";
             if (wizardBotSetup && !wizardBotToken.empty()) {
-                std::cout << (ru ? "  \xd0\x91\xd0\xbe\xd1\x82: cd DiscordBotRcon && npm install && npm run deploy && npm start\n"
-                                 : "  Bot: cd DiscordBotRcon && npm install && npm run deploy && npm start\n");
+                std::cout << (ru ? "  \xd0\x91\xd0\xbe\xd1\x82: cd DiscrordBotRcon && npm install && npm run deploy && npm start\n"
+                                 : "  Bot: cd DiscrordBotRcon && npm install && npm run deploy && npm start\n");
             }
             if (wizardWebEnabled) {
-                std::cout << (ru ? "  \xd0\x92\xd0\xb5\xd0\xb1: cd DiscordBotRcon && npm install && npm start (\xd0\xb2\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb0 \xd0\xbf\xd0\xbe \xd1\x83\xd0\xbc\xd0\xbe\xd0\xbb\xd1\x87\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x8e)\n"
-                                 : "  Web: cd DiscordBotRcon && npm install && npm start (auto-starts by default)\n");
+                std::cout << (ru ? "  \xd0\x92\xd0\xb5\xd0\xb1: cd DiscrordBotRcon && npm install && npm start (\xd0\xb2\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb0 \xd0\xbf\xd0\xbe \xd1\x83\xd0\xbc\xd0\xbe\xd0\xbb\xd1\x87\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x8e)\n"
+                                 : "  Web: cd DiscrordBotRcon && npm install && npm start (auto-starts by default)\n");
                 std::cout << "  URL: http://" << (wizardWebHost == "0.0.0.0" ? std::string("127.0.0.1") : wizardWebHost)
                           << ":" << wizardWebPort
                           << (wizardWebHost == "0.0.0.0" ? (ru ? "  (\xd0\xb0 \xd1\x82\xd0\xb0\xd0\xba\xd0\xb6\xd0\xb5 \xd0\xbf\xd0\xbe IP \xd1\x8d\xd1\x82\xd0\xbe\xd0\xb9 \xd0\xbc\xd0\xb0\xd1\x88\xd0\xb8\xd0\xbd\xd1\x8b \xd0\xb8\xd0\xb7 \xd1\x81\xd0\xb5\xd1\x82\xd0\xb8)" : "  (and from the network by this machine IP)") : "") << "\n";

@@ -2,7 +2,9 @@
 #include "core/config.hpp"
 #include "core/log.hpp"
 #include "core/crash_context.hpp" // CRASHCTX_V1
+#include "core/crash_dump.hpp" // CRASHDEEP_V1
 #include "core/embedded_bot_files.hpp" // AUTOEXTRACT_V1
+#include "console/gui_console.hpp" // GUICON_V1
 #include <iostream>
 #include <csignal>
 #include <thread>
@@ -26,6 +28,28 @@
 
 static nc::NetherCraftServer* g_server = nullptr;
 
+// GUIWIZARD_V1: true only while the first-run wizard is using the GUI window —
+// the window's close button should exit immediately then (nothing to save yet).
+static std::atomic<bool> g_wizardActive{false};
+#ifdef _WIN32
+// ONEINSTANCE_V1 / CLASSICNOW_V1: хендл нужен снаружи блока проверки: перед перезапуском
+// в терминале его надо отпустить, иначе дочерний процесс решит, что сервер уже запущен.
+static HANDLE g_instanceMutex = nullptr;
+#endif
+
+// LANGSYNC_V1: mirrors the effective language as soon as it's known (peeked config, or
+// wizard result), independent of nc::NetherCraftServer's own config_. This is what the
+// close-handlers below read, so an early close (before/around the wizard) always shows
+// the right language instead of silently defaulting.
+static std::atomic<bool> g_langRu{true};
+// CLASSICTERM_V1: true, если classic-режим пишет в терминал родителя (cmd/PowerShell/.bat),
+// а не в собственное окно консоли: такое окно закрывать и паузить нельзя.
+static bool g_attachedToParentConsole = false;
+
+// GUIWIZARD_V1: bridge for nc::log::setGuiReadLine — must be a plain function
+// pointer (see core/log.hpp GuiReadLine).
+static std::string wizardReadLineBridge() { return nc::console::readWizardLine(); }
+
 // PATHU8_V1: fs::path::string() на Windows отдаёт путь в ANSI (CP1251), а консоль у нас в UTF-8 —
 // из-за этого C:\Users\<русское имя> превращался в кракозябры. u8string() всегда UTF-8.
 static std::string pathU8(const std::filesystem::path& p) {
@@ -33,7 +57,7 @@ static std::string pathU8(const std::filesystem::path& p) {
     return std::string(s.begin(), s.end());
 }
 
-// AUTOSTARTPANEL_V1: запуск DiscordBotRcon/index.js (Discord-бот + веб-панель) вместе с
+// AUTOSTARTPANEL_V1: запуск DiscrordBotRcon/index.js (Discord-бот + веб-панель) вместе с
 // zevvoryn.exe, если это включено в мастере установки (auto-start-panel=true).
 #ifdef _WIN32
 static PROCESS_INFORMATION g_panelProc{};
@@ -89,7 +113,7 @@ static void extractEmbeddedBotFiles(const std::filesystem::path& panelDir, bool 
     }
 }
 
-// RCONENV_V1: DiscordBotRcon/.env must have RCON_HOST/RCON_PORT/RCON_PASSWORD matching
+// RCONENV_V1: DiscrordBotRcon/.env must have RCON_HOST/RCON_PORT/RCON_PASSWORD matching
 // settings.properties, or the web panel/Discord bot's RCON connection silently stays
 // "disconnected". Users should never have to hand-sync two separate config files for
 // this to work, so we do it automatically every time the panel (re)starts.
@@ -275,20 +299,20 @@ static void spawnPanelProcess(const nc::ServerConfig& cfg) {
     namespace fs = std::filesystem;
     const bool ru = (cfg.language == "rus");
     // AUTOSTARTPANEL_V2: рабочая папка процесса может отличаться от папки проекта
-    // (например, exe запущен из build-ninja) — ищем DiscordBotRcon сначала рядом с
+    // (например, exe запущен из build-ninja) — ищем DiscrordBotRcon сначала рядом с
     // текущей рабочей папкой, потом рядом с самим zevvoryn.exe, и всегда логируем результат.
-    // PANELDIR_V2: the folder shipped with the server is DiscordBotRcon (historic typo);
+    // PANELDIR_V2: the folder shipped with the server is DiscrordBotRcon (historic typo);
     // accept the correctly spelled DiscordBotRcon too, so renaming it does not break autostart.
-    fs::path panelDir = fs::exists(fs::path("DiscordBotRcon") / "index.js") ? fs::path("DiscordBotRcon")
+    fs::path panelDir = fs::exists(fs::path("DiscrordBotRcon") / "index.js") ? fs::path("DiscrordBotRcon")
                         : (fs::exists(fs::path("DiscordBotRcon") / "index.js") ? fs::path("DiscordBotRcon")
-                                                                               : fs::path("DiscordBotRcon"));
+                                                                               : fs::path("DiscrordBotRcon"));
     if (!fs::exists(panelDir / "index.js")) {
         wchar_t exeBuf[MAX_PATH]{};
         if (GetModuleFileNameW(nullptr, exeBuf, MAX_PATH) > 0) {
             fs::path exeDir = fs::path(exeBuf).parent_path();
-            if (fs::exists(exeDir / "DiscordBotRcon" / "index.js")) panelDir = exeDir / "DiscordBotRcon";
+            if (fs::exists(exeDir / "DiscrordBotRcon" / "index.js")) panelDir = exeDir / "DiscrordBotRcon";
             else if (fs::exists(exeDir / "DiscordBotRcon" / "index.js")) panelDir = exeDir / "DiscordBotRcon";
-            else if (fs::exists(exeDir / "DiscordBotRcon")) panelDir = exeDir / "DiscordBotRcon";
+            else if (fs::exists(exeDir / "DiscrordBotRcon")) panelDir = exeDir / "DiscrordBotRcon";
         }
     }
     // AUTOEXTRACT_V1: не нашли index.js ни в одной из папок-кандидатов — досыпаем недостающие
@@ -307,7 +331,7 @@ static void spawnPanelProcess(const nc::ServerConfig& cfg) {
             } else {
                 std::cout << "\033[33m[AutoStart] " << pathU8(panelDir / "index.js")
                            << " \xd0\xbd\xd0\xb5 \xd0\xbd\xd0\xb0\xd0\xb9\xd0\xb4\xd0\xb5\xd0\xbd (\xd1\x82\xd0\xb5\xd0\xba\xd1\x83\xd1\x89\xd0\xb0\xd1\x8f \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb0: " << pathU8(fs::current_path(cwdEc))
-                           << "). \xd0\x9f\xd0\xbe\xd0\xbb\xd0\xbe\xd0\xb6\xd0\xb8 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd1\x83 DiscordBotRcon \xd1\x80\xd1\x8f\xd0\xb4\xd0\xbe\xd0\xbc \xd1\x81 zevvoryn.exe \xd0\xb8\xd0\xbb\xd0\xb8 \xd0\xb2 \xd1\x82\xd0\xb5\xd0\xba\xd1\x83\xd1\x89\xd0\xb5\xd0\xb9 \xd1\x80\xd0\xb0\xd0\xb1\xd0\xbe\xd1\x87\xd0\xb5\xd0\xb9 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb5. \xd0\x90\xd0\xb2\xd1\x82\xd0\xbe\xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba \xd0\xbf\xd1\x80\xd0\xbe\xd0\xbf\xd1\x83\xd1\x89\xd0\xb5\xd0\xbd.\033[0m\n" << std::flush;
+                           << "). \xd0\x9f\xd0\xbe\xd0\xbb\xd0\xbe\xd0\xb6\xd0\xb8 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd1\x83 DiscrordBotRcon \xd1\x80\xd1\x8f\xd0\xb4\xd0\xbe\xd0\xbc \xd1\x81 zevvoryn.exe \xd0\xb8\xd0\xbb\xd0\xb8 \xd0\xb2 \xd1\x82\xd0\xb5\xd0\xba\xd1\x83\xd1\x89\xd0\xb5\xd0\xb9 \xd1\x80\xd0\xb0\xd0\xb1\xd0\xbe\xd1\x87\xd0\xb5\xd0\xb9 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb5. \xd0\x90\xd0\xb2\xd1\x82\xd0\xbe\xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba \xd0\xbf\xd1\x80\xd0\xbe\xd0\xbf\xd1\x83\xd1\x89\xd0\xb5\xd0\xbd.\033[0m\n" << std::flush;
             }
         } else {
             if (folderExists) {
@@ -317,12 +341,12 @@ static void spawnPanelProcess(const nc::ServerConfig& cfg) {
             } else {
                 std::cout << "\033[33m[AutoStart] " << pathU8(panelDir / "index.js")
                            << " not found (current dir: " << pathU8(fs::current_path(cwdEc))
-                           << "). Place the DiscordBotRcon folder next to zevvoryn.exe or in the current working directory. Auto-start skipped.\033[0m\n" << std::flush;
+                           << "). Place the DiscrordBotRcon folder next to zevvoryn.exe or in the current working directory. Auto-start skipped.\033[0m\n" << std::flush;
             }
         }
         return;
     }
-    // RCONENV_V1: keep DiscordBotRcon/.env's RCON_* values in sync with settings.properties
+    // RCONENV_V1: keep DiscrordBotRcon/.env's RCON_* values in sync with settings.properties
     // on every launch attempt, before we even check for node_modules, so the panel/bot never
     // silently fail to authenticate with a stale or missing RCON password.
     syncPanelEnvFile(panelDir, cfg, ru);
@@ -442,6 +466,19 @@ static void stopPanelProcess() {}
 // CRASHGUARD_V1: при фатальной ошибке сервер не закрывает окно молча.
 // Пишем ошибку красным в консоль, дублируем в основной лог и в logs/crash-*.txt,
 // даём 180 секунд на чтение и только потом закрываемся.
+// CRASHDEEP_V1: SEH-фильтр кладёт сюда указатель на контекст исключения,
+// чтобы crashNote() разобрал стек и регистры ИМЕННО упавшего потока,
+// а не того места внутри обработчика, где мы сейчас находимся.
+#ifdef _WIN32
+static std::atomic<EXCEPTION_POINTERS*> g_sehInfo{nullptr}; // CRASHDEEP_V1
+#endif
+
+// CRASHSAFE_V1: обработчик краша сам может зависнуть навсегда: поток мог упасть,
+// держа блокировку кучи или loader lock, а сбор символов и запись минидампа
+// ту же блокировку требуют. Именно так окно застывало на «Сохранение мира...» без
+// всякого отчёта. Сторож ниже всегда доводит дело до конца.
+static std::atomic<bool> g_crashReportDone{false}; // CRASHSAFE_V1
+
 static void crashNote(const std::string& what) {
     static std::atomic<bool> g_crashOnce{false};
     if (g_crashOnce.exchange(true)) { // повторный сбой внутри обработчика — просто ждём и выходим
@@ -449,10 +486,37 @@ static void crashNote(const std::string& what) {
         std::_Exit(3);
     }
 
+    // CRASHSAFE_V1: сторож стартует РАНЬШЕ всего остального. Если через 25 секунд
+    // отчёт так и не дописан — значит обработчик застрял в символах или минидампе.
+    // Тогда пишем аварийный короткий отчёт (журнал последних действий всегда доступен,
+    // он не требует ни кучи, ни мьютексов) и убиваем процесс, чтобы окно не висело.
+    {
+        std::string whatCopy = what;
+        std::thread([whatCopy]() {
+            for (int i = 0; i < 250; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (g_crashReportDone.load()) return;
+            }
+            std::string emerg;
+            emerg += "---- Zevvoryn Crash Report (аварийный: обработчик завис) ----\n\n";
+            emerg += "Reason:\n" + whatCopy + "\n\n";
+            emerg += "Обработчик не успел за 25 секунд — скорее всего упавший поток держал\n";
+            emerg += "блокировку кучи. Ниже — журнал последних действий сервера.\n\n";
+            emerg += nc::crash::dumpTrace(40);
+            try {
+                std::filesystem::create_directories("logs");
+                std::ofstream hf("logs/crash-hang.txt", std::ios::trunc);
+                hf << emerg;
+            } catch (...) {}
+            std::cout << "\n\033[31m\033[1m" << emerg << "\033[0m" << std::endl;
+            std::_Exit(4);
+        }).detach();
+    }
+
     // CRASHNET_V1: ПЕРВЫМ делом уводим сервер оффлайн. Раньше crashNote() просто
     // печатал отчёт и висел 180 секунд, а сеть всё это время оставалась живой —
     // accept-луп принимал новых игроков, и на «упавший» сервер можно было спокойно
-    // ��айти и играть. Теперь сразу закрываем listen-сокет и рвём все соединения —
+    // зайти и играть. Теперь сразу закрываем listen-сокет и рвём все соединения —
     // ещё ДО печати отчёта и окна ожидания.
     if (g_server) {
         g_server->getNetwork().crashShutdown();
@@ -492,6 +556,15 @@ static void crashNote(const std::string& what) {
         report += "  (no active command on this thread — likely core engine / background thread)\n";
         report += "  Source: core\n";
     }
+    // CRASHDEEP_V1: самое важное — где именно упало. Стек с именами функций,
+    // вид доступа, модуль+смещение, регистры и окружение процесса.
+    report += "\nDetails:\n";
+#ifdef _WIN32
+    report += nc::crash::details(g_sehInfo.load(), nc::NC_VERSION);
+#else
+    report += nc::crash::details(nullptr, nc::NC_VERSION);
+#endif
+
     report += "\nThe server terminated immediately because of this error.\n";
     report += "No world data was saved.\n";
 
@@ -514,6 +587,19 @@ static void crashNote(const std::string& what) {
         std::ofstream cf(crashPath, std::ios::trunc);
         cf << report;
     } catch (...) {}
+#ifdef _WIN32
+    // CRASHDEEP_V1: рядом с текстовым отчётом кладём минидамп: в нём есть ВСЕ потоки,
+    // а не только упавший. Открывается двойным кликом в Visual Studio.
+    try {
+        std::string dumpPath = crashPath;
+        if (dumpPath.size() > 4) dumpPath.resize(dumpPath.size() - 4);
+        dumpPath += ".dmp";
+        if (nc::crash::writeMiniDump(g_sehInfo.load(), dumpPath.c_str())) {
+            std::cout << "\033[33m  Минидамп для отладки: " << dumpPath << "\033[0m\n";
+        }
+    } catch (...) {}
+#endif
+    g_crashReportDone.store(true); // CRASHSAFE_V1: отчёт целиком на диске — сторож больше не нужен
     std::cout << "\033[33m  Ошибка сохранена в " << crashPath << " и в текущий лог.\033[0m\n";
     // CRASHRESTART_V1: ENTER = перезапуск сразу, иначе авто-перезапуск через 180с.
     // Упавший процесс лечить нельзя — запускаем СВЕЖИЙ процесс в новом окне.
@@ -563,17 +649,23 @@ static void crashNote(const std::string& what) {
 
 #ifdef _WIN32
 static LONG WINAPI sehCrashHandler(EXCEPTION_POINTERS* info) {
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "критический сбой SEH 0x%08lX по адресу %p",
+    // CRASHDEEP_V1: сначала запоминаем контекст — без него не будет ни стека,
+    // ни регистров, ни минидампа.
+    g_sehInfo.store(info);
+    char buf[320];
+    std::string where = nc::crash::moduleOf(reinterpret_cast<DWORD64>(info->ExceptionRecord->ExceptionAddress));
+    std::snprintf(buf, sizeof(buf), "критический сбой SEH 0x%08lX (%s) по адресу %p [%s]",
                   (unsigned long)info->ExceptionRecord->ExceptionCode,
-                  info->ExceptionRecord->ExceptionAddress);
+                  nc::crash::codeName(info->ExceptionRecord->ExceptionCode),
+                  info->ExceptionRecord->ExceptionAddress,
+                  where.c_str());
     crashNote(buf);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 #endif
 
 static void abortHandler(int) {
-    crashNote("вызван abort() — критическая внутр��нняя ошибка");
+    crashNote("вызван abort() — критическая внутренняя ошибка");
     std::_Exit(3);
 }
 
@@ -594,7 +686,9 @@ static void fatalSignalHandler(int sig) {
 // Windows даёт ~5 секунд до принудительного убийства процесса — успеваем сохранить
 // мир и игроков вместо мгновенной потери всего несохранённого.
 static bool serverLangRu() { // WINSAVE_V1
-    return g_server && g_server->getConfig().language == "rus";
+    // LANGSYNC_V1: g_langRu всегда отражает последний известный язык (до и после мастера),
+    // в отличие от g_server->getConfig(), который до startWithConfig()/start() мог бы ещё держать дефолтное значение.
+    return g_langRu.load();
 }
 
 static BOOL WINAPI consoleCtrlHandler(DWORD ctrlType) {
@@ -614,7 +708,7 @@ static BOOL WINAPI consoleCtrlHandler(DWORD ctrlType) {
         // те же строки в лог-файл: окно может уже закрыться, лог останется
         if (ru) NC_INFO("Main", "Крестик консоли: экстренное сохранение мира и игроков");
         else NC_INFO("Main", "Console close button: emergency world + player save");
-        if (g_server) g_server->stop(); // сохранит мир + игроков и погасит сеть
+        if (g_server) g_server->stop("closed"); // CLEANEXIT_V3: в last-exit.txt попадёт именно «закрыли крестиком»
         stopPanelProcess(); // AUTOSTARTPANEL_V1
         if (ru) NC_INFO("Main", "Готово, всё сохранено");
         else NC_INFO("Main", "Done, everything is saved");
@@ -631,15 +725,22 @@ static BOOL WINAPI consoleCtrlHandler(DWORD ctrlType) {
 void signalHandler(int signal) {
     if (g_server) {
         NC_INFO("Main", "Received signal {}, stopping...", signal);
-        g_server->stop();
+        g_server->stop("signal"); // CLEANEXIT_V3: Ctrl+C — это не команда stop
     }
 }
 
 // EXITPAUSE_V1: при запуске двойным кликом Windows закрывает окно вместе с процессом,
 // и причину ошибки прочитать невозможно. Ждём любую клавишу — но только если
-// консоль наша собственная: в чужом терминале, .bat-е или CI пауза только мешает.
-static void pauseBeforeExit() {
+// консоль наша собственная: в чужом терминале, .bat-файле или CI пауза только мешает.
+static void pauseBeforeExit(bool guiActive = false) {
 #ifdef _WIN32
+    // NOCONHOST_V1: если уже открыто своё GUI-окно — оно не закроется само и ошибка уже
+    // видна в нём; ждать нажатие клавиши в отвязанной (FreeConsole) консоли здесь нельзя —
+    // это повесило бы процесс навсегда.
+    if (guiActive) return;
+    // CLASSICTERM_V1: если мы прицепились к чужому терминалу, он никуда не денется после выхода,
+    // а пауза там только мешает скриптам.
+    if (g_attachedToParentConsole) return;
     DWORD pids[4] = {};
     const DWORD owners = GetConsoleProcessList(pids, 4);
     if (owners > 1) return; // окно переживёт наш выход — сообщение и так видно
@@ -650,7 +751,200 @@ static void pauseBeforeExit() {
 #endif
 }
 
+#ifdef _WIN32
+// CLASSICNOW_V1: мастер всегда идёт в нашем окне (конфига ещё нет, читать неоткуда),
+// но если в нём выбрали classic — ждать следующего запуска глупо. Открываем
+// системный терминал и продолжаем работу там, как в CLASSICTERM_V2 при обычном старте.
+static bool relaunchInSystemTerminal(int argc, char* argv[]) {
+    wchar_t exePathW[MAX_PATH] = {0};
+    if (GetModuleFileNameW(nullptr, exePathW, MAX_PATH) == 0) return false;
+
+    const std::wstring exePath(exePathW);
+    const std::wstring workDir = std::filesystem::path(exePath).parent_path().wstring();
+    const std::wstring q(1, static_cast<wchar_t>(34)); // кавычка без экранирования
+
+    std::wstring extraArgs;
+    for (int ai = 1; ai < argc; ++ai) {
+        const int need = MultiByteToWideChar(CP_ACP, 0, argv[ai], -1, nullptr, 0);
+        if (need <= 1) continue;
+        std::wstring warg(static_cast<size_t>(need - 1), static_cast<wchar_t>(0));
+        MultiByteToWideChar(CP_ACP, 0, argv[ai], -1, warg.data(), need);
+        extraArgs += L" " + q + warg + q;
+    }
+    const std::wstring quotedExe = q + exePath + q;
+
+    // Метка защищает от бесконечного перезапуска: у дочернего родитель — cmd,
+    // так что AttachConsole в начале main() подхватит его окно.
+    SetEnvironmentVariableW(L"ZEVVORYN_TERM_CHILD", L"1");
+
+    auto spawnInTerminal = [&](const std::wstring& cmdLine) -> bool {
+        std::wstring mutableCmd = cmdLine;
+        STARTUPINFOW si{}; si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                            CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT, nullptr,
+                            workDir.empty() ? nullptr : workDir.c_str(), &si, &pi))
+            return false;
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return true;
+    };
+
+    bool ok = spawnInTerminal(L"wt.exe -d " + q + workDir + q + L" cmd.exe /k " + quotedExe + extraArgs);
+    if (!ok) ok = spawnInTerminal(L"cmd.exe /k " + quotedExe + extraArgs);
+    if (!ok) SetEnvironmentVariableW(L"ZEVVORYN_TERM_CHILD", nullptr);
+    return ok;
+}
+#endif
+
 int main(int argc, char* argv[]) {
+    // GUICON_V2: путь к конфигу нужен до первого вывода: по нему решаем, какая консоль главная.
+    // NOCONHOST_V1: этот блок переехал выше бывшего VTFIRST_V1 — теперь мы должны знать guiWanted
+    // ДО любого обращения к консоли: с /SUBSYSTEM:WINDOWS её больше не создаёт сама Windows,
+    // и для classic-режима мы должны вызвать AllocConsole() сами, раньше любого вывода.
+    std::string configPath = "settings.properties";
+    if (argc > 1) {
+        configPath = argv[1];
+    }
+
+    const bool firstRun = nc::setup::needsSetup(configPath);
+    bool guiWanted = false;
+    bool guiRu     = true;
+    std::string guiTitle = "Zevvoryn";
+    // NOCONHOST_V1: текст диагностики копим, но печатаем через NC_INFO чуть позже — после того как
+    // консоль (для classic) точно уже есть.
+    std::string diagLine;
+    std::string cfgWarn; // CFGVALIDATE_V1
+    if (!firstRun) {
+        const nc::ServerConfig peek = nc::ServerConfig::loadFrom(configPath);
+        // CFGVALIDATE_V1: неизвестное значение больше не уходит в classic молча.
+        const bool modeKnown = (peek.consoleMode == "gui" || peek.consoleMode == "classic");
+        const bool langKnown = (peek.language == "rus" || peek.language == "eng");
+        guiWanted = modeKnown ? (peek.consoleMode == "gui") : true;
+        guiRu     = langKnown ? (peek.language == "rus") : true;
+        if (!modeKnown)
+            cfgWarn += "console-mode=" + peek.consoleMode + " — " + std::string(guiRu ? "\xd0\xbd\xd0\xb5\xd0\xb8\xd0\xb7\xd0\xb2\xd0\xb5\xd1\x81\xd1\x82\xd0\xbd\xd0\xbe\xd0\xb5 \xd0\xb7\xd0\xbd\xd0\xb0\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb8\xd0\xb5, \xd0\xbe\xd0\xb6\xd0\xb8\xd0\xb4\xd0\xb0\xd0\xbb\xd0\xbe\xd1\x81\xd1\x8c gui \xd0\xb8\xd0\xbb\xd0\xb8 classic; \xd0\xbe\xd1\x82\xd0\xba\xd0\xb0\xd1\x82 \xd0\xbd\xd0\xb0 gui." : "unknown value, expected gui or classic; falling back to gui.") + " ";
+        if (!langKnown)
+            cfgWarn += "language=" + peek.language + " — " + std::string("\xd0\xbd\xd0\xb5\xd0\xb8\xd0\xb7\xd0\xb2\xd0\xb5\xd1\x81\xd1\x82\xd0\xbd\xd1\x8b\xd0\xb9 \xd1\x8f\xd0\xb7\xd1\x8b\xd0\xba, \xd0\xbe\xd0\xb6\xd0\xb8\xd0\xb4\xd0\xb0\xd0\xbb\xd0\xbe\xd1\x81\xd1\x8c rus \xd0\xb8\xd0\xbb\xd0\xb8 eng; \xd0\xbe\xd1\x82\xd0\xba\xd0\xb0\xd1\x82 \xd0\xbd\xd0\xb0 rus. / unknown language, expected rus or eng; falling back to rus.");
+        guiTitle  = std::string("Zevvoryn \xe2\x80\x94 ") + peek.motd;
+        // DIAG_V1: помогает понять, какой именно файл и какие значения реально загрузились —
+        // если вы правите console-mode в файле, а приложение всё равно откроет старый
+        // режим, эта строка в логах покажет, читается ли вообще тот файл, который вы правили.
+        diagLine = "config: " + pathU8(std::filesystem::absolute(configPath))
+            + " | console-mode=" + peek.consoleMode + " | language=" + peek.language;
+    } else {
+        // GUIWIZARD_V1: конфига ещё нет — язык и MOTD станут известны только после мастера,
+        // но окно нужно поднять уже сейчас, иначе шапка и весь диалог уйдёт в classic-консоль.
+        guiWanted = nc::console::isAvailable();
+        guiTitle  = std::string("Zevvoryn \xe2\x80\x94 ") + "\xd0\xa3\xd1\x81\xd1\x82\xd0\xb0\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xba\xd0\xb0";
+    }
+
+#ifdef _WIN32
+    // NOCONHOST_V1: в classic-режиме (или если GUI недоступен) консоли ещё нет — поднимаем свою
+    // свою свежую (точно такую же, какую раньше автоматически создавала подсистема CONSOLE),
+    // ДО первого лога — иначе хендл в writeConsole() прочитается невалидным в пустоту.
+    if (!guiWanted) {
+        // CLASSICTERM_V1: classic — это именно терминал Windows, а не наше окно.
+        // Сначала пробуем прицепиться к консоли родителя: если сервер запущен из cmd,
+        // PowerShell, Windows Terminal или .bat — весь вывод останется в том же окне,
+        // а не улетит в отдельное всплывшее окно. Двойной клик по exe родительской
+        // консоли не даёт — тогда создаём свою через AllocConsole().
+        g_attachedToParentConsole = (AttachConsole(ATTACH_PARENT_PROCESS) != 0);
+
+        // CLASSICTERM_V2: при запуске двойным кликом родительской консоли нет, а AllocConsole()
+        // рисует голый conhost — именно он и выглядит как «наше» окно.
+        // Настоящий classic — это системный терминал: Windows Terminal (Windows 11),
+        // а если его нет — обычный cmd.exe. Поэтому перезапускаем себя внутри терминала
+        // и сразу выходим; у дочернего процесса родитель — cmd, так что AttachConsole выше
+        // подхватит его окно. Метка ZEVVORYN_TERM_CHILD защищает от бесконечного перезапуска.
+        if (!g_attachedToParentConsole) {
+            wchar_t* childMark = nullptr; size_t childMarkLen = 0;
+            _wdupenv_s(&childMark, &childMarkLen, L"ZEVVORYN_TERM_CHILD");
+            const bool alreadyChild = (childMark != nullptr);
+            if (childMark) free(childMark);
+
+            bool relaunched = false;
+            if (!alreadyChild) {
+                wchar_t exePathW[MAX_PATH] = {0};
+                if (GetModuleFileNameW(nullptr, exePathW, MAX_PATH) > 0) {
+                    const std::wstring exePath(exePathW);
+                    std::error_code wdec;
+                    std::wstring workDir = std::filesystem::path(exePath).parent_path().wstring();
+
+                    // Аргументы (путь к конфигу) передаём дальше как есть.
+                    std::wstring extraArgs;
+                    for (int ai = 1; ai < argc; ++ai) {
+                        const int need = MultiByteToWideChar(CP_ACP, 0, argv[ai], -1, nullptr, 0);
+                        if (need <= 1) continue;
+                        std::wstring warg(static_cast<size_t>(need - 1), L'\0');
+                        MultiByteToWideChar(CP_ACP, 0, argv[ai], -1, warg.data(), need);
+                        extraArgs += L" \"" + warg + L"\"";
+                    }
+                    const std::wstring quotedExe = L"\"" + exePath + L"\"";
+
+                    SetEnvironmentVariableW(L"ZEVVORYN_TERM_CHILD", L"1");
+
+                    auto spawnInTerminal = [&](const std::wstring& cmdLine) -> bool {
+                        std::wstring mutableCmd = cmdLine;
+                        STARTUPINFOW si{}; si.cb = sizeof(si);
+                        PROCESS_INFORMATION pi{};
+                        if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                                            CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT, nullptr,
+                                            workDir.empty() ? nullptr : workDir.c_str(), &si, &pi))
+                            return false;
+                        CloseHandle(pi.hThread);
+                        CloseHandle(pi.hProcess);
+                        return true;
+                    };
+
+                    // 1) Windows Terminal (Windows 11 и установленный вручную на Windows 10)
+                    relaunched = spawnInTerminal(L"wt.exe -d \"" + workDir + L"\" cmd.exe /k " + quotedExe + extraArgs);
+                    // 2) Запасной путь: обычный cmd в своём окне (Windows 10 без wt)
+                    if (!relaunched) relaunched = spawnInTerminal(L"cmd.exe /k " + quotedExe + extraArgs);
+                    if (!relaunched) SetEnvironmentVariableW(L"ZEVVORYN_TERM_CHILD", nullptr);
+                }
+            }
+
+            if (relaunched) return 0; // работа продолжится в окне терминала
+            AllocConsole();          // терминал не нашёлся — как раньше, своя консоль
+        }
+
+        FILE* nc_stdout = nullptr;
+        FILE* nc_stderr = nullptr;
+        FILE* nc_stdin  = nullptr;
+        freopen_s(&nc_stdout, "CONOUT$", "w", stdout);
+        freopen_s(&nc_stderr, "CONOUT$", "w", stderr);
+        freopen_s(&nc_stdin,  "CONIN$",  "r", stdin);
+
+        if (g_attachedToParentConsole) {
+            // В чужом терминале курсор стоит после строки с командой запуска.
+            std::cout << "\n" << std::flush;
+        } else {
+            // Своя консоль — доводим её до ума: заголовок и длинная прокрутка,
+            // иначе стартовый лог уезжает за пределы буфера уже на загрузке мира.
+            SetConsoleTitleW(guiRu ? L"Zevvoryn \u2014 \u0441\u0435\u0440\u0432\u0435\u0440 (classic)"
+                                   : L"Zevvoryn \u2014 server (classic)");
+            HANDLE hConOut = GetStdHandle(STD_OUTPUT_HANDLE);
+            CONSOLE_SCREEN_BUFFER_INFO csbi{};
+            if (hConOut != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(hConOut, &csbi)) {
+                COORD bufSize = csbi.dwSize;
+                if (bufSize.X < 100) bufSize.X = 100;
+                if (bufSize.Y < 3000) bufSize.Y = 3000;
+                SetConsoleScreenBufferSize(hConOut, bufSize);
+            }
+        }
+
+        // Выделение мышью и Enter для копирования — штатное поведение консоли Windows,
+        // плюс построчный ввод с эхом для команд и мастера настройки.
+        HANDLE hConIn = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD inMode = 0;
+        if (hConIn != INVALID_HANDLE_VALUE && GetConsoleMode(hConIn, &inMode)) {
+            SetConsoleMode(hConIn, inMode | ENABLE_EXTENDED_FLAGS | ENABLE_QUICK_EDIT_MODE
+                                          | ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+        }
+    }
+#endif
+
 #ifdef _WIN32
     // VTFIRST_V1: console setup MUST happen before the first line we print,
     // otherwise the version banner is emitted while the console still has
@@ -678,6 +972,14 @@ int main(int argc, char* argv[]) {
     const bool g_ansiOk = true;
 #endif
 
+    g_langRu.store(guiRu); // LANGSYNC_V1
+    // GUIBACKLOG_V2: буфер заводится только в GUI-режиме и только на время старта окна.
+    if (guiWanted) nc::log::enableBacklog(true);
+    // NOCONHOST_V1: теперь печатаем отложенную выше диагностику — консоль (classic) уже поднята,
+    // а в gui-режиме это уйдёт в бэклог и попадёт в окно как только оно откроется.
+    if (!diagLine.empty()) NC_INFO("Main", diagLine.c_str());
+    if (!cfgWarn.empty()) NC_WARN("Main", cfgWarn.c_str()); // CFGVALIDATE_V1
+
     // VERSION_V1: версия ядра первой строкой, до любых других логов.
     if (g_ansiOk) {
         std::cout << "\033[36m\033[1m" << nc::NC_CODENAME << " V: " << nc::NC_VERSION
@@ -687,6 +989,32 @@ int main(int argc, char* argv[]) {
         std::cout << nc::NC_CODENAME << " V: " << nc::NC_VERSION
                   << "  (Minecraft 1.21.1, protocol 767)\n" << std::flush;
     }
+    // GUIBACKLOG_V1: та же шапка без ANSI — чтобы окно-терминал увидел её при реплее.
+    nc::log::guiLine(std::string(nc::NC_CODENAME) + " V: " + nc::NC_VERSION +
+                     "  (Minecraft 1.21.1, protocol 767)", 6); // GUICOLOR_V2: голубая, как в classic
+
+#ifdef _WIN32
+    // ONEINSTANCE_V1: два экземпляра из одной папки пишут в один world.dat и latest.log,
+    // и это ловилось только на bind(), когда мир уже тронут. Отсекаем сразу.
+    {
+        std::error_code mtxEc;
+        std::string key = pathU8(std::filesystem::absolute(configPath, mtxEc));
+        for (auto& ch : key) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        unsigned long long hash = 1469598103934665603ULL;
+        for (unsigned char ch : key) { hash ^= ch; hash *= 1099511628211ULL; }
+        wchar_t mutexName[64];
+        swprintf_s(mutexName, L"Local\\ZevvorynServer_%016llx", hash);
+        g_instanceMutex = CreateMutexW(nullptr, TRUE, mutexName);
+        if (g_instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+            const char* warn = guiRu ? "\xd0\xa1\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80 \xd0\xb8\xd0\xb7 \xd1\x8d\xd1\x82\xd0\xbe\xd0\xb9 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb8 \xd1\x83\xd0\xb6\xd0\xb5 \xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x89\xd0\xb5\xd0\xbd. \xd0\x94\xd0\xb2\xd0\xb0 \xd1\x8d\xd0\xba\xd0\xb7\xd0\xb5\xd0\xbc\xd0\xbf\xd0\xbb\xd1\x8f\xd1\x80\xd0\xb0 \xd0\xbf\xd0\xb8\xd1\x88\xd1\x83\xd1\x82 \xd0\xb2 \xd0\xbe\xd0\xb4\xd0\xb8\xd0\xbd \xd0\xbc\xd0\xb8\xd1\x80 \xd0\xb8 \xd0\xbb\xd0\xbe\xd0\xb3 \xd0\xb8 \xd0\xbb\xd0\xbe\xd0\xbc\xd0\xb0\xd1\x8e\xd1\x82 \xd0\xb5\xd0\xb3\xd0\xbe \xe2\x80\x94 \xd0\xb7\xd0\xb0\xd0\xba\xd1\x80\xd0\xbe\xd0\xb9 \xd0\xbf\xd0\xb5\xd1\x80\xd0\xb2\xd0\xbe\xd0\xb5 \xd0\xbe\xd0\xba\xd0\xbd\xd0\xbe \xd0\xb8\xd0\xbb\xd0\xb8 \xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba\xd0\xb0\xd0\xb9 \xd0\xba\xd0\xbe\xd0\xbf\xd0\xb8\xd1\x8e \xd0\xb8\xd0\xb7 \xd0\xb4\xd1\x80\xd1\x83\xd0\xb3\xd0\xbe\xd0\xb9 \xd0\xbf\xd0\xb0\xd0\xbf\xd0\xba\xd0\xb8." : "This server folder is already running. Two instances write the same world and log and corrupt it \xe2\x80\x94 close the first window or start the copy from another folder.";
+            NC_FATAL("Main", warn);
+            MessageBoxW(nullptr, guiRu ? L"\u0421\u0435\u0440\u0432\u0435\u0440 \u0438\u0437 \u044d\u0442\u043e\u0439 \u043f\u0430\u043f\u043a\u0438 \u0443\u0436\u0435 \u0437\u0430\u043f\u0443\u0449\u0435\u043d.\n\u0417\u0430\u043a\u0440\u043e\u0439 \u043f\u0435\u0440\u0432\u043e\u0435 \u043e\u043a\u043d\u043e \u0438\u043b\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0439 \u043a\u043e\u043f\u0438\u044e \u0438\u0437 \u0434\u0440\u0443\u0433\u043e\u0439 \u043f\u0430\u043f\u043a\u0438."
+                                   : L"This server folder is already running.\nClose the first window or start the copy from another folder.",
+                        guiRu ? L"Zevvoryn \u2014 \u0443\u0436\u0435 \u0437\u0430\u043f\u0443\u0449\u0435\u043d" : L"Zevvoryn \u2014 already running", MB_OK | MB_ICONERROR | MB_TOPMOST);
+            return 1;
+        }
+    }
+#endif
 
     // CRASHGUARD_V1: перехват фатальных ошибок (исключения, SEH, abort)
     std::set_terminate(terminateHandler);
@@ -701,9 +1029,74 @@ int main(int argc, char* argv[]) {
 #endif
 #endif
 
-    std::string configPath = "settings.properties";
-    if (argc > 1) {
-        configPath = argv[1];
+    // GUICON_V2: окно поднимаем ДО старта сервера — тогда в него попадает весь вывод:
+    // шапка версии, баннер, загрузка мира. Если окно не создалось — остаёмся в classic.
+    bool guiConsole = false;
+    if (guiWanted) {
+        if (!nc::console::isAvailable()) {
+            NC_WARN("Main", guiRu ? "console-mode=gui \xd0\xbd\xd0\xb5 \xd0\xbf\xd0\xbe\xd0\xb4\xd0\xb4\xd0\xb5\xd1\x80\xd0\xb6\xd0\xb8\xd0\xb2\xd0\xb0\xd0\xb5\xd1\x82\xd1\x81\xd1\x8f \xd0\xbd\xd0\xb0 \xd1\x8d\xd1\x82\xd0\xbe\xd0\xb9 \xd0\xbf\xd0\xbb\xd0\xb0\xd1\x82\xd1\x84\xd0\xbe\xd1\x80\xd0\xbc\xd0\xb5, \xd1\x80\xd0\xb0\xd0\xb1\xd0\xbe\xd1\x82\xd0\xb0\xd0\xb5\xd0\xbc \xd0\xb2 \xd0\xbe\xd0\xb1\xd1\x8b\xd1\x87\xd0\xbd\xd0\xbe\xd0\xb9 \xd0\xba\xd0\xbe\xd0\xbd\xd1\x81\xd0\xbe\xd0\xbb\xd0\xb8"
+                                  : "console-mode=gui is not supported on this platform, staying in the classic console");
+        } else {
+            nc::console::GuiOptions guiOptions;
+            guiOptions.title   = guiTitle;
+            guiOptions.russian = guiRu;
+            guiConsole = nc::console::start(
+                guiOptions,
+                [](const std::string& command) { if (g_server) g_server->queueConsoleCommand(command); },
+                [] { // GUIWIZARD_V1: во время мастера сервера ещё нет — сохранять нечего, выходим сразу
+                    if (g_wizardActive.load()) { std::_Exit(0); }
+                    if (g_server) g_server->stop("closed");
+                }); // крестик окна = честный сейв
+            if (guiConsole) {
+                // Приёмник сразу проигрывает всё, что успело напечататься до его регистрации.
+                nc::log::setGuiSink([](int level, const char* tag, const char* text) {
+                    nc::console::pushLine(static_cast<nc::console::LineLevel>(level),
+                                          tag ? tag : "", text ? text : "");
+                });
+#ifdef _WIN32
+                // Окно наше — чёрный квадрат conhost больше не нужен.
+                if (HWND conhost = GetConsoleWindow()) ShowWindow(conhost, SW_HIDE);
+#endif
+                // GUIQUIET_V1: Windows Terminal спрятать нельзя, но можно перестать в него писать.
+                nc::log::setConsoleQuiet(true);
+                std::fflush(stdout);
+#ifdef _WIN32
+                std::freopen("NUL", "w", stdout);
+#else
+                std::freopen("/dev/null", "w", stdout);
+#endif
+#ifdef _WIN32
+                // NOCONHOST_V1: как и во втором блоке ниже — полностью отвязываем процесс от
+                // conhost (мы туда всё равно больше не пишем), иначе мелькает второе окно.
+                FreeConsole();
+#endif
+                if (firstRun) {
+                    // GUIWIZARD_V1: окно уже наше — переключаем ввод мастера в него, чтобы шапка
+                    // версии, баннер и все вопросы шли туда, а не в classic-консоль.
+                    g_wizardActive.store(true);
+                    nc::console::enableWizardInput(true);
+                    nc::log::setGuiReadLine(&wizardReadLineBridge);
+                }
+                NC_INFO("Main", guiRu ? "\xd0\x9e\xd0\xba\xd0\xbd\xd0\xbe-\xd1\x82\xd0\xb5\xd1\x80\xd0\xbc\xd0\xb8\xd0\xbd\xd0\xb0\xd0\xbb \xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x89\xd0\xb5\xd0\xbd (console-mode=gui)"
+                                      : "GUI console started (console-mode=gui)");
+            } else {
+#ifdef _WIN32
+                // NOCONHOST_V1: gui не поднялся, а консоли ещё нет (guiWanted был true, поэтому выше мы её
+                // не создавали) — поднимаем сейчас, иначе и мастер настройки, и classic-режим
+                // останутся без ввода/вывода вообще.
+                AllocConsole();
+                FILE* nc_stdout2 = nullptr;
+                FILE* nc_stderr2 = nullptr;
+                FILE* nc_stdin2  = nullptr;
+                freopen_s(&nc_stdout2, "CONOUT$", "w", stdout);
+                freopen_s(&nc_stderr2, "CONOUT$", "w", stderr);
+                freopen_s(&nc_stdin2,  "CONIN$",  "r", stdin);
+#endif
+                NC_WARN("Main", guiRu ? "\xd0\x9d\xd0\xb5 \xd1\x83\xd0\xb4\xd0\xb0\xd0\xbb\xd0\xbe\xd1\x81\xd1\x8c \xd1\x81\xd0\xbe\xd0\xb7\xd0\xb4\xd0\xb0\xd1\x82\xd1\x8c \xd0\xbe\xd0\xba\xd0\xbd\xd0\xbe-\xd1\x82\xd0\xb5\xd1\x80\xd0\xbc\xd0\xb8\xd0\xbd\xd0\xb0\xd0\xbb, \xd0\xbe\xd1\x81\xd1\x82\xd0\xb0\xd1\x91\xd0\xbc\xd1\x81\xd1\x8f \xd0\xb2 \xd0\xbe\xd0\xb1\xd1\x8b\xd1\x87\xd0\xbd\xd0\xbe\xd0\xb9 \xd0\xba\xd0\xbe\xd0\xbd\xd1\x81\xd0\xbe\xd0\xbb\xd0\xb8"
+                                      : "Could not create the GUI console window, staying in the classic console");
+                nc::log::enableBacklog(false);
+            }
+        }
     }
 
     std::signal(SIGINT, signalHandler);
@@ -717,12 +1110,85 @@ int main(int argc, char* argv[]) {
     // чтобы успеть дописать мир (на Windows 11 окно закрывается агрессивнее).
     SetProcessShutdownParameters(0x100, SHUTDOWN_NORETRY);
 #endif
-    const bool started = nc::setup::needsSetup(configPath)
-        ? server.startWithConfig(nc::setup::runWizard())
+    // GUIWIZARD_V1: мастер вызываем ровно один раз, чтобы потом обновить заголовок уже открытого окна.
+    nc::ServerConfig wizardCfg{};
+    if (firstRun) {
+        wizardCfg = nc::setup::runWizard();
+        if (guiConsole && g_wizardActive.load()) {
+            // GUIWIZARD_V1: мастер прошёл внутри уже открытого окна — не пересоздаём его, просто
+            // переключаемся обратно на обычный режим и обновляем заголовок под MOTD.
+            g_wizardActive.store(false);
+            nc::console::enableWizardInput(false);
+            nc::log::setGuiReadLine(nullptr);
+            guiRu = (wizardCfg.language == "rus");
+            g_langRu.store(guiRu); // LANGSYNC_V1
+            nc::console::setTitle(std::string("Zevvoryn \xe2\x80\x94 ") + wizardCfg.motd);
+            // CLASSICNOW_V1: раньше выбор classic применялся только со следующего запуска,
+            // потому что окно мастера уже открыто. Теперь сразу уходим в терминал Windows.
+            bool needModeNote = (wizardCfg.consoleMode == "classic");
+#ifdef _WIN32
+            if (wizardCfg.consoleMode == "classic") {
+                NC_INFO("Main", guiRu ? "Выбран classic — открываю системный терминал и продолжаю там"
+                                      : "classic selected - opening the system terminal and continuing there");
+                if (g_instanceMutex) {
+                    ReleaseMutex(g_instanceMutex);
+                    CloseHandle(g_instanceMutex);
+                    g_instanceMutex = nullptr;
+                }
+                if (relaunchInSystemTerminal(argc, argv)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    std::_Exit(0); // сервер ещё не стартовал, сохранять нечего
+                }
+                // терминал не открылся — остаёмся в этом окне и честно об этом говорим
+            }
+#endif
+            if (needModeNote) NC_INFO("Main", guiRu
+                ? "\xd0\x92\xd1\x8b\xd0\xb1\xd0\xbe\xd1\x80 classic/gui \xd0\xb8\xd0\xb7 \xd0\xbc\xd0\xb0\xd1\x81\xd1\x82\xd0\xb5\xd1\x80\xd0\xb0 \xd0\xbf\xd1\x80\xd0\xb8\xd0\xbc\xd0\xb5\xd0\xbd\xd0\xb8\xd1\x82\xd1\x81\xd1\x8f \xd1\x81\xd0\xbe \xd1\x81\xd0\xbb\xd0\xb5\xd0\xb4\xd1\x83\xd1\x8e\xd1\x89\xd0\xb5\xd0\xb3\xd0\xbe \xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x81\xd0\xba\xd0\xb0, \xd1\x8d\xd1\x82\xd0\xb0 \xd1\x81\xd0\xb5\xd1\x81\xd1\x81\xd0\xb8\xd1\x8f \xd0\xbe\xd1\x81\xd1\x82\xd0\xb0\xd1\x91\xd1\x82\xd1\x81\xd1\x8f \xd0\xb2 \xd1\x8d\xd1\x82\xd0\xbe\xd0\xbc \xd0\xbe\xd0\xba\xd0\xbd\xd0\xb5"
+                : "The classic/gui choice from the wizard takes effect from the next launch; this session stays in this window");
+        }
+    }
+    const bool started = firstRun
+        ? server.startWithConfig(wizardCfg)
         : server.start(configPath);
-    if (!started) { pauseBeforeExit(); return 1; } // EXITPAUSE_V1
+    if (!started) { pauseBeforeExit(guiConsole); return 1; } // EXITPAUSE_V1, NOCONHOST_V1
 
     if (server.getConfig().autoStartPanel) spawnPanelProcess(server.getConfig()); // AUTOSTARTPANEL_V1 / RCONENV_V1
+
+    // GUICON_V2: конфиг мог быть только что создан мастером — тогда окно поднимаем сейчас.
+    if (!guiConsole && server.getConfig().consoleMode == "gui" && nc::console::isAvailable()) {
+        const bool ruGui = server.getConfig().language == "rus";
+        nc::console::GuiOptions guiOptions;
+        guiOptions.title   = std::string("Zevvoryn \xe2\x80\x94 ") + server.getConfig().motd;
+        guiOptions.russian = ruGui;
+        guiConsole = nc::console::start(
+            guiOptions,
+            [](const std::string& command) { if (g_server) g_server->queueConsoleCommand(command); },
+            [] { if (g_server) g_server->stop("closed"); });
+        if (guiConsole) {
+            nc::log::setGuiSink([](int level, const char* tag, const char* text) {
+                nc::console::pushLine(static_cast<nc::console::LineLevel>(level),
+                                      tag ? tag : "", text ? text : "");
+            });
+#ifdef _WIN32
+            if (HWND conhost = GetConsoleWindow()) ShowWindow(conhost, SW_HIDE);
+#endif
+            nc::log::setConsoleQuiet(true); // GUIQUIET_V1
+            std::fflush(stdout);
+#ifdef _WIN32
+            std::freopen("NUL", "w", stdout);
+#else
+            std::freopen("/dev/null", "w", stdout);
+#endif
+#ifdef _WIN32
+            // NOCONHOST_V1: мы уже ничего не пишем в conhost (stdout ушёл в NUL), поэтому отвязываем
+            // процесс от консоли совсем — окно не просто скрыто, а фактически уничтожено.
+            // Полностью исключить краткое появление окна при старте может только /SUBSYSTEM:WINDOWS в сборке (нужен CMakeLists.txt).
+            FreeConsole();
+#endif
+            NC_INFO("Main", ruGui ? "\xd0\x9e\xd0\xba\xd0\xbd\xd0\xbe-\xd1\x82\xd0\xb5\xd1\x80\xd0\xbc\xd0\xb8\xd0\xbd\xd0\xb0\xd0\xbb \xd0\xb7\xd0\xb0\xd0\xbf\xd1\x83\xd1\x89\xd0\xb5\xd0\xbd (console-mode=gui)"
+                                  : "GUI console started (console-mode=gui)");
+        }
+    }
 
     // CONSOLE_V2: server simulation owns world state; console lines are queued for its tick.
     std::thread serverThread([&server] { server.run(); });
@@ -730,7 +1196,22 @@ int main(int argc, char* argv[]) {
     // «висело». Теперь консоль читает detached-поток, а main ждёт серверный
     // поток и закрывает процесс сразу при любом способе остановки.
     std::thread consoleThread([&server] {
-        std::cout << "Console ready. Type help for commands.\n> " << std::flush;
+        // STDINGUARD_V1: с /SUBSYSTEM:WINDOWS в gui-режиме мы больше не вызываем AllocConsole вовсе —
+        // у процесса нет валидного stdin. Раньше (под CONSOLE-подсистемой) Windows всё
+        // равно создавала реальную консоль, и std::getline просто вечно блокировался.
+        // Теперь же он немедленно возвращает EOF, и цикл ниже тут же считал это выходом и
+        // сам себе ставил "stop" сразу после старта — поэтому сервер тут же останавливался.
+        // В gui-режиме команды и так идут через свой коллбэк nc::console::start(...), поэтому этому
+        // потоку тут вообще нечего читать — просто ждём остановки сервера.
+        if (nc::console::isRunning()) {
+            while (server.isRunning()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            return;
+        }
+        // GUIBACKLOG_V1: в GUI-режиме у окна своя строка ввода — приглашение туда не дублируем.
+        // LANGFIX_V1: раньше эта строка была зашита только по-английски, хотя язык выбирался русский.
+        std::cout << (g_langRu.load()
+                ? "\xd0\x9a\xd0\xbe\xd0\xbd\xd1\x81\xd0\xbe\xd0\xbb\xd1\x8c \xd0\xb3\xd0\xbe\xd1\x82\xd0\xbe\xd0\xb2\xd0\xb0. \xd0\x92\xd0\xb2\xd0\xb5\xd0\xb4\xd0\xb8\xd1\x82\xd0\xb5 help \xd0\xb4\xd0\xbb\xd1\x8f \xd1\x81\xd0\xbf\xd0\xb8\xd1\x81\xd0\xba\xd0\xb0 \xd0\xba\xd0\xbe\xd0\xbc\xd0\xb0\xd0\xbd\xd0\xb4.\n> "
+                : "Console ready. Type help for commands.\n> ") << std::flush;
         std::string line;
         bool sentStop = false; // STOPLOG_V1: не дублируем stop в очереди — было два «Stopping server...»
         while (server.isRunning() && std::getline(std::cin, line)) {
@@ -745,6 +1226,10 @@ int main(int argc, char* argv[]) {
 
     if (serverThread.joinable()) serverThread.join();
     server.stop();
+    if (guiConsole) { // GUICON_V1: сначала отцепляем приёмник, потом гасим окно
+        nc::log::setGuiSink(nullptr);
+        nc::console::stop();
+    }
     stopPanelProcess(); // AUTOSTARTPANEL_V1
     g_server = nullptr;
     return 0;

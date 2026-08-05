@@ -97,6 +97,20 @@ void Connection::enableCompression(i32 threshold) {
 }
 
 // ONLINE_V1: enable AES-128-CFB8 on the socket (both directions share one secret)
+// PKTLIMIT_V1: глобальный потолок длины входящего пакета (max-packet-size).
+// Дефолт — старое хардкодное значение, чтобы поведение без конфига не менялось.
+static std::atomic<i32> g_maxPacketSize{2097151};
+
+void Connection::setMaxPacketSize(i32 bytes) {
+    // Нижняя граница: с совсем маленьким лимитом не пролезет даже логин.
+    if (bytes < 32 * 1024) bytes = 32 * 1024;
+    g_maxPacketSize.store(bytes, std::memory_order_relaxed);
+}
+
+i32 Connection::getMaxPacketSize() {
+    return g_maxPacketSize.load(std::memory_order_relaxed);
+}
+
 void Connection::enableEncryption(std::span<const u8> secret) {
     if (secret.size() != 16) return;
     if (!encCipher_.init(secret) || !decCipher_.init(secret)) {
@@ -162,33 +176,68 @@ void Connection::sendRaw(std::span<const u8> data) {
     queueSend(std::move(frame));
 }
 
+// NETQUEUE_V1: выбросить из очереди всё необязательное. Вызывается уже под writeMutex_.
+size_t Connection::dropDroppableLocked() {
+    size_t freed = 0;
+    std::deque<QueuedFrame> kept;
+    while (!writeQueue_.empty()) {
+        QueuedFrame& f = writeQueue_.front();
+        if (f.droppable) {
+            freed += f.data.size();
+            droppedPackets_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            kept.push_back(std::move(f));
+        }
+        writeQueue_.pop_front();
+    }
+    writeQueue_ = std::move(kept);
+    writeQueueBytes_ -= (writeQueueBytes_ >= freed ? freed : writeQueueBytes_);
+    return freed;
+}
+
+size_t Connection::dropQueuedDroppable() {
+    if (!isConnected()) return 0;
+    std::lock_guard lock(writeMutex_);
+    return dropDroppableLocked();
+}
+
+size_t Connection::pendingBytes() const {
+    std::lock_guard lock(const_cast<std::mutex&>(writeMutex_));
+    return writeQueueBytes_;
+}
+
+// NETQUEUE_V1: общая логика постановки в очередь для обеих перегрузок.
+//  1. droppable-кадр за мягким порогом просто выкидываем;
+//  2. если важный кадр не лезет в жёсткий лимит — СНАЧАЛА чистим мусор из очереди
+//     (раньше сразу рвали сокет — именно это выбрасывало при массовых правках);
+//  3. только если даже после чистки не влезает — клиент безнадёжен, закрываем.
+bool Connection::enqueueFrame(std::vector<u8>&& data, bool droppable) {
+    const size_t n = data.size();
+    std::lock_guard lock(writeMutex_);
+    if (droppable && writeQueueBytes_ + n > kSoftDropBytes) { // NETSHED_V1
+        droppedPackets_.fetch_add(1, std::memory_order_relaxed);
+        return true; // не ошибка: сознательно пропускаем устаревший апдейт
+    }
+    if (writeQueueBytes_ + n > kMaxWriteQueueBytes) {
+        dropDroppableLocked(); // NETQUEUE_V1: освобождаем место под важный кадр
+        if (writeQueueBytes_ + n > kMaxWriteQueueBytes) return false;
+    }
+    writeQueueBytes_ += n;
+    writeQueue_.push_back(QueuedFrame{ std::move(data), droppable });
+    return true;
+}
+
 void Connection::queueSend(const std::vector<u8>& data, bool droppable) {
     if (!isConnected()) return;
-    bool overflow = false;
-    {
-        std::lock_guard lock(writeMutex_);
-        const size_t projected = writeQueueBytes_ + data.size();
-        if (droppable && projected > kSoftDropBytes) { droppedPackets_.fetch_add(1, std::memory_order_relaxed); return; } // NETSHED_V1
-        if (projected > kMaxWriteQueueBytes) overflow = true;
-        else { writeQueueBytes_ += data.size(); writeQueue_.push(data); }
-    }
-    if (overflow) { close(); return; } // NETASYNC_V2: медленный клиент дропается
-    writeCv_.notify_one();             // NETASYNC_V2: будим писателя, не шлём инлайн
+    std::vector<u8> copy(data);
+    if (!enqueueFrame(std::move(copy), droppable)) { close(); return; } // NETASYNC_V2
+    writeCv_.notify_one();
 }
 
 void Connection::queueSend(std::vector<u8>&& data, bool droppable) {
     if (!isConnected()) return;
-    bool overflow = false;
-    size_t n = data.size();
-    {
-        std::lock_guard lock(writeMutex_);
-        const size_t projected = writeQueueBytes_ + n;
-        if (droppable && projected > kSoftDropBytes) { droppedPackets_.fetch_add(1, std::memory_order_relaxed); return; } // NETSHED_V1
-        if (projected > kMaxWriteQueueBytes) overflow = true;
-        else { writeQueueBytes_ += n; writeQueue_.push(std::move(data)); }
-    }
-    if (overflow) { close(); return; } // NETASYNC_V2
-    writeCv_.notify_one();             // NETASYNC_V2
+    if (!enqueueFrame(std::move(data), droppable)) { close(); return; } // NETASYNC_V2
+    writeCv_.notify_one();
 }
 
 void Connection::writerLoop() {
@@ -208,8 +257,8 @@ void Connection::writerLoop() {
                 gracefulShutdown(); // GRACECLOSE_V2
                 return;
             }
-            data = std::move(writeQueue_.front());
-            writeQueue_.pop();
+            data = std::move(writeQueue_.front().data); // NETQUEUE_V1
+            writeQueue_.pop_front();
             const size_t n = data.size();
             writeQueueBytes_ -= (writeQueueBytes_ >= n ? n : writeQueueBytes_);
         }
@@ -300,7 +349,7 @@ void Connection::doRead() {
                 packetLength);
 
             if (lenBytes == 0) break; // VarInt не полный
-            if (packetLength < 0 || packetLength > 2097151) {
+            if (packetLength < 0 || packetLength > getMaxPacketSize()) { // PKTLIMIT_V1
                 NC_ERROR("Net", "Invalid packet length: {}", packetLength);
                 close();
                 return;
@@ -396,6 +445,7 @@ void Connection::doRead() {
 }
 
 void Connection::processPacket(i32 length, i32 packetId, Buffer& payload) {
+    (void)length; // WARNFIX_V1: длина уже учтена при нарезке кадра, здесь не нужна
     try {
         server_.handleIncomingPacket(shared_from_this(), packetId, payload);
     } catch (const std::exception& e) {

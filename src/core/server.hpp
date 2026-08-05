@@ -5,6 +5,8 @@
 #include "../entity/player.hpp"
 #include "../entity/mob.hpp" // MOBS_V1
 #include "../world/chunk.hpp"
+#include "../world/worldextra.hpp" // BANNER_V1: BannerRecord хранится прямо в сервере
+#include "../world/anvil.hpp" // V57_PLAYERTAG_V1: PlayerExport для Data.Player в level.dat
 #include "../core/config.hpp"
 #include "../core/types.hpp"
 #include "../core/miniedit.hpp"
@@ -37,7 +39,7 @@ public:
 
     bool start(const std::string& configPath = "settings.properties");
     bool startWithConfig(const ServerConfig& cfg);
-    void stop();
+    void stop(const char* exitStatus = "clean"); // CLEANEXIT_V3: причину завершения задаёт вызывающий: clean | closed | signal
     void softReload(); // SOFTRELOAD_V1: мягкий рестарт без завершения процесса (только tick-поток)
     void run();
 
@@ -91,19 +93,6 @@ private:
     void sendPlayerEquipment(const std::shared_ptr<entity::Player>& viewer, const std::shared_ptr<entity::Player>& target); // EQUIP_V1
     void broadcastHeldEquipment(const std::shared_ptr<entity::Player>& player); // EQUIP_V1
     void broadcastEntityMeta(const std::shared_ptr<entity::Player>& player); // PLAYER_VIS_V1
-    void sendTitleTimes(const std::shared_ptr<entity::Player>& player, i32 fadeIn, i32 stay, i32 fadeOut);
-    void sendTitleText(const std::shared_ptr<entity::Player>& player, std::string_view text);
-    void sendSubtitleText(const std::shared_ptr<entity::Player>& player, std::string_view text);
-    void sendActionBarText(const std::shared_ptr<entity::Player>& player, std::string_view text);
-    void sendClearTitles(const std::shared_ptr<entity::Player>& player, bool reset);
-    void sendStopSound(const std::shared_ptr<entity::Player>& player);
-    void sendCameraPacket(const std::shared_ptr<entity::Player>& player, i32 entityId);
-    void sendSimulationDistance(const std::shared_ptr<entity::Player>& player);
-    void sendInitialWorldBorder(const std::shared_ptr<entity::Player>& player);
-    void sendFacePlayer(const std::shared_ptr<entity::Player>& player, const std::shared_ptr<entity::Player>& target);
-    void broadcastEnterCombat(const std::shared_ptr<entity::Player>& player);
-    void broadcastEndCombat(const std::shared_ptr<entity::Player>& player, i32 durationTicks);
-    void broadcastBlockBreakAnimation(i32 entityId, i32 x, i32 y, i32 z, i8 stage);
     void despawnPlayerFor(const std::shared_ptr<entity::Player>& viewer, const std::shared_ptr<entity::Player>& target); // PLAYER_VIS_V2
     void spawnItemDrop(f64 x, f64 y, f64 z, i32 itemId, i32 count, f64 vx, f64 vy, f64 vz, i32 pickupDelay = 10); // ITEMDROP_V1
     void tickItemDrops(); // ITEMDROP_V1
@@ -190,6 +179,16 @@ private:
     };
     std::vector<SpawnWarmup> spawnWarmups_; // SPAWNCFG_V1
     void saveWorlds();                                                     // DIMSAVE_V1                                    // MULTIWORLD_V1
+    // WORLDEXTRA_V1: chests/signs/mobs/drops/vehicles live only in RAM otherwise.
+    world::extra::Snapshot buildExtrasSnapshot(); // V56_VANILLAONLY_V1: собирает снимок из RAM, без файла extra.dat
+    void saveVanillaMirror(bool force);   // VANILLA_MIRROR_V1
+    i64 lastMirrorMs_ = 0;                // VANILLA_MIRROR_V1: когда зеркало писалось в последний раз
+    // V57_PLAYERTAG_V1: последнее известное состояние игрока для Data.Player.
+    // Зеркало может писаться уже после кика игроков на остановке,
+    // поэтому снимок запоминается в savePlayerData(), пока игрок ещё жив.
+    world::anvil::PlayerExport lastPlayerExport_{};
+    bool haveLastPlayerExport_ = false;
+    void restoreExtras(const world::extra::Snapshot& snap); // V56_VANILLAONLY_V1: раскладывает снимок в RAM (сундуки/печи/спавнеры/баннеры/таблички/мобы/дроп/транспорт)
     bool travelToDimension(const std::shared_ptr<entity::Player>& player, i32 dim, f64 tx, f64 ty, f64 tz); // MULTIWORLD_V1
     void refreshSpectatorVisibility(const std::shared_ptr<entity::Player>& player, bool wasSpectator, bool isSpectator); // PLAYER_VIS_V2
     void applyGameMode(const std::shared_ptr<entity::Player>& target, i32 mode); // CONSOLE_V3: единая смена режима (команда + консоль)
@@ -227,7 +226,37 @@ private:
     struct ChestData { i32 itemId[27] = {}; i32 count[27] = {}; };
     std::unordered_map<u64, ChestData> chests_;
     std::mutex chestsMutex_;
+    // CONTAINER_V2: блок-сущности с поведением — печка плавит, воронка качает.
+    // Оба контейнера живут в chests_; здесь только то, что нужно тикать.
+    // Оба мапа ходят под chestsMutex_ — второй мьютекс дал бы вложенность.
+    struct FurnaceData { i32 burn = 0; i32 burnTotal = 0; i32 cook = 0; i32 cookTotal = 0; };
+    std::unordered_map<u64, i32> blockEnts_;        // ключ позиции -> ContainerKind (только тикающие)
+    std::unordered_map<u64, FurnaceData> furnaces_; // прогресс плавки по позиции
+    void registerBlockEntity(i32 bx, i32 by, i32 bz, i32 kind); // CONTAINER_V2
+    void forgetBlockEntity(u64 key);                            // CONTAINER_V2
+    // SPAWNER_V1: спавнер — не контейнер, у него своя мапа и свой тик.
+    struct SpawnerData {
+        i32 typeIdx = -1;          // индекс в gen::MOBS; -1 = тип не поддержан ядром
+        std::string entityId;      // исходное ванильное имя — везём обратно в экспорт как есть
+        i32 delay = 20;
+        i32 minDelay = 200;
+        i32 maxDelay = 800;
+        i32 spawnCount = 4;
+        i32 maxNearby = 6;
+        i32 requiredPlayerRange = 16;
+        i32 spawnRange = 4;
+    };
+    std::unordered_map<u64, SpawnerData> spawners_; // SPAWNER_V1: ключ позиции -> настройки
+    std::mutex spawnersMutex_;                      // SPAWNER_V1
+    // BANNER_V1: слои узоров лежат мёртвым грузом — ядро их не меняет,
+    // только возит между extra.dat и ванильным сейвом.
+    std::unordered_map<u64, world::extra::BannerRecord> banners_; // BANNER_V1
+    std::mutex bannersMutex_;                                     // BANNER_V1
+    void tickSpawners();                            // SPAWNER_V1
+    void tickBlockEntities();                                   // CONTAINER_V2
+    void tickHopperAt(u64 key, i32 st, i32 bx, i32 by, i32 bz, std::vector<u64>& refresh); // CONTAINER_V2
     void openChestFor(const std::shared_ptr<entity::Player>& player, i32 bx, i32 by, i32 bz, bool isEnder); // CHEST_V1
+    void openVehicleChestFor(const std::shared_ptr<entity::Player>& player, i32 vehicleEid); // CHESTBOAT_V1
     void sendContainerContent(const std::shared_ptr<entity::Player>& player); // CHEST_V1
     int countChestViewers(u64 key, bool ender); // CHEST_V2: сколько игроков смотрит в сундук с данным ключом
     void broadcastChestLid(i32 bx, i32 by, i32 bz, i32 blockState, i32 viewers); // CHEST_V2: анимация крышки (Block Action 0x08)
@@ -438,6 +467,7 @@ private:
     // на сериализации мира и записи на диск.
     std::thread saveThread_;
     std::atomic<bool> saveBusy_{false};
+    u64 lastAutoSaveSeq_ = ~0ull; // AUTOSAVE_V3: editSeq мира на момент последнего автосейва
     std::atomic<bool> stoppedOnce_{false}; // STOPONCE_V1: stop() выполняется только один раз
 };
 
