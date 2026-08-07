@@ -79,3 +79,8 @@ Desktop.ini
 
 # Зеркало-репозиторий
 Zevvoryn/
+
+# Файлы, которым не место в src/ (дублируют корневые / внутренние заметки)
+src/CMakeLists.txt
+src/PHYSICS_PROGRESS.txt
+src/README.md

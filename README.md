@@ -26,9 +26,9 @@ No JVM. No JNI. No wrappers.
 > finished server.
 >
 > **Not there yet / not working properly:** crafting and furnaces, redstone and
-> mechanisms, portals and travel between the Nether/End (stubs only),
-> enchanting and brewing, full mob AI and mob variety, plus a number of other
-> blocks/mechanics. Full list is in [`license/CHANGELOG_EN.md`](license/CHANGELOG_EN.md).
+> mechanisms, enchanting and brewing, full mob AI and mob variety, plus a
+> number of other blocks/mechanics. Full list is in
+> [`license/CHANGELOG_EN.md`](license/CHANGELOG_EN.md).
 >
 > Almost none of this has been tested on a live server under load — most of it
 > was only checked statically (syntax / bracket balance), not by actually
@@ -42,14 +42,10 @@ Zevvoryn is a from-scratch implementation of the Minecraft: Java Edition 1.21.1
 server (protocol 767), written in C++20. A vanilla client connects to it
 directly — no mods, no proxy.
 
-The goal is fast startup and predictable resource usage, where the official
-Java server spends seconds spinning up the JVM and hundreds of megabytes on the
-heap. This is a learning/research project, not a drop-in replacement for the
-official server.
-
-```
-[17:01:10.482] [Server thread/INFO] Done! (0.05s)
-```
+The goal is a fast, lightweight server core with predictable resource usage,
+where the official Java server spends time spinning up the JVM and a lot of
+memory on the heap. This is a learning/research project, not a drop-in
+replacement for the official server.
 
 ---
 
@@ -83,11 +79,12 @@ Legend: ✅ works · 🚧 partial / buggy · ❌ not yet
 |------|-------|
 | Protocol 1.21.1 (767): handshake, status, play | ✅ |
 | Online/offline mode, encryption, packet compression | ✅ |
-| Vanilla world generation (cubiomes), vanilla-matching seeds | ✅ |
 | Anvil format: read and write regions/chunks | ✅ |
-| Block physics, fluids, tick-based updates | ✅ |
 | Inventory, items, game modes | ✅ |
-| Mining: block hardness, tool speed, durability | ✅ |
+| Eating food and food effects | ✅ |
+| Nether, End, inter-dimension portals | ✅ |
+| Block physics, fluids, tick-based updates | 🚧 |
+| Mining: block hardness, tool speed, durability | 🚧 |
 | Armor, equipment, combat vs players/mobs | 🚧 |
 | Chat, system messages, tab list, skins | ✅ |
 | Whitelist (`whitelist.txt`), operators, bans | ✅ |
@@ -98,9 +95,9 @@ Legend: ✅ works · 🚧 partial / buggy · ❌ not yet
 | Rotating logs (last 15), crash protection | ✅ |
 | MiniEdit — fast bulk region block ops | ✅ |
 | Mobs: spawning and a basic set | 🚧 |
+| Vehicles: boats and minecarts | 🚧 |
 | Mobs: full AI and variety | ❌ |
 | Crafting and furnaces | ❌ |
-| Nether, End, inter-dimension portals | ❌ |
 | Redstone, mechanisms, rail transport | ❌ |
 | Enchanting, brewing | ❌ |
 
@@ -130,6 +127,10 @@ Put the resulting `zevvoryn.exe` in its own folder — next to it the server wil
 create `settings.properties`, `world/`, `logs/` and `DiscrordBotRcon/`.
 
 ### Linux
+
+> **Not tested at all.** The Linux build has never been verified — it may not
+> even compile yet. Treat the steps below as a starting point, not a supported
+> path.
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -336,11 +337,10 @@ Open TCP port `25565` in the Windows firewall.
 ## Roadmap
 
 - Crafting and furnaces
-- Portals and travel between the Nether/End
 - Full mob AI and mob variety
+- Vehicles/transport polish (boats, minecarts)
 - Structure and village generation
 - Redstone and mechanisms
-- Minecarts and transport
 - Web panel extensions (world map, TPS graphs)
 
 ---
