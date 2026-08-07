@@ -24,9 +24,7 @@
 #include <memory>
 #include <string>
 #include <span>
-#include <string>
 #include <string_view>
-#include <utility>
 #include <utility>
 #include <vector>
 
@@ -401,13 +399,18 @@ inline void sendUpdateTime(const PlayerPtr& player, i64 worldAge, i64 timeOfDay)
 //   Byte containerId, VarInt stateId, Short slot, Slot item
 //   Slot: VarInt count; если count > 0 - VarInt itemId, VarInt addedComponents, VarInt removedComponents
 inline void sendContainerSlot(const PlayerPtr& player, i32 containerId, i32 stateId,
-                              i16 slot, i32 itemId, i32 count) {
+                              i16 slot, i32 itemId, i32 count, i32 damage = 0) {
     net::Buffer buf;
     buf.writeByte(static_cast<u8>(containerId));
     buf.writeVarInt(stateId);
     buf.writeI16(slot);
     buf.writeVarInt(count);
-    if (count > 0) { buf.writeVarInt(itemId); buf.writeVarInt(0); buf.writeVarInt(0); }
+    if (count > 0) {
+        buf.writeVarInt(itemId);
+        buf.writeVarInt(damage > 0 ? 1 : 0); // added components
+        buf.writeVarInt(0);                  // removed components
+        if (damage > 0) { buf.writeVarInt(3); buf.writeVarInt(damage); } // minecraft:damage
+    }
     detail::dispatch(player, cb::ContainerSetSlot, buf);
 }
 
@@ -1428,6 +1431,158 @@ inline void sendStartConfiguration(const PlayerPtr& player) {
 }
 
 // ============================================================
+// PACKETS_V22: полное API для оставшихся clientbound Play-пакетов.
+// Даже редко используемые пакеты теперь имеют типизированный writer и не требуют
+// ручной сборки payload в core/server.cpp.
+// ============================================================
+
+inline void sendBlockDestroyStage(const PlayerPtr& player, i32 entityId,
+                                  const BlockPos& pos, i8 stage) {
+    net::Buffer buf;
+    buf.writeVarInt(entityId);
+    buf.writePosition(pos);
+    buf.writeByte(static_cast<u8>(stage));
+    detail::dispatch(player, cb::BlockDestroyStage, buf);
+}
+
+inline void sendBlockEntityData(const PlayerPtr& player, const BlockPos& pos,
+                                i32 blockEntityType, std::span<const u8> nbt) {
+    net::Buffer buf;
+    buf.writePosition(pos);
+    buf.writeVarInt(blockEntityType);
+    buf.writeBytes(nbt); // anonymous network NBT, including its root tag
+    detail::dispatch(player, cb::BlockEntityData, buf);
+}
+
+inline void sendBlockAction(const PlayerPtr& player, const BlockPos& pos,
+                            u8 actionId, u8 actionParam, i32 blockType) {
+    net::Buffer buf;
+    buf.writePosition(pos);
+    buf.writeByte(actionId);
+    buf.writeByte(actionParam);
+    buf.writeVarInt(blockType);
+    detail::dispatch(player, cb::BlockAction, buf);
+}
+
+// action: 0 add, 1 remove, 2 replace.
+inline void sendChatSuggestions(const PlayerPtr& player, i32 action,
+                                const std::vector<std::string>& entries) {
+    net::Buffer buf;
+    buf.writeVarInt(action);
+    buf.writeVarInt(static_cast<i32>(entries.size()));
+    for (const auto& entry : entries) buf.writeString(entry);
+    detail::dispatch(player, cb::ChatSuggestions, buf);
+}
+
+inline void sendDebugSample(const PlayerPtr& player, const std::vector<i64>& sample,
+                            i32 sampleType) {
+    net::Buffer buf;
+    buf.writeVarInt(static_cast<i32>(sample.size()));
+    for (i64 value : sample) buf.writeI64(value);
+    buf.writeVarInt(sampleType);
+    detail::dispatch(player, cb::DebugSample, buf);
+}
+
+// id is the packed message-signature cache id. Values > 0 carry no 256-byte signature.
+inline void sendDeleteChatMessage(const PlayerPtr& player, i32 id) {
+    net::Buffer buf;
+    buf.writeVarInt(id > 0 ? id : 1);
+    detail::dispatch(player, cb::DeleteChatMessage, buf);
+}
+
+// Unsigned/system-like chat with a registry chat type holder.
+inline void sendDisguisedChatMessage(const PlayerPtr& player, std::string_view message,
+                                     i32 chatTypeId, std::string_view senderName,
+                                     std::string_view targetName = {}) {
+    net::Buffer buf;
+    writeTextComponent(buf, message);
+    buf.writeVarInt(chatTypeId + 1); // registry holder: zero is inline, ids are encoded as id+1
+    writeTextComponent(buf, senderName);
+    const bool hasTarget = !targetName.empty();
+    buf.writeBool(hasTarget);
+    if (hasTarget) writeTextComponent(buf, targetName);
+    detail::dispatch(player, cb::DisguisedChatMessage, buf);
+}
+
+struct LightUpdateData {
+    std::vector<i64> skyMask;
+    std::vector<i64> blockMask;
+    std::vector<i64> emptySkyMask;
+    std::vector<i64> emptyBlockMask;
+    std::vector<std::vector<u8>> skyArrays;
+    std::vector<std::vector<u8>> blockArrays;
+};
+
+inline void writeLongArray(net::Buffer& buf, const std::vector<i64>& values) {
+    buf.writeVarInt(static_cast<i32>(values.size()));
+    for (i64 value : values) buf.writeI64(value);
+}
+inline void writeByteArrays(net::Buffer& buf, const std::vector<std::vector<u8>>& arrays) {
+    buf.writeVarInt(static_cast<i32>(arrays.size()));
+    for (const auto& bytes : arrays) {
+        buf.writeVarInt(static_cast<i32>(bytes.size()));
+        buf.writeBytes(std::span<const u8>(bytes.data(), bytes.size()));
+    }
+}
+inline void sendLightUpdate(const PlayerPtr& player, i32 chunkX, i32 chunkZ,
+                            const LightUpdateData& light) {
+    net::Buffer buf;
+    buf.writeVarInt(chunkX);
+    buf.writeVarInt(chunkZ);
+    writeLongArray(buf, light.skyMask);
+    writeLongArray(buf, light.blockMask);
+    writeLongArray(buf, light.emptySkyMask);
+    writeLongArray(buf, light.emptyBlockMask);
+    writeByteArrays(buf, light.skyArrays);
+    writeByteArrays(buf, light.blockArrays);
+    detail::dispatch(player, cb::LightUpdate, buf);
+}
+
+inline void sendMoveEntityPosRot(const PlayerPtr& player, i32 entityId,
+                                 i16 dx, i16 dy, i16 dz,
+                                 Angle yaw, Angle pitch, bool onGround) {
+    net::Buffer buf;
+    buf.writeVarInt(entityId); buf.writeI16(dx); buf.writeI16(dy); buf.writeI16(dz);
+    buf.writeAngle(yaw); buf.writeAngle(pitch); buf.writeBool(onGround);
+    detail::dispatch(player, cb::MoveEntityPosRot, buf);
+}
+inline void sendMoveEntityRot(const PlayerPtr& player, i32 entityId,
+                              Angle yaw, Angle pitch, bool onGround) {
+    net::Buffer buf;
+    buf.writeVarInt(entityId); buf.writeAngle(yaw); buf.writeAngle(pitch); buf.writeBool(onGround);
+    detail::dispatch(player, cb::MoveEntityRot, buf);
+}
+
+// Offline-mode unsigned Player Chat. chatTypeId is a registry id, encoded as id+1.
+inline void sendPlayerChatUnsigned(const PlayerPtr& player, const UUID& sender,
+                                   i32 messageIndex, std::string_view plainMessage,
+                                   i64 timestamp, i64 salt, i32 chatTypeId,
+                                   std::string_view networkName) {
+    net::Buffer buf;
+    buf.writeUUID(sender);
+    buf.writeVarInt(messageIndex);
+    buf.writeBool(false);                 // no 256-byte signature
+    buf.writeString(plainMessage);
+    buf.writeI64(timestamp);
+    buf.writeI64(salt);
+    buf.writeVarInt(0);                   // previous message signatures
+    buf.writeBool(false);                 // no unsigned decorated content
+    buf.writeVarInt(0);                   // filter: pass through
+    buf.writeVarInt(chatTypeId + 1);      // registry holder
+    writeTextComponent(buf, networkName);
+    buf.writeBool(false);                 // no target name
+    detail::dispatch(player, cb::PlayerChat, buf);
+}
+
+inline void sendSetEntityLink(const PlayerPtr& player, i32 attachedEntityId,
+                              i32 holdingEntityId) {
+    net::Buffer buf;
+    buf.writeI32(attachedEntityId);
+    buf.writeI32(holdingEntityId);
+    detail::dispatch(player, cb::SetEntityLink, buf);
+}
+
+// ============================================================
 // PACKETS_V21: метаданные сущностей, таб-лист, атрибуты, биомы чанка.
 // Форматы сверены с protocol.json из minecraft-data 1.21.1 (version 767).
 // ============================================================
@@ -1443,6 +1598,7 @@ inline constexpr u8 TicksFrozen        = 7;  // Entity
 inline constexpr u8 LivingHandStates   = 8;  // LivingEntity
 inline constexpr u8 ItemStack          = 8;  // ItemEntity / ThrowableItemProjectile
 inline constexpr u8 BoatVariant        = 11; // Boat
+inline constexpr u8 PlayerAbsorption   = 15; // Player: yellow absorption hearts
 inline constexpr u8 DisplayedSkinParts = 17; // Player
 
 // DATA_SHARED_FLAGS (индекс 0)
@@ -1481,6 +1637,13 @@ public:
         buf_.writeByte(index);
         buf_.writeVarInt(1);
         buf_.writeVarInt(value);
+        return *this;
+    }
+
+    EntityMetadata& floatField(u8 index, f32 value) {
+        buf_.writeByte(index);
+        buf_.writeVarInt(3); // EntityDataSerializers.FLOAT
+        buf_.writeF32(value);
         return *this;
     }
 
@@ -1540,6 +1703,10 @@ inline std::vector<u8> buildEntityHandStates(i32 entityId, bool handActive, bool
         ? static_cast<u8>(meta::HandActive | (offhand ? meta::HandOffhand : 0))
         : static_cast<u8>(0);
     return EntityMetadata(entityId).byteField(meta::LivingHandStates, state).build();
+}
+
+inline std::vector<u8> buildPlayerAbsorption(i32 entityId, f32 amount) {
+    return EntityMetadata(entityId).floatField(meta::PlayerAbsorption, amount).build();
 }
 
 inline std::vector<u8> buildEntityItemStack(i32 entityId, i32 itemId, i32 count) {
@@ -1671,6 +1838,100 @@ inline void sendChunkBiomes(const PlayerPtr& player, const std::vector<ChunkBiom
     auto conn = player->getConnection();
     if (!conn) return;
     conn->sendPacket(cb::ChunkBiomes, buildChunkBiomes(chunks));
+}
+
+
+// PACKETS_V23: send-wrappers for payload builders and large packets assembled by world/game code.
+// This keeps every one of the 124 clientbound Play IDs reachable through the packet layer.
+inline void sendEncoded(const PlayerPtr& player, i32 packetId, std::span<const u8> payload,
+                        bool droppable = false) {
+    if (!player) return;
+    auto conn = player->getConnection();
+    if (!conn) return;
+    conn->sendPacket(packetId, std::vector<u8>(payload.begin(), payload.end()), droppable);
+}
+inline void sendChunkDataAndLight(const PlayerPtr& player, std::span<const u8> payload) {
+    sendEncoded(player, cb::ChunkDataAndLight, payload);
+}
+inline void sendDamageEvent(const PlayerPtr& player, i32 entityId, i32 damageTypeId) {
+    const auto payload = buildDamageEvent(entityId, damageTypeId);
+    sendEncoded(player, cb::DamageEvent, payload);
+}
+inline void sendLevelEvent(const PlayerPtr& player, i32 event, const BlockPos& pos,
+                           i32 data, bool global = false) {
+    const auto payload = buildLevelEvent(event, pos, data, global);
+    sendEncoded(player, cb::LevelEvent, payload);
+}
+inline void sendLevelParticles(const PlayerPtr& player, i32 particleId,
+                               f64 x, f64 y, f64 z, f32 offsetX, f32 offsetY, f32 offsetZ,
+                               f32 speed, i32 count, bool longDistance = false) {
+    const auto payload = buildLevelParticlesPacket(particleId, x, y, z, offsetX, offsetY,
+                                                   offsetZ, speed, count, longDistance);
+    sendEncoded(player, cb::LevelParticles, payload, true);
+}
+inline void sendLoginPayload(const PlayerPtr& player, std::span<const u8> payload) {
+    sendEncoded(player, cb::Login, payload);
+}
+inline void sendMoveEntityPos(const PlayerPtr& player, i32 entityId,
+                              i16 dx, i16 dy, i16 dz, bool onGround) {
+    const auto payload = buildMoveEntityPos(entityId, dx, dy, dz, onGround);
+    sendEncoded(player, cb::MoveEntityPos, payload, true);
+}
+inline void sendPlayerInfoRemove(const PlayerPtr& player, const std::vector<UUID>& uuids) {
+    const auto payload = buildPlayerInfoRemove(uuids);
+    sendEncoded(player, cb::PlayerInfoRemove, payload);
+}
+inline void sendPlayerInfoUpdatePayload(const PlayerPtr& player, std::span<const u8> payload) {
+    sendEncoded(player, cb::PlayerInfoUpdate, payload);
+}
+inline void sendSectionBlocksUpdate(const PlayerPtr& player, i32 sectionX, i32 sectionY,
+                                    i32 sectionZ, const std::vector<std::pair<u16, i32>>& blocks) {
+    const auto payload = buildSectionBlocksUpdate(sectionX, sectionY, sectionZ, blocks);
+    sendEncoded(player, cb::SectionBlocksUpdate, payload);
+}
+inline void sendEntityMetadataPayload(const PlayerPtr& player, std::span<const u8> payload,
+                                      bool droppable = true) {
+    sendEncoded(player, cb::SetEntityMetadata, payload, droppable);
+}
+inline void sendEquipmentPayload(const PlayerPtr& player, std::span<const u8> payload) {
+    sendEncoded(player, cb::SetEquipment, payload);
+}
+inline void sendPassengers(const PlayerPtr& player, i32 vehicleId, i32 passengerId) {
+    const auto payload = buildSetPassengers(vehicleId, passengerId);
+    sendEncoded(player, cb::SetPassengers, payload);
+}
+inline void sendSoundEffect(const PlayerPtr& player, std::string_view soundName, i32 category,
+                            f64 x, f64 y, f64 z, f32 volume, f32 pitch, i64 seed) {
+    const auto payload = buildSoundEffect(soundName, category, x, y, z, volume, pitch, seed);
+    sendEncoded(player, cb::SoundEffect, payload, true);
+}
+inline void sendSpawnEntity(const PlayerPtr& player, i32 entityId, const UUID& uuid, i32 typeId,
+                            f64 x, f64 y, f64 z, Angle pitch, Angle yaw, Angle headYaw,
+                            i32 data = 0, i16 velX = 0, i16 velY = 0, i16 velZ = 0) {
+    const auto payload = buildSpawnEntity(entityId, uuid, typeId, x, y, z, pitch, yaw, headYaw,
+                                          data, velX, velY, velZ);
+    sendEncoded(player, cb::SpawnEntity, payload);
+}
+inline void sendSpawnExperienceOrb(const PlayerPtr& player, i32 entityId,
+                                   f64 x, f64 y, f64 z, i16 count) {
+    const auto payload = buildSpawnExperienceOrb(entityId, x, y, z, count);
+    sendEncoded(player, cb::SpawnExperienceOrb, payload);
+}
+inline void sendTakeItemEntity(const PlayerPtr& player, i32 collectedId,
+                               i32 collectorId, i32 count) {
+    const auto payload = buildTakeItemEntity(collectedId, collectorId, count);
+    sendEncoded(player, cb::TakeItemEntity, payload);
+}
+inline void sendTeleportEntity(const PlayerPtr& player, i32 entityId,
+                               f64 x, f64 y, f64 z, u8 yaw, u8 pitch, bool onGround,
+                               bool droppable = true) {
+    const auto payload = buildTeleportEntity(entityId, x, y, z, yaw, pitch, onGround);
+    sendEncoded(player, cb::TeleportEntity, payload, droppable);
+}
+inline void sendUpdateAttributes(const PlayerPtr& player, i32 entityId,
+                                 const std::vector<AttributeValue>& values) {
+    const auto payload = buildUpdateAttributes(entityId, values);
+    sendEncoded(player, cb::UpdateAttributes, payload);
 }
 
 } // namespace nc::packets

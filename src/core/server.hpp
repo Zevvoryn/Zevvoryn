@@ -99,7 +99,10 @@ private:
     void scheduleFallingBlockUpdate(i32 x, i32 y, i32 z, i32 delay = 2); // FALLING_V1
     void tickFallingBlocks(); // FALLING_V1: sand/gravel/concrete powder/anvils
     void solidifyConcretePowderAround(i32 x, i32 y, i32 z); // CONCRETE_V2: water neighbour update
-    void scheduleFallingColumnCascade(i32 x, i32 y, i32 z, i32 firstDelay = 2); // FALLING_CHAIN_V3
+    // FALLING_CHAIN_V3; UNDOLAG_V1: maxScan ограничивает глубину прохода по колонке.
+    // -1 = до потолка мира, как было (для одиночных событий это один проход и норм).
+    // Массовые правки MiniEdit передают конечное значение: там колонок тысячи.
+    void scheduleFallingColumnCascade(i32 x, i32 y, i32 z, i32 firstDelay = 2, i32 maxScan = -1);
     void spawnPrimedTnt(f64 x, f64 y, f64 z, i32 ownerEid = 0, i32 fuse = 80, f64 launchImpulse = 0.0); // TNT_V1
     bool primeTntBlock(i32 x, i32 y, i32 z, i32 ownerEid = 0, i32 fuse = 80); // TNT_V1
     void tickPrimedTnt(); // TNT_V1
@@ -121,7 +124,10 @@ private:
     void tickMobs();
     void spawnMobWave();
     void spawnTraderCaravan();   // LLAMA_CARAVAN_V1: странствующий торговец с ламами на привязи
-    void spawnMobAt(i32 typeIdx, f64 x, f64 y, f64 z, i32 dim, i32 count, bool asBaby = false); // MOBS_ALL_V1 (SPLIT_V1: asBaby для мелких копий слизней/магма-кубов)
+    // MOBS_ALL_V1; SLIMESIZE_V1: slimeSize задаёт размер слизнеподобного моба (1/2/4),
+    // 0 = выбрать случайно как в ванилле. Для остальных мобов параметр игнорируется.
+    void spawnMobAt(i32 typeIdx, f64 x, f64 y, f64 z, i32 dim, i32 count,
+                    bool asBaby = false, i32 slimeSize = 0);
     // MOBS_AI_V1: снаряды мобов — стрелы скелетов, фаерболы гаста/блейза, снежки голема
     void spawnMobProjectile(i32 typeId, i32 dim, i32 ownerEid, f64 x, f64 y, f64 z,
                             f64 vx, f64 vy, f64 vz, f32 damage, bool gravity, bool explosive,
@@ -263,8 +269,10 @@ private:
     void extinguishPortalNear(i32 dim, i32 bx, i32 by, i32 bz, i32 brokenState); // PORTALBREAK_V1
     void broadcastBlockIn(i32 dim, i32 x, i32 y, i32 z, i32 state); // PORTAL_V1: ставит блок в СВОЁМ измерении
     void broadcastBlockSound(const char* name, i32 bx, i32 by, i32 bz, f32 volume, f32 pitch); // CHEST_V2: звук (Sound Effect 0x68)
+    void setBarrelOpen(i32 bx, i32 by, i32 bz, bool open); // CONTAINER_V4
     void handleChestWindowClosed(const std::shared_ptr<entity::Player>& player); // CHEST_V2: игрок закрыл окно сундука
-    void broadcastHandState(const std::shared_ptr<entity::Player>& player); // SHIELD_V1: метаданные руки (щит активен)
+    void broadcastHandState(const std::shared_ptr<entity::Player>& player); // SHIELD/FOOD: active hand metadata
+    void broadcastAbsorption(const std::shared_ptr<entity::Player>& player); // EFFECTS_V3: yellow hearts
 
     net::Server network_;
     protocol::v1_21_1::Codec_1_21_1 codec_;

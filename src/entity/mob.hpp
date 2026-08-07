@@ -252,6 +252,7 @@ struct Mob {
     bool dead = false;
     i32 deathTimer = 0;         // тики анимации смерти (ванильные 20)
     i32 hurtCooldown = 0;       // invulnerableTime, 10 тиков
+    f32 lastDamageTaken = 0.0f; // MOB_COMBAT_V1: stronger hit inside i-frames applies only the difference
     i32 wool = 0;
     bool sheared = false;
     i32 eggTimer = 0;
@@ -305,9 +306,46 @@ struct Mob {
     i32 restockTimer = 0;
     f64 lastSentX = 0, lastSentY = 0, lastSentZ = 0;
     f32 lastSentYaw = 0;
+    // DESPAWN_V1: ванильный PersistenceRequired — моб, помеченный так, не деспавнится
+    // никогда (приручённый, именованный, восстановленный из сейва с этим тегом).
+    bool persistent = false;
+    // DESPAWN_V1: Mob.noActionTime — сколько тиков моб «никому не нужен». Ванилла по нему
+    // постепенно прореживает монстров дальше 32 блоков, а не только на границе 128.
+    i32 noActionTime = 0;
+    // SLIMESIZE_V1: размер слизнеподобного моба (слайм, магма-куб): 1, 2 или 4.
+    // 0 = моб не слизнеподобный. Клиент рисует размер из метаданных index 16, а раньше
+    // они вообще не отправлялись — поэтому все слаймы выглядели мелкими независимо от HP.
+    i32 slimeSize = 0;
 
     const MobInfo& def() const { return mobDef(typeIdx); }
+    // SLIMESIZE_V1: масштаб от размера. Проверка через поле, а не strcmp по имени —
+    // boxWidth() зовётся из физики на каждый шаг каждого моба.
+    bool sized() const { return slimeSize > 0; }
+    i32  sizeScale() const { return slimeSize > 0 ? slimeSize : 1; }
+    f32  boxWidth()  const { return def().width  * static_cast<f32>(sizeScale()); }
+    f32  boxHeight() const { return def().height * static_cast<f32>(sizeScale()); }
+    // SLIMEDMG_V1: в ванилле Slime.isDealsDamage() = !isTiny(), а isTiny() это размер <= 1.
+    // То есть МЕЛКИЙ слайм не наносит урона вовсе — он только прыгает на игрока.
+    // Раньше здесь возвращался сам размер, поэтому мелкие били на одно сердце.
+    f32  attackDamage() const {
+        if (!sized()) return def().damage;
+        return sizeScale() <= 1 ? 0.0f : static_cast<f32>(sizeScale());
+    }
+    // Slime.setSize(): здоровье = размер в квадрате, то есть 1 / 4 / 16.
+    i32  maxHealthFor() const {
+        return sized() ? sizeScale() * sizeScale() : static_cast<i32>(def().maxHealth + 0.5f);
+    }
     bool isKind(const char* name) const { return std::strcmp(def().name, name) == 0; }
+    // DESPAWN_V1: ванильный Mob.removeWhenFarAway(). Animal переопределяет его в false,
+    // поэтому скот, лошади и бродячий торговец (MC_CREATURE) не деспавнятся НИКОГДА;
+    // житель и големы (MC_MISC) тоже. Деспавнятся только монстры, летучие мыши и рыбы.
+    // Раньше здесь не было различия вообще: одна строка удаляла ЛЮБОГО моба дальше
+    // 128 блоков, и мир пустел после каждой прогулки.
+    bool despawns() const {
+        if (persistent || tamed) return false;
+        const gen::MobCat c = static_cast<gen::MobCat>(def().cat);
+        return c == gen::MC_MONSTER || c == gen::MC_AMBIENT || c == gen::MC_WATER;
+    }
     bool hostile() const { return def().behavior == gen::MB_HOSTILE; }
     bool neutral() const { return def().behavior == gen::MB_NEUTRAL; }
     bool aquatic() const { return def().aquatic; }
@@ -325,9 +363,11 @@ struct MobPhysicsEnv {
 };
 
 inline bool mobBlocked(const MobPhysicsEnv& env, const Mob& m, f64 nx, f64 nz) {
-    const f32 half = m.def().width * 0.5f;
+    // SLIMESIZE_V1: большой слайм должен и упираться как большой, иначе размер 4
+    // пролезал бы в однобл��чную щель.
+    const f32 half = m.boxWidth() * 0.5f;
     const i32 y0 = (i32)std::floor(m.y);
-    const i32 y1 = (i32)std::floor(m.y + m.def().height - 0.1);
+    const i32 y1 = (i32)std::floor(m.y + m.boxHeight() - 0.1);
     for (i32 y = y0; y <= y1; ++y)
         for (f64 ox : { -(f64)half, (f64)half })
             for (f64 oz : { -(f64)half, (f64)half })

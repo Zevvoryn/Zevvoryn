@@ -1,12 +1,41 @@
 # Zevvoryn — What's New (English summary)
 
-> **Status: 0.1.0 — Proof of Concept.** This is an early, actively-changing
-> build. A lot of systems below are implemented and playable, but this is
-> **not** a finished, polished server. Expect bugs, rough edges, and some
-> features that only half-work or don't work at all yet. None of this has
-> been tested on a live running server in the dev environment — most of it
-> was only checked with static syntax/bracket-balance checks, not by
-> actually playing on a running world, so real-world behavior may differ.
+> **Status: 0.2.0 — Alpha (proof of concept).** This is an early, actively-changing
+> and **unstable** build. Some of the systems below are implemented and playable,
+> but this is **not** a finished, polished server. Expect bugs, rough edges, and
+> features that only half-work or don't work at all yet. Almost none of this has
+> been tested on a live running server under load — most of it was only checked
+> with static syntax/bracket-balance checks, not by actually playing on a running
+> world, so real-world behavior may differ. Back up your world.
+
+## 0.2.0 — Mining, durability, armor & inventory
+
+**Block hardness & mining time** — vanilla 1.21.1 hardness and material tables
+(generated into `mining_data.gen.hpp`); dig time is computed from the block and
+the tool in hand, matching vanilla break-speed math. A `/digdebug` command prints
+the per-block calculation.
+
+**Tool speed** — correct "best tool" detection, tool speed multipliers, and the
+resulting tick count for every block, driven by the generated tables.
+
+**Item durability** — tools, armor, shield, elytra and bow now take damage and
+wear out: when mining, when attacking, when blocking with a shield, and when
+armor absorbs incoming damage. Damage values follow vanilla 1.21.1.
+
+**Inventory fixes** — real vanilla stack limits, armor-slot gating (you can no
+longer drop boots onto the helmet slot — each armor piece only fits its own
+slot), and proper reset of the held cursor / drag state on inventory changes.
+
+**Armor & equipping** — vanilla damage absorption using armor + toughness,
+equipping armor in both survival and creative, and equipment changes are now
+broadcast to other players so they see what you're wearing/holding.
+
+**Mob combat** — attacking mobs applies damage with the correct cooldown and
+wears down the weapon, the victim's shield, and the victim's armor.
+
+---
+
+## 0.1.0 — Physics & server tooling (proof of concept)
 
 ## What has been added (gameplay physics)
 

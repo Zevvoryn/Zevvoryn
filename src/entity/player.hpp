@@ -5,6 +5,7 @@
 #include "../world/chunk.hpp"
 #include <string>
 #include <memory>
+#include <vector>        // INVENTORY_V4: effects + mode 5 drag slot list
 #include <unordered_set> // LIGHT_V1
 #include <mutex>         // CHUNKVIS_V1
 
@@ -118,6 +119,7 @@ public:
     static constexpr int INV_SIZE = 46;
     i32 invItemId[INV_SIZE] = {};
     i32 invCount[INV_SIZE] = {};
+    i32 invDamage[INV_SIZE] = {}; // DURABILITY_V1: minecraft:damage per slot
     std::string invCustomName[INV_SIZE]; // ALLPACKETS_V3: Edit Book / Rename Item persist a real per-slot custom name
     bool builderWandOwned = false; // MINIEDIT_V4: persists named wand across reconnects
     // ALLPACKETS_V3: real per-player recipe book UI state (Recipe Book Settings / Seen Recipe)
@@ -166,7 +168,18 @@ public:
 
     // COMBAT_V1: PvP — здоровье (20.0 = 10 сердец) и флаг смерти игрока.
     f32 health = 20.0f;
+    f32 absorptionAmount = 0.0f; // EFFECTS_V3: visible golden absorption hearts
     bool dead = false;
+    // FOOD_V1: vanilla hunger, saturation, exhaustion and natural regeneration.
+    i32 foodLevel = 20;
+    f32 foodSaturation = 5.0f;
+    f32 foodExhaustion = 0.0f;
+    i32 foodTickTimer = 0;
+    bool usingFood = false;
+    i32 usingFoodSlot = -1;
+    i32 usingFoodItem = 0;
+    i32 usingFoodTicks = 0;
+    i32 usingFoodHand = 0;
 
     // ENV_V1: урон окружением — заморозка в рыхлом снегу и урон лавой.
     i32 ticksFrozen = 0;       // 0..140; при 140 — урон морозом (ванильный TICKS_REQUIRED_TO_FREEZE)
@@ -187,6 +200,17 @@ public:
     // INVENTORY_CLICK_V1: предмет «в курсоре» при работе с окном инвентаря.
     i32 cursorItemId = 0;
     i32 cursorCount = 0;
+    // INVENTORY_V4: курсор — полноценный стак. Без этих полей любой перенос предмета
+    // через курсор обнулял minecraft:damage, то есть «ремонтировал» инструмент, и терял
+    // кастомное имя из Rename Item / Edit Book.
+    i32 cursorDamage = 0;
+    std::string cursorCustomName;
+    // INVENTORY_V4: состояние протягивания (mode 5). Клиент обрамляет протягивание
+    // кадрами со slot == -999 (button 0/4/8 — начало, 2/6/10 — конец) и между ними
+    // присылает закрашенные слоты. Раньше эти -999 кадры попадали в ветку «клик мимо
+    // окна» и сервер выбрасывал стак с курсора на землю.
+    i32 dragKind = -1;            // -1 = нет протягивания, 0 = ЛКМ (разделить), 1 = ПКМ (по одному), 2 = креатив
+    std::vector<i32> dragSlots;   // закрашенные слоты текущего протягивания
 
     // CHEST_V1: открытое окно контейнера (сундука) и личный эндер-сундук игрока.
     i32 openWindowId = 0;      // 0 = контейнер не открыт
@@ -195,6 +219,21 @@ public:
     i32 nextWindowId = 1;      // счётчик id окон (1..99)
     i32 openBlockState = 0;    // CHEST_V2: стейт блока открытого сундука (для анимации крышки)
     i64 lastAttackMs = 0;      // COMBAT_V2: время предыдущего удара (для кулдауна атаки)
+    bool digging = false;       // MINING_V1: server-authoritative destroy progress
+    i32 digX = 0, digY = 0, digZ = 0;
+    i32 digState = 0;
+    i32 digStartTick = 0;
+    i32 digExpectedTicks = 0;
+    i32 digSequence = 0;      // MINING_V3: acknowledge the original START sequence
+    bool digCorrectTool = true;
+    // MINING_V8: последняя отправленная зрителям стадия трещин (0..9), -1 = ничего не шлём.
+    // Без Set Block Destroy Stage клиент рисовал только свою предсказанную анимацию,
+    // и если сервер считал дольше, картинка «замирала», а потом блок внезапно ломался.
+    i32 digLastStage = -1;
+    // MINING_V6: /digdebug — печатает игроку расчёт времени добычи для блока,
+    // по которому он начал копать. Нужен, чтобы спорные случаи обсуждать
+    // по цифрам, а не по ощущениям. По умолчанию выключен, лог не спамит.
+    bool digDebug = false;
     bool usingShield = false;  // SHIELD_V1: щит поднят (активная фаза Use Item)
     i32 usingShieldHand = 0;   // SHIELD_V1: 0 = основная рука, 1 = оффхенд
     i64 shieldRaisedMs = 0;        // SHIELD_V2: когда щит поднят (ванильный прогрев 5 тиков)

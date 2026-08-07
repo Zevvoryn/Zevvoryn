@@ -1,7 +1,7 @@
 Zevvoryn Minecraft Server
-Copyright 2026 yicekot811 and Zevvoryn contributors
+Copyright 2026 xzz11222 and Zevvoryn contributors
 
-Licensed under the Zevvoryn Custom License (see LICENSE.txt in this
+Licensed under the Zevvoryn Custom License v1.0 (see LICENSE.txt in this
 folder).
 
 This product includes the "cubiomes" library

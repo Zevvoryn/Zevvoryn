@@ -34,6 +34,7 @@
 // That single call is enough — the plugin does not touch server.cpp at all.
 
 #include <string>
+#include <cctype>
 #include <vector>
 #include <functional>
 #include <unordered_map>
@@ -74,6 +75,7 @@ public:
     }
 
     void registerCommand(CommandDef def) {
+        for (char& c : def.name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         std::lock_guard<std::mutex> lk(mutex_);
         // CMDFULL_V1: registering the same name twice (soft reload, or a core
         // command that later gets a real handler) must not duplicate the node
@@ -85,8 +87,10 @@ public:
 
     // Returns nullptr if not registered.
     const CommandDef* find(const std::string& name) {
+        std::string normalized = name;
+        for (char& c : normalized) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         std::lock_guard<std::mutex> lk(mutex_);
-        auto it = commands_.find(name);
+        auto it = commands_.find(normalized);
         return it == commands_.end() ? nullptr : &it->second;
     }
 

@@ -297,6 +297,47 @@ void RegistryManager::registerStateVariants() {
     add("lantern", {{"hanging", kBool}, {"waterlogged", kBool}});
     add("soul_lantern", {{"hanging", kBool}, {"waterlogged", kBool}});
 
+    // CONTAINER_V4: контейнеры вообще не имели вариантов состояний, поэтому
+    // при экспорте в ванильный формат палитра писала имя без свойств
+    // (stateProperties() в anvil.cpp отдаёт только непустую карту), а при импорте
+    // такой блок восставал в состоянии по умолчанию. Отсюда баг: двойные
+    // сундуки после перезапуска теряли type=left/right и становились одиночками
+    // на 27 слотов, а печка теряла lit и facing.
+    // Смещение дефолта внутри диапазона сверено три раза по уже
+    // проверенным диапазонам в server.cpp: chest 2954..2977, trapped 9119..9142,
+    // ender 7513..7520 — везде дефолт стоит вторым (waterlogged=false).
+    // Бочка, раздатчик и выбрасыватель НЕ регистрируются: у них facing из шести
+    // значений, и порядок этих шести по таблице не восстанавливается однозначно
+    // (та же причина, по которой выше пропущены pointed_dripstone и black_candle).
+    auto addBased = [&](const std::string& shortName, i32 defaultOffset,
+                        const std::vector<Prop>& props) {
+        const i32 def = baseOf(shortName);
+        if (def < 0 || props.empty()) return;
+        const i32 base = def - defaultOffset;
+        if (base <= 0) return;
+        size_t total = 1;
+        for (const auto& p : props) total *= p.values.size();
+        for (size_t idx = 0; idx < total; ++idx) {
+            size_t rem = idx;
+            std::unordered_map<std::string, std::string> map;
+            for (size_t pi = props.size(); pi-- > 0;) {
+                const auto& p = props[pi];
+                map[p.name] = p.values[rem % p.values.size()];
+                rem /= p.values.size();
+            }
+            blockStates_.registerEntry({base + static_cast<i32>(idx), base,
+                "minecraft:" + shortName, map});
+        }
+    };
+    const Values kChestType = {"single", "left", "right"};
+    for (const char* chest : {"chest", "trapped_chest"})
+        addBased(chest, 1, {{"facing", kHorizontal}, {"type", kChestType}, {"waterlogged", kBool}});
+    addBased("ender_chest", 1, {{"facing", kHorizontal}, {"waterlogged", kBool}});
+    for (const char* furnace : {"furnace", "smoker", "blast_furnace"})
+        addBased(furnace, 1, {{"facing", kHorizontal}, {"lit", kBool}});
+    addBased("hopper", 0, {{"facing", Values{"down", "north", "south", "west", "east"}},
+                           {"enabled", kBool}});
+
     // CAKE_EAT_V1: cake right-click eating needs a registered bites 0..6 state so
     // registry-based lookups (blockRegistryIdForState etc.) resolve correctly.
     // Verified gap: cake=5874 to repeater=5884 is 10, which is >= vanilla's 7 bite

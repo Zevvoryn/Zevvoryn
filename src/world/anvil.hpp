@@ -63,10 +63,14 @@ struct PlayerExport {
     i32 selectedSlot = 0; // 0..8
     f32 health = 20.0f;
     i32 foodLevel = 20;
+    f32 foodSaturation = 5.0f;
+    f32 foodExhaustion = 0.0f;
+    i32 foodTickTimer = 0;
     i32 xpLevel = 0;
     i32 xpTotal = 0;
     std::array<i32, 46> itemId{};
     std::array<i32, 46> count{};
+    std::array<i32, 46> damage{};
     std::array<i32, 27> enderItemId{};
     std::array<i32, 27> enderCount{};
 };

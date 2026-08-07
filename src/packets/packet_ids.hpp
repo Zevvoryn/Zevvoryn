@@ -15,6 +15,66 @@
 namespace nc::packets {
 
 // ------------------------------------------------------------
+// Состояния до Play. Идентификаторы разделены по направлению и состоянию,
+// потому что одинаковые wire-id имеют разный смысл в разных фазах.
+// ------------------------------------------------------------
+namespace handshake::sb {
+inline constexpr i32 Intention = 0x00;
+}
+namespace status::sb {
+inline constexpr i32 Request = 0x00;
+inline constexpr i32 Ping    = 0x01;
+}
+namespace status::cb {
+inline constexpr i32 Response = 0x00;
+inline constexpr i32 Pong     = 0x01;
+}
+namespace login::sb {
+inline constexpr i32 Hello             = 0x00;
+inline constexpr i32 Key               = 0x01;
+inline constexpr i32 CustomQueryAnswer = 0x02;
+inline constexpr i32 Acknowledged      = 0x03;
+inline constexpr i32 CookieResponse    = 0x04;
+}
+namespace login::cb {
+inline constexpr i32 Disconnect  = 0x00;
+inline constexpr i32 Hello       = 0x01;
+inline constexpr i32 Success     = 0x02;
+inline constexpr i32 Compression = 0x03;
+inline constexpr i32 CustomQuery = 0x04;
+inline constexpr i32 CookieRequest = 0x05;
+}
+namespace config::sb {
+inline constexpr i32 ClientInformation    = 0x00;
+inline constexpr i32 CookieResponse       = 0x01;
+inline constexpr i32 CustomPayload        = 0x02;
+inline constexpr i32 FinishAcknowledged   = 0x03;
+inline constexpr i32 KeepAlive            = 0x04;
+inline constexpr i32 Pong                 = 0x05;
+inline constexpr i32 ResourcePackResponse = 0x06;
+inline constexpr i32 SelectKnownPacks     = 0x07;
+}
+namespace config::cb {
+inline constexpr i32 CookieRequest       = 0x00;
+inline constexpr i32 CustomPayload       = 0x01;
+inline constexpr i32 Disconnect          = 0x02;
+inline constexpr i32 Finish              = 0x03;
+inline constexpr i32 KeepAlive           = 0x04;
+inline constexpr i32 Ping                = 0x05;
+inline constexpr i32 ResetChat           = 0x06;
+inline constexpr i32 RegistryData        = 0x07;
+inline constexpr i32 ResourcePackPop     = 0x08;
+inline constexpr i32 ResourcePackPush    = 0x09;
+inline constexpr i32 StoreCookie         = 0x0A;
+inline constexpr i32 Transfer            = 0x0B;
+inline constexpr i32 FeatureFlags        = 0x0C;
+inline constexpr i32 UpdateTags          = 0x0D;
+inline constexpr i32 SelectKnownPacks    = 0x0E;
+inline constexpr i32 CustomReportDetails = 0x0F;
+inline constexpr i32 ServerLinks         = 0x10;
+}
+
+// ------------------------------------------------------------
 // Clientbound, состояние Play (сервер -> клиент)
 // ------------------------------------------------------------
 namespace cb {

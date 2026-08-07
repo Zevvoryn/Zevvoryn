@@ -24,6 +24,7 @@
 #include "../core/item_blocks.gen.hpp" // BLOCKMAP_V1
 #include "../core/items.gen.hpp"    // BLOCKENT_V1
 #include "worldextra.hpp"              // BLOCKENT_V1
+#include <chrono>                // SAVEPROF_V2: разбивка медленного сохранения
 #include "../entity/mob.hpp"           // BLOCKENT_V1
 #include "../core/log.hpp"
 #include "../core/crash_trace.hpp" // NC_CTRACE
@@ -151,7 +152,8 @@ public:
         return static_cast<bool>(f) || f.eof();
     }
 
-    bool getChunk(int localX, int localZ, std::vector<u8>& outUncompressed) const {
+    bool getChunk(int localX, int localZ, std::vector<u8>& outUncompressed,
+                  std::vector<u8>* outCompressedZlib = nullptr) const {
         int idx = localX + localZ * 32;
         size_t locOff = size_t(idx) * 4;
         if (locOff + 4 > data_.size()) return false;
@@ -170,6 +172,7 @@ public:
         constexpr size_t kMaxChunkBytes = 16 * 1024 * 1024;
         if (compressionType == 2) { // zlib
             if (dataLen < 2) return false;
+            if (outCompressedZlib) outCompressedZlib->assign(payload, payload + dataLen);
             outUncompressed.clear();
             return net::zlibc::inflate(payload + 2, dataLen - 2, outUncompressed, kMaxChunkBytes);
         }
@@ -644,9 +647,81 @@ static void readBlockEntities(const nbt::NbtValue& root, const ChunkColumn& chun
     }
 }
 
+// SAVEPROF_V3: biome::getBiomeName() идёт через cubiomes — это настоящая генерация биома,
+// и вызывалась она 4x4x4 на КАЖДУЮ секцию, то есть 1536 раз на чанк, включая секции без
+// блоков, плюс столько же аллокаций std::string. На 526 чанках это ~808 000 вызовов.
+// Именно они и съедали сохранение: в логе было «5691мс всего | zlib 46мс | диск 6мс»,
+// то есть 5.6 с вне сжатия и диска.
+// Биом для данного сида и клетки не меняется НИКОГДА, поэтому кешируем на чанк:
+// 1536 индексов по одному байту = 1.5 КБ на чанк (0.8 МБ на 526 чанков), а имена
+// интернируются — различных биомов в мире единицы.
+static std::mutex g_ncBiomeMutex;
+static std::vector<std::string> g_ncBiomeNamePool;
+static std::unordered_map<std::string, u8> g_ncBiomeNameIdx;
+static std::unordered_map<i64, std::vector<u8>> g_ncBiomeCells; // chunkKey -> 1536 индексов
+static i64 g_ncBiomeCacheSeed = 0;
+static bool g_ncBiomeCacheSeeded = false;
+
+// Возвращает 1536 индексов в пул имён, в том же порядке, в котором их читает
+// цикл секций ниже: s * 64 + cy * 16 + cz * 4 + cx.
+static const std::vector<u8>& ncBiomeCellsFor(i32 chunkX, i32 chunkZ, i64 seed) {
+    std::lock_guard<std::mutex> lk(g_ncBiomeMutex);
+    if (!g_ncBiomeCacheSeeded || g_ncBiomeCacheSeed != seed) {
+        // сид мира сменился — прежние клетки больше не действительны
+        g_ncBiomeCells.clear();
+        g_ncBiomeNamePool.clear();
+        g_ncBiomeNameIdx.clear();
+        g_ncBiomeCacheSeed = seed;
+        g_ncBiomeCacheSeeded = true;
+    }
+    const i64 key = chunkKeyOf(chunkX, chunkZ);
+    auto it = g_ncBiomeCells.find(key);
+    if (it != g_ncBiomeCells.end()) return it->second;
+
+    std::vector<u8> cells;
+    cells.reserve(static_cast<size_t>(SECTIONS_PER_CHUNK) * BIOMES_PER_SECTION);
+    const i32 chunkBlockX = chunkX * SECTION_WIDTH;
+    const i32 chunkBlockZ = chunkZ * SECTION_WIDTH;
+    for (i32 s = 0; s < SECTIONS_PER_CHUNK; ++s) {
+        const i32 sectionBlockY = (CHUNK_HEIGHT_MIN / SECTION_HEIGHT + s) * SECTION_HEIGHT;
+        for (i32 cy = 0; cy < 4; ++cy) {
+            for (i32 cz = 0; cz < 4; ++cz) {
+                for (i32 cx = 0; cx < 4; ++cx) {
+                    std::string name = biome::getBiomeName(seed, chunkBlockX + cx * 4,
+                                                           sectionBlockY + cy * 4,
+                                                           chunkBlockZ + cz * 4);
+                    auto ni = g_ncBiomeNameIdx.find(name);
+                    if (ni == g_ncBiomeNameIdx.end()) {
+                        // Пул байтовый: 255 разных биомов на мир с запасом хватает,
+                        // а если вдруг нет — валимся в plains, а не портим индексы.
+                        if (g_ncBiomeNamePool.size() >= 255) { cells.push_back(0); continue; }
+                        const auto idx = static_cast<u8>(g_ncBiomeNamePool.size());
+                        g_ncBiomeNamePool.push_back(name);
+                        ni = g_ncBiomeNameIdx.emplace(std::move(name), idx).first;
+                    }
+                    cells.push_back(ni->second);
+                }
+            }
+        }
+    }
+    if (g_ncBiomeNamePool.empty()) g_ncBiomeNamePool.push_back("minecraft:plains");
+    return g_ncBiomeCells.emplace(key, std::move(cells)).first->second;
+}
+
+// Имя биома по индексу пула. Зовётся только при записи палитры секции, то есть
+// единицы раз на секцию, а не на каждую клетку.
+static std::string ncBiomeNameByIndex(u8 poolIdx) {
+    std::lock_guard<std::mutex> lk(g_ncBiomeMutex);
+    if (g_ncBiomeNamePool.empty()) return "minecraft:plains";
+    return poolIdx < g_ncBiomeNamePool.size() ? g_ncBiomeNamePool[poolIdx]
+                                             : g_ncBiomeNamePool[0];
+}
+
 static std::vector<u8> buildChunkNbt(const ChunkColumn& chunk, i64 seed,
                                      const ChunkExtras* chunkExtras) {
     nbt::TagWriter w;
+    // SAVEPROF_V3: биомы чанка берём из кеша один раз, а не пересчитываем на каждую секцию.
+    const std::vector<u8>& biomeCells = ncBiomeCellsFor(chunk.getX(), chunk.getZ(), seed);
     w.beginRootCompoundNamed("");
     w.writeInt(DATA_VERSION_1_21_1, "DataVersion");
     w.writeInt(chunk.getX(), "xPos");
@@ -724,38 +799,42 @@ static std::vector<u8> buildChunkNbt(const ChunkColumn& chunk, i64 seed,
 
         // BIOMEGEN_V1: real vanilla biomes per 4x4x4 cell, matching the world
         // seed bit-for-bit via cubiomes (see world/biomegen.hpp).
-        i32 chunkBlockX = chunk.getX() * SECTION_WIDTH;
-        i32 chunkBlockZ = chunk.getZ() * SECTION_WIDTH;
-        i32 sectionBlockY = sectionY * SECTION_HEIGHT;
-        std::vector<std::string> biomePalette;
-        std::unordered_map<std::string, i32> biomeToPaletteIdx;
+        // SAVEPROF_V3: chunkBlockX/Z и sectionBlockY больше не нужны — координаты клеток
+        // считаются один раз при заполнении кеша биомов, см. ncBiomeCellsFor().
+        // SAVEPROF_V3: палитра собирается по индексам пула, а не по строкам. Раньше на
+        // каждую из 64 клеток секции создавалась std::string («minecraft:plains» — 16
+        // символов, в SSO не влезает), то есть 1536 аллокаций на чанк и 800 000 на
+        // сохранение. Различных биомов в секции единицы, поэтому линейный поиск здесь
+        // быстрее хеш-таблицы, а строки материализуются только для самой палитры.
+        std::vector<u8> biomePalette;
         std::vector<i32> biomeIndices;
         biomeIndices.reserve(BIOMES_PER_SECTION);
         for (i32 cy = 0; cy < 4; ++cy) {
             for (i32 cz = 0; cz < 4; ++cz) {
                 for (i32 cx = 0; cx < 4; ++cx) {
-                    i32 bx = chunkBlockX + cx * 4;
-                    i32 by = sectionBlockY + cy * 4;
-                    i32 bz = chunkBlockZ + cz * 4;
-                    std::string name = biome::getBiomeName(seed, bx, by, bz);
-                    auto bit = biomeToPaletteIdx.find(name);
-                    i32 bIdx;
-                    if (bit == biomeToPaletteIdx.end()) {
+                    // SAVEPROF_V3: было biome::getBiomeName(seed, bx, by, bz) прямо здесь —
+                    // вызов cubiomes на каждую клетку каждой секции.
+                    const size_t flat = static_cast<size_t>(s) * BIOMES_PER_SECTION
+                                      + static_cast<size_t>(cy) * 16
+                                      + static_cast<size_t>(cz) * 4 + static_cast<size_t>(cx);
+                    const u8 poolIdx = flat < biomeCells.size() ? biomeCells[flat] : 0;
+                    i32 bIdx = -1;
+                    for (size_t q = 0; q < biomePalette.size(); ++q)
+                        if (biomePalette[q] == poolIdx) { bIdx = static_cast<i32>(q); break; }
+                    if (bIdx < 0) {
                         bIdx = static_cast<i32>(biomePalette.size());
-                        biomePalette.push_back(name);
-                        biomeToPaletteIdx.emplace(name, bIdx);
-                    } else {
-                        bIdx = bit->second;
+                        biomePalette.push_back(poolIdx);
                     }
                     biomeIndices.push_back(bIdx);
                 }
             }
         }
-        if (biomePalette.empty()) biomePalette.push_back("minecraft:plains");
+        if (biomePalette.empty()) biomePalette.push_back(0);
 
         w.beginCompound("biomes");
         w.beginList("palette", nbt::TagType::String, static_cast<i32>(biomePalette.size()));
-        for (const auto& name : biomePalette) w.writeListElementString(name);
+        // Строки нужны только здесь — обычно одна-две на секцию.
+        for (const u8 poolIdx : biomePalette) w.writeListElementString(ncBiomeNameByIndex(poolIdx));
         w.endList();
         if (biomePalette.size() > 1) {
             int bbits = bitsForPalette(biomePalette.size(), 1);
@@ -864,9 +943,9 @@ static void writePlayerTag(nbt::TagWriter& w, const PlayerExport& p) {
     w.writeInt(p.gameMode, "previousPlayerGameType");
     w.writeFloat(p.health, "Health");
     w.writeInt(p.foodLevel, "foodLevel");
-    w.writeFloat(5.0f, "foodSaturationLevel");
-    w.writeFloat(0.0f, "foodExhaustionLevel");
-    w.writeInt(0, "foodTickTimer");
+    w.writeFloat(p.foodSaturation, "foodSaturationLevel");
+    w.writeFloat(p.foodExhaustion, "foodExhaustionLevel");
+    w.writeInt(p.foodTickTimer, "foodTickTimer");
     w.writeInt(p.xpLevel, "XpLevel");
     w.writeFloat(0.0f, "XpP");
     w.writeInt(p.xpTotal, "XpTotal");
@@ -917,6 +996,12 @@ static void writePlayerTag(nbt::TagWriter& w, const PlayerExport& p) {
         w.writeByte(static_cast<i32>(static_cast<i8>(vslot)), "Slot"); // -106 пишется байтом
         w.writeString(itemIdName(id), "id");
         w.writeInt(n, "count");
+        const i32 damage = p.damage[static_cast<size_t>(s)];
+        if (damage > 0) {
+            w.beginCompound("components");
+            w.writeInt(damage, "minecraft:damage");
+            w.endCompound();
+        }
         w.endListElementCompound();
     }
     w.endList();
@@ -1097,6 +1182,13 @@ static bool writeRegionsTo(const World& world, const std::string& regionDir, i64
     u32 timestamp = 0; // vanilla just uses this for informational purposes
     // SAVEFAST_V1: инкрементальная запись — жмём и пишем только то, что реально поменялось
     size_t reusedChunks = 0, rebuiltChunks = 0, skippedRegions = 0, writtenRegions = 0;
+    // SAVEPROF_V2: раньше эти счётчики уходили только в NC_CTRACE, то есть в трассу краша,
+    // и в обычном логе их не было видно — понять, ПОЧЕМУ сохранение долгое, было нечем.
+    // Теперь ещё и замеряем, куда именно ушло время: в zlib или в запись файлов.
+    using SaveClock = std::chrono::steady_clock;
+    const auto saveT0 = SaveClock::now();
+    double msCompress = 0.0, msDisk = 0.0, msBuildNbt = 0.0, msHash = 0.0;
+    size_t compressedBytes = 0, nbtBuilt = 0;
     std::lock_guard<std::mutex> saveCacheLk(g_ncSaveCacheMutex);
     auto& blobCache = g_ncSaveBlobs[regionDir];
     auto& regionSigs = g_ncSaveRegionSig[regionDir];
@@ -1124,10 +1216,21 @@ static bool writeRegionsTo(const World& world, const std::string& regionDir, i64
             if (!slot.zlib.empty() && slot.sig != 0 && be == nullptr && !chunkPtr->isDirty()) {
                 ++reusedChunks;
             } else {
+                // SAVEPROF_V3: в прошлой версии таймером была обёрнута ТОЛЬКО zlib-компрессия,
+                // поэтому лог показал «5691мс всего | zlib 46мс | диск 6мс» и 5.6 с висели
+                // без объяснения. Сборка NBT и хеш — вот они, теперь измеряются.
+                const auto tn0 = SaveClock::now();
                 auto chunkNbt = buildChunkNbt(*chunkPtr, seed, be);
+                msBuildNbt += std::chrono::duration<double, std::milli>(SaveClock::now() - tn0).count();
+                const auto th0 = SaveClock::now();
                 const u64 sig = ncSaveHash(chunkNbt);
+                msHash += std::chrono::duration<double, std::milli>(SaveClock::now() - th0).count();
+                ++nbtBuilt;
                 if (slot.zlib.empty() || slot.sig != sig) {
+                    const auto tc0 = SaveClock::now();
                     slot.zlib = net::zlibc::compress(std::span<const u8>(chunkNbt.data(), chunkNbt.size()));
+                    msCompress += std::chrono::duration<double, std::milli>(SaveClock::now() - tc0).count();
+                    compressedBytes += chunkNbt.size();
                     slot.sig = sig;
                     ++rebuiltChunks;
                 } else {
@@ -1149,7 +1252,9 @@ static bool writeRegionsTo(const World& world, const std::string& regionDir, i64
         }
         RegionWriter region;
         for (const auto& it : items) region.putChunk(it.lx, it.lz, *it.blob, /*compressionType=*/2, timestamp);
+        const auto td0 = SaveClock::now();
         if (!region.save(regionPath)) { if (errorOut) *errorOut = "failed writing " + regionPath; return false; }
+        msDisk += std::chrono::duration<double, std::milli>(SaveClock::now() - td0).count();
         regionSigs[key] = regionSig;
         ++writtenRegions;
     }
@@ -1161,6 +1266,19 @@ static bool writeRegionsTo(const World& world, const std::string& regionDir, i64
     }
     NC_CTRACE("Anvil: save cache -> reused %zu, compressed %zu, regions written %zu, skipped %zu",
               reusedChunks, rebuiltChunks, writtenRegions, skippedRegions);
+    // SAVEPROF_V2: при долгом сохранении пишем разбивку в ОБЫЧНЫЙ лог — иначе непонятно,
+    // что виновато: холодный кеш сжатия, много правленых чанков или медленный диск.
+    const double msTotal = std::chrono::duration<double, std::milli>(SaveClock::now() - saveT0).count();
+    if (msTotal >= 1000.0) {
+        NC_WARN("Anvil",
+                "Долгое сохранение {}: {:.0f}мс всего | чанков {} (без сборки NBT {}, собрано NBT {}, "
+                "из них пережато {}) | регионов записано {}, пропущено {} | "
+                "NBT {:.0f}мс, хеш {:.0f}мс, zlib {:.0f}мс на {:.1f} МБ, диск {:.0f}мс",
+                regionDir, msTotal, reusedChunks + rebuiltChunks,
+                (reusedChunks + rebuiltChunks) - nbtBuilt, nbtBuilt, rebuiltChunks,
+                writtenRegions, skippedRegions, msBuildNbt, msHash, msCompress,
+                static_cast<double>(compressedBytes) / (1024.0 * 1024.0), msDisk);
+    }
 
     if (chunksOut) *chunksOut = world.getAllChunks().size();
     if (regionsOut) *regionsOut = regionChunks.size();
@@ -1192,7 +1310,8 @@ static size_t readRegionsFrom(World& world, const std::string& regionDir,
         for (int lz = 0; lz < 32; ++lz) {
             for (int lx = 0; lx < 32; ++lx) {
                 std::vector<u8> chunkBytes;
-                if (!region.getChunk(lx, lz, chunkBytes)) continue;
+                std::vector<u8> compressedZlib; // SAVEFAST_V2: reuse bytes read from MCA
+                if (!region.getChunk(lx, lz, chunkBytes, &compressedZlib)) continue;
                 nbt::TagReader reader(chunkBytes.data(), chunkBytes.size());
                 std::string rootName;
                 nbt::NbtValue root;
@@ -1204,6 +1323,16 @@ static size_t readRegionsFrom(World& world, const std::string& regionDir,
                 if (!chunk) continue;
                 applyChunkNbt(root, *chunk);
                 if (extrasOut) readBlockEntities(root, *chunk, *extrasOut); // BLOCKENT_V1/BLOCKENT_V2
+                chunk->clearDirty(); // loaded state is already durable on disk
+                if (!compressedZlib.empty()) {
+                    // SAVEFAST_V2: first /save-all after startup no longer recompresses
+                    // every unchanged chunk. Cache the exact zlib payload already in MCA.
+                    const i64 ck = chunkKeyOf(cx, cz);
+                    std::lock_guard<std::mutex> lk(g_ncSaveCacheMutex);
+                    auto& slot = g_ncSaveBlobs[regionDir][ck];
+                    slot.sig = ncSaveHash(chunkBytes);
+                    slot.zlib = std::move(compressedZlib);
+                }
                 ++importedChunks;
             }
         }
@@ -1285,8 +1414,12 @@ static void writeMobEntity(nbt::TagWriter& w, const extra::MobRecord& m) {
     w.writeShort(300, "Air");
     w.writeByte(1, "OnGround");
     w.writeByte(0, "Invulnerable");
-    w.writeByte(0, "PersistenceRequired");
+    w.writeByte(m.persistent ? 1 : 0, "PersistenceRequired"); // DESPAWN_V1: было всегда 0
     if (m.baby) w.writeByte(1, "IsBaby");
+    // SLIMESIZE_V2: ванильный Slime.addAdditionalSaveData пишет РАЗМЕР МИНУС ОДИН,
+    // а readAdditionalSaveData делает setSize(getInt("Size") + 1). Иначе экспорт в
+    // ванильный мир превратил бы размер 1 в размер 2.
+    if (m.slimeSize > 0) w.writeInt(m.slimeSize - 1, "Size");
     if (m.sheared) w.writeByte(1, "Sheared");
     if (m.wool > 0) w.writeByte(static_cast<u8>(m.wool), "Color");
     if (m.sitting) w.writeByte(1, "Sitting");
@@ -1480,6 +1613,10 @@ static size_t readEntityRegions(const std::string& entitiesDir, i32 dim, extra::
                     const nbt::NbtValue* hp = e.get("Health");
                     m.health = hp ? static_cast<i32>(hp->asDouble + 0.5) : 0;
                     m.baby = e.getByte("IsBaby") != 0;
+                    m.persistent = e.getByte("PersistenceRequired") != 0; // DESPAWN_V1
+                    // SLIMESIZE_V2: тег есть только у слизнеподобных; +1 — обратная
+                    // операция к ванильному «размер минус один».
+                    if (e.get("Size")) m.slimeSize = e.getInt("Size") + 1;
                     m.sheared = e.getByte("Sheared") != 0;
                     m.sitting = e.getByte("Sitting") != 0;
                     m.wool = static_cast<i32>(e.getByte("Color"));

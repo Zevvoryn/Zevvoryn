@@ -1,6 +1,7 @@
 #include "player.hpp"
 #include <span>
 #include "../protocol/codec_1_21_1/packet_ids.hpp"
+#include "../packets/packet_ids.hpp"
 #include "../core/log.hpp"
 
 namespace nc::entity {
@@ -20,7 +21,7 @@ void Player::sendSystemMessage(std::string_view message) {
     buf.writeU16(static_cast<u16>(msg.size()));
     buf.writeBytes(std::span<const u8>(reinterpret_cast<const u8*>(msg.data()), msg.size()));
     buf.writeBool(false); // overlay: false = chat, true = actionbar
-    connection_->sendPacket(0x6C, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+    connection_->sendPacket(packets::cb::SystemChat, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
 }
 
 void Player::kick(std::string_view reason) {
@@ -34,7 +35,7 @@ void Player::kick(std::string_view reason) {
     std::string msg(reason);
     buf.writeU16(static_cast<u16>(msg.size()));
     buf.writeBytes(std::span<const u8>(reinterpret_cast<const u8*>(msg.data()), msg.size()));
-    connection_->sendPacket(0x1D, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
+    connection_->sendPacket(packets::cb::Disconnect, std::vector<u8>(buf.writtenSpan().begin(), buf.writtenSpan().end()));
     // KICKFIX_V2: close() рвал сокет раньше, чем writer успевал отправить Disconnect,
     // и клиент видел «Connection reset» вместо причины кика.
     connection_->closeAfterFlush();
