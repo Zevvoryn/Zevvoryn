@@ -2,8 +2,10 @@
 
 # Zevvoryn
 
-**Сервер Minecraft: Java Edition 1.21.1 на чистом C++20.**
-Без JVM. Без JNI. Без обёрток.
+**A Minecraft: Java Edition 1.21.1 server in pure C++20.**
+No JVM. No JNI. No wrappers.
+
+[Русский](README.ru.md) · **English**
 
 ![version](https://img.shields.io/badge/version-0.2.0--alpha-orange)
 ![status](https://img.shields.io/badge/status-alpha%20%C2%B7%20unstable-red)
@@ -16,112 +18,116 @@
 
 ---
 
-> ## ⚠️ Это ранняя альфа
+> ## ⚠️ This is an early alpha
 >
-> Zevvoryn находится на стадии **альфа-версии** и **очень нестабилен**. Это
-> proof-of-concept: часть систем работает и в них можно играть, но многого
-> ещё нет, что-то работает наполовину, а что-то — с багами. Считайте это
-> экспериментом, а не готовым сервером.
+> Zevvoryn is at an **alpha** stage and is **very unstable**. It's a
+> proof of concept: some systems work and are playable, but a lot is missing,
+> some things half-work, and some are buggy. Treat it as an experiment, not a
+> finished server.
 >
-> **Чего пока нет или что не работает как надо:** крафт и печки, редстоун и
-> механизмы, порталы и переходы между Незером/Энд (только заготовки),
-> зачарование и зельеварение, полноценный ИИ и разнообразие мобов, и ещё ряд
-> блоков/механик. Подробный список — в [`license/CHANGELOG_EN.md`](license/CHANGELOG_EN.md).
+> **Not there yet / not working properly:** crafting and furnaces, redstone and
+> mechanisms, portals and travel between the Nether/End (stubs only),
+> enchanting and brewing, full mob AI and mob variety, plus a number of other
+> blocks/mechanics. Full list is in [`license/CHANGELOG_EN.md`](license/CHANGELOG_EN.md).
 >
-> Ничего из этого не тестировалось на живом сервере под нагрузкой — многое
-> проверялось только статически (синтаксис/баланс скобок), а не реальной
-> игрой на запущенном мире. Поведение в бою может отличаться. Бэкапьте мир.
+> Almost none of this has been tested on a live server under load — most of it
+> was only checked statically (syntax / bracket balance), not by actually
+> playing on a running world, so real behavior may differ. Back up your world.
 
 ---
 
-## Что это
+## What it is
 
-Zevvoryn — самостоятельная реализация серверной части Minecraft: Java Edition 1.21.1 (протокол 767),
-написанная с нуля на C++20. Ванильный клиент подключается к нему напрямую, без модов и прокси.
+Zevvoryn is a from-scratch implementation of the Minecraft: Java Edition 1.21.1
+server (protocol 767), written in C++20. A vanilla client connects to it
+directly — no mods, no proxy.
 
-Цель проекта — скорость запуска и предсказуемое потребление ресурсов там, где официальный
-Java-сервер тратит секунды на старт JVM и сотни мегабайт на heap. Это учебный/исследовательский
-проект, а не замена официальному серверу.
+The goal is fast startup and predictable resource usage, where the official
+Java server spends seconds spinning up the JVM and hundreds of megabytes on the
+heap. This is a learning/research project, not a drop-in replacement for the
+official server.
 
 ```
-[17:01:10.482] [Server thread/INFO] Done! (за 0.05 сек.)
+[17:01:10.482] [Server thread/INFO] Done! (0.05s)
 ```
 
 ---
 
-## Что нового в 0.2.0
+## What's new in 0.2.0
 
-- **Прочность блоков и время добычи** — ванильные таблицы твёрдости и материалов
-  Minecraft 1.21.1; время копания считается с учётом инструмента и блока
-  (отладка — команда `/digdebug`).
-- **Скорость инструмента** — корректный подбор «правильного» инструмента,
-  множители скорости и число тиков на каждый блок.
-- **Долговечность предметов** — инструменты, броня, щит, элитра и лук теперь
-  изнашиваются: при добыче, атаке, блоке щитом и получении урона по броне.
-- **Фиксы инвентаря** — реальные ванильные лимиты стака, запрет класть предмет
-  не в свой слот брони (нельзя надеть ботинки на голову), корректный сброс
-  курсора и состояния перетаскивания.
-- **Броня и экипировка** — расчёт поглощения урона (защита + прочность/toughness),
-  надевание брони в выживании и творчестве, синхронизация экипировки другим игрокам.
-- **Бой с мобами** — урон, кулдаун атаки, износ оружия, щита и брони жертвы.
+- **Block hardness & mining time** — vanilla Minecraft 1.21.1 hardness and
+  material tables; dig time is computed from the block and the tool in hand
+  (debug it with the `/digdebug` command).
+- **Tool speed** — correct "best tool" detection, speed multipliers, and the
+  tick count per block.
+- **Item durability** — tools, armor, shields, elytra and bows now wear out:
+  when mining, attacking, blocking with a shield, and when armor absorbs damage.
+- **Inventory fixes** — real vanilla stack limits, armor-slot gating (you can't
+  put boots on your head anymore — each piece only fits its own slot), and
+  proper reset of the held cursor and drag state.
+- **Armor & equipping** — vanilla damage absorption (armor + toughness),
+  equipping armor in both survival and creative, and equipment changes are
+  broadcast to other players.
+- **Mob combat** — damage, attack cooldown, and wear on the weapon, the
+  victim's shield and the victim's armor.
 
-Полный список — в [`license/CHANGELOG_EN.md`](license/CHANGELOG_EN.md).
-
----
-
-## Возможности
-
-Легенда: ✅ работает · 🚧 частично / есть баги · ❌ ещё нет
-
-| Блок | Состояние |
-|------|-----------|
-| Протокол 1.21.1 (767), handshake, статус, игра | ✅ |
-| Онлайн/офлайн режим, шифрование, сжатие пакетов | ✅ |
-| Ванильная генерация мира (cubiomes), сид как в ваниле | ✅ |
-| Формат Anvil: чтение и запись региона/чанков | ✅ |
-| Физика блоков, жидкости, обновления по тикам | ✅ |
-| Инвентарь, предметы, режимы игры | ✅ |
-| Добыча: прочность блоков, скорость инструмента, износ | ✅ |
-| Броня, экипировка, бой с игроками/мобами | 🚧 |
-| Чат, системные сообщения, tab-list, скины | ✅ |
-| Белый список (`whitelist.txt`), операторы, баны | ✅ |
-| RCON (Source RCON, совместим с любым клиентом) | ✅ |
-| Discord-бот + веб-панель управления | ✅ |
-| Мастер первичной настройки (RU/EN) | ✅ |
-| Автосохранение, корректное сохранение при закрытии окна | ✅ |
-| Логи с ротацией (15 последних), защита от крашей | ✅ |
-| MiniEdit — быстрые операции с регионами блоков | ✅ |
-| Мобы: спавн и базовый набор | 🚧 |
-| Мобы: полноценный ИИ и разнообразие | ❌ |
-| Крафт и печки | ❌ |
-| Незер, Энд, порталы между измерениями | ❌ |
-| Редстоун, механизмы, рельсовый транспорт | ❌ |
-| Зачарование, зельеварение | ❌ |
+Full list: [`license/CHANGELOG_EN.md`](license/CHANGELOG_EN.md).
 
 ---
 
-## Требования
+## Features
 
-- **Windows 10/11 x64** или **Linux x64**
-- Компилятор с полной поддержкой C++20: **MSVC 2022** (17.10+) или GCC 13+/Clang 17+
-- **CMake 3.20+** и **Ninja**
-- **Node.js 18+** — только если нужны Discord-бот и веб-панель
+Legend: ✅ works · 🚧 partial / buggy · ❌ not yet
+
+| Area | State |
+|------|-------|
+| Protocol 1.21.1 (767): handshake, status, play | ✅ |
+| Online/offline mode, encryption, packet compression | ✅ |
+| Vanilla world generation (cubiomes), vanilla-matching seeds | ✅ |
+| Anvil format: read and write regions/chunks | ✅ |
+| Block physics, fluids, tick-based updates | ✅ |
+| Inventory, items, game modes | ✅ |
+| Mining: block hardness, tool speed, durability | ✅ |
+| Armor, equipment, combat vs players/mobs | 🚧 |
+| Chat, system messages, tab list, skins | ✅ |
+| Whitelist (`whitelist.txt`), operators, bans | ✅ |
+| RCON (Source RCON, works with any client) | ✅ |
+| Discord bot + web control panel | ✅ |
+| First-run setup wizard (RU/EN) | ✅ |
+| Auto-save, safe save on window close | ✅ |
+| Rotating logs (last 15), crash protection | ✅ |
+| MiniEdit — fast bulk region block ops | ✅ |
+| Mobs: spawning and a basic set | 🚧 |
+| Mobs: full AI and variety | ❌ |
+| Crafting and furnaces | ❌ |
+| Nether, End, inter-dimension portals | ❌ |
+| Redstone, mechanisms, rail transport | ❌ |
+| Enchanting, brewing | ❌ |
 
 ---
 
-## Сборка
+## Requirements
+
+- **Windows 10/11 x64** or **Linux x64**
+- A compiler with full C++20 support: **MSVC 2022** (17.10+) or GCC 13+/Clang 17+
+- **CMake 3.20+** and **Ninja**
+- **Node.js 18+** — only if you want the Discord bot and web panel
+
+---
+
+## Building
 
 ### Windows (MSVC + Ninja)
 
-Из «x64 Native Tools Command Prompt for VS 2022»:
+From the "x64 Native Tools Command Prompt for VS 2022":
 
 ```bat
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Готовый `zevvoryn.exe` кладите в отдельную папку — рядом с ним сервер создаст
-`settings.properties`, `world/`, `logs/` и `DiscrordBotRcon/`.
+Put the resulting `zevvoryn.exe` in its own folder — next to it the server will
+create `settings.properties`, `world/`, `logs/` and `DiscrordBotRcon/`.
 
 ### Linux
 
@@ -133,218 +139,224 @@ cmake --build build
 
 ---
 
-## Первый запуск
+## First run
 
-При первом старте (когда `settings.properties` ещё нет) включается мастер настройки:
-язык, порт, режим игры, сложность, дальность прорисовки, белый список, RCON,
-Discord-бот и веб-панель. Всё, что вы выберете, сохраняется в `settings.properties`,
-а для панели дополнительно создаётся `DiscrordBotRcon/.env`.
+On the first start (when there's no `settings.properties` yet) a setup wizard
+kicks in: language, port, game mode, difficulty, view distance, whitelist, RCON,
+Discord bot and web panel. Everything you pick is saved to
+`settings.properties`, and a `DiscrordBotRcon/.env` is created for the panel.
 
-Дальше сервер стартует обычным образом:
+After that the server starts normally:
 
 ```
-zevvoryn.exe                       # конфиг по умолчанию
-zevvoryn.exe my-settings.properties  # свой файл конфигурации
+zevvoryn.exe                          # default config
+zevvoryn.exe my-settings.properties   # custom config file
 ```
 
 ---
 
-## Настройки (`settings.properties`)
+## Configuration (`settings.properties`)
 
-Формат — обычные `ключ=значение`, как в PocketMine/PMMP.
+Plain `key=value`, like PocketMine/PMMP.
 
 ```properties
-# ── Сервер ──
-language=rus              # rus | eng — язык логов и сообщений
+# ── Server ──
+language=eng             # rus | eng — language of logs and messages
 motd=Zevvoryn Server
 server-port=25565
 max-players=80
 view-distance=16
 simulation-distance=8
 
-# ── Мир ──
+# ── World ──
 level-name=world
-level-type=DEFAULT        # DEFAULT | FLAT | VOID
-level-seed=0              # 0 = случайный
+level-type=DEFAULT       # DEFAULT | FLAT | VOID
+level-seed=0             # 0 = random
 
-# ── Геймплей ──
+# ── Gameplay ──
 gamemode=creative
-difficulty=2              # 0 мирная … 3 хардкор
+difficulty=2             # 0 peaceful … 3 hard
 pvp=true
 spawn-protection=16
 
-# ── Доступ ──
+# ── Access ──
 online-mode=false
-white-list=false          # список ников — в whitelist.txt
+white-list=false         # player names go in whitelist.txt
 
 # ── RCON ──
 enable-rcon=true
 rcon.port=25575
-rcon.password=смените_меня
+rcon.password=change_me
 rcon.max-clients=4
 
-# ── Панель ──
-auto-start-panel=true     # поднимать Discord-бота/веб-панель вместе с сервером
+# ── Panel ──
+auto-start-panel=true    # launch the Discord bot / web panel with the server
 ```
 
-> **Важно:** пароль RCON задаётся **только здесь**. Файл `DiscrordBotRcon/.env`
-> сервер синхронизирует сам при каждом запуске — руками его править не нужно.
+> **Important:** the RCON password is set **only here**. The server syncs
+> `DiscrordBotRcon/.env` on every start — don't edit it by hand.
 
 ---
 
-## Команды консоли
+## Console commands
 
 ```
-help                      справка
-list                      кто онлайн
-say <текст>               сообщение от консоли
-gamemode <0-3> [ник]      сменить режим (или gm0..gm3)
-give <ник> <предмет>      выдать предмет
-tp <ник> <x> <y> <z>      телепорт
-spawn / setworldspawn     точка спавна
-time set <значение>       время суток
+help                      help
+list                      who is online
+say <text>                message from the console
+gamemode <0-3> [name]     change mode (or gm0..gm3)
+give <name> <item>        give an item
+tp <name> <x> <y> <z>     teleport
+spawn / setworldspawn     spawn point
+time set <value>          time of day
 weather <clear|rain|thunder>
-summon / mob / killall    мобы
-setblock <x> <y> <z> <блок>
-locate <структура>
-nether / end / overworld  переход по измерениям
+summon / mob / killall    mobs
+setblock <x> <y> <z> <block>
+locate <structure>
+nether / end / overworld  dimension switch
 whitelist <add|remove|on|off|list>
-kick <ник>
-save                      сохранить мир немедленно
-tps                       производительность
-reload                    мягкая перезагрузка конфига
-stop                      корректная остановка
+kick <name>
+save                      save the world now
+tps                       performance
+reload                    soft config reload
+stop                      graceful shutdown
 ```
 
-Те же команды доступны через RCON, Discord-бота и веб-панель.
+The same commands are available over RCON, the Discord bot and the web panel.
 
 ---
 
-## Белый список
+## Whitelist
 
-`whitelist.txt` рядом с сервером, по одному нику в строке:
+`whitelist.txt` next to the server, one name per line:
 
 ```
-# Белый список игроков
+# Player whitelist
 Notch
 Steve
 ```
 
-Включается через `white-list=true` или командой `whitelist on`.
+Enable it with `white-list=true` or the `whitelist on` command.
 
 ---
 
-## RCON, Discord-бот и веб-панель
+## RCON, Discord bot and web panel
 
-В комплекте идёт папка `DiscrordBotRcon` — Node.js-приложение, которое подключается
-к серверу по RCON и даёт два интерфейса: команды в Discord и веб-панель в браузере.
+The bundled `DiscrordBotRcon` folder is a Node.js app that connects to the
+server over RCON and offers two interfaces: Discord commands and a browser web
+panel.
 
 ```bash
 cd DiscrordBotRcon
 npm install
 ```
 
-При `auto-start-panel=true` сервер сам поднимает её вместе с `zevvoryn.exe`
-(и сам записывает актуальные RCON-порт и пароль в `.env`).
+With `auto-start-panel=true` the server launches it together with
+`zevvoryn.exe` (and writes the current RCON port and password into `.env`).
 
-| Переменная | Назначение |
-|------------|-----------|
-| `RCON_HOST`, `RCON_PORT`, `RCON_PASSWORD` | заполняются сервером автоматически |
-| `WEB_ENABLED` | `false` — выключить веб-панель (по умолчанию включена) |
-| `WEB_HOST`, `WEB_PORT` | адрес панели, по умолчанию `127.0.0.1:3000` |
-| `WEB_PASSWORD` | пароль на вход в панель |
-| `DISCORD_TOKEN`, `CLIENT_ID`, `GUILD_ID` | нужны только для Discord-бота |
-| `ADMIN_ROLE_ID`, `COMMAND_CHANNEL_ID` | ограничение прав в Discord |
+| Variable | Purpose |
+|----------|---------|
+| `RCON_HOST`, `RCON_PORT`, `RCON_PASSWORD` | filled in automatically by the server |
+| `WEB_ENABLED` | `false` — disable the web panel (enabled by default) |
+| `WEB_HOST`, `WEB_PORT` | panel address, default `127.0.0.1:3000` |
+| `WEB_PASSWORD` | panel login password |
+| `DISCORD_TOKEN`, `CLIENT_ID`, `GUILD_ID` | needed only for the Discord bot |
+| `ADMIN_ROLE_ID`, `COMMAND_CHANNEL_ID` | permission gating in Discord |
 
-Панель показывает состояние сервера, онлайн, белый список и даёт консоль в браузере:
-`http://127.0.0.1:3000`
+The panel shows server status, who's online, the whitelist, and gives you a
+console in the browser: `http://127.0.0.1:3000`
 
-Регистрация слэш-команд Discord (один раз):
+Register the Discord slash commands (once):
 
 ```bash
 npm run deploy
 ```
 
----
-
-## Логи и остановка
-
-- Логи пишутся в `logs/log-ДД.ММ.ГГ.log` (в английской локали — `ММ.ДД.ГГ`), хранятся 15 последних.
-- Правильная остановка — команда `stop`.
-- Закрытие окна крестиком тоже безопасно: сервер кикает игроков, сохраняет мир и данные
-  игроков и только потом завершается. Windows даёт закрывающемуся консольному приложению
-  около пяти секунд, поэтому при очень больших мирах предпочтительнее `stop`.
-- При выходе из системы или выключении компьютера сервер выставляет Windows
-  «причину блокировки завершения работы» и сохраняет мир без ограничения по времени.
-- После аварийного завершения сервер сообщит об этом при следующем запуске.
+> The web panel is HTTP only (no real TLS/HTTPS) and uses a single shared Basic
+> Auth password — fine for local/personal use, not meant to be exposed directly
+> to the internet.
 
 ---
 
-## Структура проекта
+## Logs and shutdown
+
+- Logs go to `logs/log-DD.MM.YY.log` (in the English locale — `MM.DD.YY`), the
+  last 15 are kept.
+- The proper way to stop is the `stop` command.
+- Closing the window with the X is also safe: the server kicks players, saves
+  the world and player data, and only then exits. Windows gives a closing
+  console app about five seconds, so for very large worlds prefer `stop`.
+- On sign-out or shutdown the server sets a Windows "shutdown block reason" and
+  saves the world with no time limit.
+- After a crash the server reports it on the next start.
+
+---
+
+## Project layout
 
 ```
-core/        конфиг, логи, RCON, whitelist, команды, MiniEdit, ядро сервера
-network/     TCP-сервер, соединения, сжатие
-protocol/    кодеки пакетов 1.21.1 и общие структуры
-entity/      игроки и мобы
-world/       чанки, генерация, биомы, формат Anvil
-registries/  реестры блоков, предметов, биомов
-crypto/      шифрование протокола
-utils/       NBT и вспомогательное
-data/        игровые данные Minecraft
-thirdparty/  cubiomes (ванильная генерация)
-tools/       смоук- и стресс-боты на Python
-DiscrordBotRcon/  Discord-бот и веб-панель (Node.js)
+core/        config, logs, RCON, whitelist, commands, MiniEdit, server core
+network/     TCP server, connections, compression
+protocol/    1.21.1 packet codecs and shared structures
+entity/      players and mobs
+world/       chunks, generation, biomes, Anvil format
+registries/  block, item and biome registries
+crypto/      protocol encryption
+utils/       NBT and helpers
+data/        Minecraft game data
+thirdparty/  cubiomes (vanilla generation)
+tools/       smoke and stress test bots in Python
+DiscrordBotRcon/  Discord bot and web panel (Node.js)
 ```
 
-Дополнительная документация: [`PHYSICS.md`](PHYSICS.md) — модель физики,
-[`MINIEDIT.md`](MINIEDIT.md) — операции с регионами блоков.
+Extra docs: [`PHYSICS.md`](PHYSICS.md) — the physics model,
+[`MINIEDIT.md`](MINIEDIT.md) — bulk region block operations.
 
 ---
 
-## Частые проблемы
+## Troubleshooting
 
-**Панель пишет «RCON: Отключено».**
-Проверьте, что в `settings.properties` стоит `enable-rcon=true` и непустой `rcon.password`
-(с пустым паролем удалённая консоль не запускается). В логе старта должна быть строка
-`Удалённая консоль слушает 0.0.0.0:25575`.
+**The panel says "RCON: Disconnected".**
+Check that `settings.properties` has `enable-rcon=true` and a non-empty
+`rcon.password` (the remote console won't start with an empty password). The
+startup log should contain `Remote console listening on 0.0.0.0:25575`.
 
-**Панель не открывается.**
-Порт по умолчанию — `3000`, адрес `http://127.0.0.1:3000`. Причину падения ищите в
-`DiscrordBotRcon/panel-crash.log`.
+**The panel won't open.**
+Default port is `3000`, address `http://127.0.0.1:3000`. Look for the crash
+cause in `DiscrordBotRcon/panel-crash.log`.
 
-**Автозапуск панели пропущен.**
-Нужен установленный Node.js в `PATH` и выполненный `npm install` в папке `DiscrordBotRcon`.
+**Panel auto-start was skipped.**
+You need Node.js on `PATH` and `npm install` run in the `DiscrordBotRcon` folder.
 
-**Клиент не видит сервер в локальной сети.**
-Откройте TCP-порт `25565` в брандмауэре Windows.
-
----
-
-## Дорожная карта
-
-- Крафт и печки
-- Порталы и переходы между Незером/Энд
-- Полноценный ИИ и разнообразие мобов
-- Генерация структур и деревень
-- Красный камень и механизмы
-- Вагонетки и транспорт
-- Расширение веб-панели (карта мира, графики TPS)
+**The client doesn't see the server on the LAN.**
+Open TCP port `25565` in the Windows firewall.
 
 ---
 
-## Лицензия
+## Roadmap
 
-Проект распространяется под **Zevvoryn Custom License v1.0** — см.
-[`license/LICENSE.txt`](license/LICENSE.txt). Коротко: использовать, изучать,
-модифицировать и форкать можно, но только с сохранением авторства и открытием
-исходников, и **без коммерческого распространения** без письменного разрешения.
-Сторонние компоненты и их лицензии перечислены в
+- Crafting and furnaces
+- Portals and travel between the Nether/End
+- Full mob AI and mob variety
+- Structure and village generation
+- Redstone and mechanisms
+- Minecarts and transport
+- Web panel extensions (world map, TPS graphs)
+
+---
+
+## License
+
+Distributed under the **Zevvoryn Custom License v1.0** — see
+[`license/LICENSE.txt`](license/LICENSE.txt). In short: you may use, study,
+modify and fork it, but only with attribution preserved and source disclosed,
+and **no commercial distribution** without written permission. Third-party
+components and their licenses are listed in
 [`license/THIRD-PARTY-NOTICES.txt`](license/THIRD-PARTY-NOTICES.txt)
-(в частности [cubiomes](https://github.com/Cubitect/cubiomes)).
+(notably [cubiomes](https://github.com/Cubitect/cubiomes)).
 
-Minecraft — товарный знак Mojang Studios. Проект не связан с Mojang Studios и Microsoft
-и не содержит их кода.
+Minecraft is a trademark of Mojang Studios. This project is not affiliated with
+Mojang Studios or Microsoft and contains none of their code.
 
 ---
 
