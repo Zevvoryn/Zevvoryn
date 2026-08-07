@@ -1,0 +1,100 @@
+Zevvoryn Custom License v1.0
+Copyright (c) 2026 xzz11222 and Zevvoryn contributors
+
+1. Scope
+This License applies to all source code, assets, documentation, and other
+files contained in this repository, except for third-party components listed
+in NOTICE.txt or THIRD-PARTY-NOTICES.txt. Third-party components remain
+subject to their own licenses.
+
+2. Permission
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of Zevvoryn ("the Software") to:
+  - use the Software;
+  - study the Software;
+  - modify the Software;
+  - create and distribute derivative works ("Forks");
+provided that all conditions of this License are satisfied.
+
+3. Attribution
+Any copy, Fork, or derivative work must:
+  - retain this License;
+  - retain all copyright notices;
+  - retain the NOTICE.txt file;
+  - clearly credit the original Zevvoryn project and its authors.
+No person may claim authorship of the original Zevvoryn code.
+
+4. Source Code Availability
+If you distribute the Software or any Fork in source or binary form, you must
+make the complete corresponding source code publicly available at no charge.
+The source code must include:
+  - all modifications;
+  - build files;
+  - scripts necessary to build the distributed version.
+
+5. Copyleft Requirement
+Every Fork and every derivative work must be distributed under this License or
+another license that:
+  - preserves every restriction and obligation of this License regarding
+    Zevvoryn-derived code;
+  - requires complete source code disclosure;
+  - prohibits commercial distribution without permission;
+  - requires attribution;
+  - requires all further derivative works to comply with these same
+    requirements.
+Additional permissions for newly written code may be granted only if they do
+not reduce or remove any restriction applying to Zevvoryn-derived code.
+No Fork may relicense or weaken the terms of this License for any portion
+derived from Zevvoryn.
+
+6. Non-Commercial Distribution
+Neither the Software nor any Fork or derivative work may be:
+  - sold;
+  - licensed for a fee;
+  - commercially distributed;
+  - included in paid software packages;
+  - sublicensed for commercial purposes;
+without prior written permission from the copyright holder(s).
+This restriction applies to the original Software, Forks, and all further
+derivative works.
+
+7. Donation-Supported Servers
+Using the Software or Forks on donation-supported Minecraft servers is
+permitted. Receiving voluntary donations, memberships, or cosmetic purchases
+related to operating a server does not, by itself, constitute commercial
+distribution of the Software.
+However, selling the Software itself, selling Forks, selling compiled builds,
+or charging specifically for access to the Software remains prohibited unless
+expressly authorized in writing by the copyright holder(s).
+
+8. No Closed-Source Forks
+You may not distribute any Fork or derivative work without making its complete
+corresponding source code publicly available. Private modifications that are
+not distributed are permitted.
+
+9. Third-Party Components
+Nothing in this License modifies or overrides the licenses of third-party
+software included with Zevvoryn. Those components remain under their
+respective licenses.
+
+10. Minecraft Trademark
+"Minecraft" is a trademark of Mojang Synergies AB and Microsoft. Zevvoryn is
+an independent, unofficial project and is not affiliated with, endorsed by, or
+sponsored by Mojang or Microsoft.
+
+11. Termination
+Any violation of this License immediately and automatically terminates all
+rights granted under it. Any continued use or distribution after termination
+constitutes copyright infringement unless permission is restored in writing by
+the copyright holder(s).
+
+12. Disclaimer of Warranty
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+13. Acceptance
+By using, modifying, or distributing the Software, you agree to the terms of
+this License.
