@@ -33,6 +33,15 @@ broadcast to other players so they see what you're wearing/holding.
 **Mob combat** — attacking mobs applies damage with the correct cooldown and
 wears down the weapon, the victim's shield, and the victim's armor.
 
+**Skins & capes** — `/skin <name>` lets an offline player wear any licensed
+nickname's skin, `/skin reset` restores their own; `/cape <id>` puts on an
+official minecraft.net cape, `/cape off` removes it, and `/capes` lists what's
+available. Skins and capes **only work with `online-mode=false`** — under
+`online-mode=true` capes are disabled on purpose, because handing minecraft.net
+capes to licensed accounts would violate the Minecraft EULA. If a cape is worn,
+the first `/skin reset` only warns; running it again within 15 seconds drops
+both the skin and the cape.
+
 ---
 
 ## 0.1.0 — Physics & server tooling (proof of concept)
