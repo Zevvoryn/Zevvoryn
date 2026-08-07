@@ -227,6 +227,28 @@ The same commands are available over RCON, the Discord bot and the web panel.
 
 ---
 
+## In-game player commands (skins & capes)
+
+Typed by players in chat:
+
+```
+/skin <name>              wear a licensed player's skin
+/skin reset               go back to your own skin
+/cape <id>                put on a minecraft.net cape
+/cape off                 take the cape off
+/capes                    list the available capes
+```
+
+> **Skins and capes only work when `online-mode=false`.** With
+> `online-mode=true` capes are disabled on purpose — handing official
+> minecraft.net capes to licensed accounts would violate the Minecraft EULA, so
+> the server refuses to. `/skin` lets an offline (cracked) player borrow the
+> skin of any licensed nickname; `/skin reset` restores their own. If you're
+> wearing a cape, the first `/skin reset` only warns — run it again within 15
+> seconds to drop both the skin and the cape.
+
+---
+
 ## Whitelist
 
 `whitelist.txt` next to the server, one name per line:

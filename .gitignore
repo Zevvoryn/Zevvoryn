@@ -84,3 +84,6 @@ Zevvoryn/
 src/CMakeLists.txt
 src/PHYSICS_PROGRESS.txt
 src/README.md
+
+# Пустой файл-заглушка, созданный по ошибке (не путать с каталогом .git)
+/git
