@@ -72,6 +72,26 @@ if ($installDir.Contains('%') -or $installDir.Contains('"') -or $installDir.Cont
     exit 1
 }
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+$installDriveRoot = [IO.Path]::GetPathRoot($installDir)
+try {
+    $freeBytes = [System.IO.DriveInfo]::new($installDriveRoot).AvailableFreeSpace
+} catch {
+    Say "Не удалось проверить свободное место на диске $installDriveRoot. Проверьте его вручную перед продолжением." "Could not check free space on $installDriveRoot. Check it manually before continuing."
+    throw
+}
+if ($freeBytes -lt 1GB) {
+    Say "Недостаточно места: нужно минимум 1 ГБ свободного места на диске $installDriveRoot." "Not enough space: at least 1 GB must be free on $installDriveRoot."
+    exit 1
+}
+if ($freeBytes -lt 5GB) {
+    $freeGiB = [math]::Round($freeBytes / 1GB, 1)
+    Say "Свободно только $freeGiB ГБ. Рекомендуется не менее 5 ГБ для сборки и тестов." "Only $freeGiB GB is free. At least 5 GB is recommended for building and testing."
+    $continueWithLowSpace = Ask 'Продолжить всё равно? [д/н]:' 'Continue anyway? [y/N]:'
+    if (($script:Language -eq 'en' -and $continueWithLowSpace -notmatch '^(y|yes)$') -or ($script:Language -eq 'ru' -and $continueWithLowSpace -notmatch '^(д|да|y|yes)$')) {
+        Say 'Установка остановлена.' 'Installation cancelled.'
+        exit 1
+    }
+}
 $sourceDir = Join-Path $installDir '.source'
 $buildDir = Join-Path $installDir '.build'
 
