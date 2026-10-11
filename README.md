@@ -16,6 +16,7 @@ No JVM. No JNI. No wrappers.
 
 </div>
 
+
 ---
 
 > ## ⚠️ This is an early alpha
@@ -128,15 +129,22 @@ create `settings.properties`, `world/`, `logs/` and `DiscrordBotRcon/`.
 
 ### Linux
 
-> **Not tested at all.** The Linux build has never been verified — it may not
-> even compile yet. Treat the steps below as a starting point, not a supported
-> path.
+Download the installer and run it in a terminal (Bash and an internet connection
+are required):
 
 ```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-./build/zevvoryn
+curl -fL https://raw.githubusercontent.com/Zevvoryn/Zevvoryn/main/install_linux.sh -o install_linux.sh
+bash install_linux.sh
 ```
+
+The installer lets you choose English or Russian, an installation folder
+(default: `Desktop/zevvoryn/release`), or open a folder picker. If CMake, a
+compiler, or required libraries are missing, it asks before installing system
+dependencies. After building, you can launch the server setup wizard right away
+or do it later. The install folder contains `run_server.sh` to start the server
+and `compile.sh` to rebuild it. Run the installer as a regular user; `sudo` is
+used only to install dependencies and only if you approve. Linux build and
+gameplay still need further verification.
 
 ---
 
@@ -387,4 +395,3 @@ Mojang Studios or Microsoft and contains none of their code.
 **GitHub:** https://github.com/Zevvoryn/Zevvoryn
 
 </div>
-
