@@ -143,6 +143,8 @@ powershell -ExecutionPolicy Bypass -File $installer
 `irm https://raw.githubusercontent.com/Zevvoryn/Zevvoryn/main/install_windows.ps1 | iex`.
 Перед прямым запуском удалённого скрипта сначала просмотрите его, если хотите
 проверить содержимое.
+На выбранном диске должно быть не менее 1 ГБ свободного места; для сборки и
+тестов рекомендуется 5 ГБ или больше.
 
 ### Linux
 
