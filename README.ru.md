@@ -103,8 +103,8 @@ Zevvoryn — самостоятельная реализация серверн�
 ## Требования
 
 - **Windows 10/11 x64** или **Linux x64**
-- Компилятор с полной поддержкой C++20: **MSVC 2022** (17.10+) или GCC 13+/Clang 17+
-- **CMake 3.20+** и **Ninja**
+- Компилятор с полной поддержкой C++23: **MSVC 2022** (17.10+) или GCC 13+/Clang 17+
+- **CMake 3.21+**; **Ninja** нужен только для ручной сборки Windows, установщикам не требуется
 - **Node.js 18+** — только если нужны Discord-бот и веб-панель
 
 ---
@@ -122,6 +122,27 @@ cmake --build build
 
 Готовый `zevvoryn.exe` кладите в отдельную папку — рядом с ним сервер создаст
 `settings.properties`, `world/`, `logs/` и `DiscrordBotRcon/`.
+
+#### Установщик PowerShell
+
+Откройте PowerShell, скачайте установщик с GitHub, проверьте его и запустите:
+
+```powershell
+$installer = "$env:TEMP\install_zevvoryn.ps1"
+Invoke-WebRequest "https://raw.githubusercontent.com/Zevvoryn/Zevvoryn/main/install_windows.ps1" -OutFile $installer
+notepad $installer
+powershell -ExecutionPolicy Bypass -File $installer
+```
+
+Установщик предложит выбрать русский или английский язык и папку, загрузит
+исходники и соберёт Release-версию x64. Если не хватает CMake или C++ Build Tools
+для Visual Studio 2022, он сначала спросит разрешение установить их через
+`winget` (комплект Visual Studio большой и может запросить подтверждение UAC).
+В папке появятся `run_server.bat` для запуска и `compile.bat` для пересборки.
+Можно запустить и одной командой:
+`irm https://raw.githubusercontent.com/Zevvoryn/Zevvoryn/main/install_windows.ps1 | iex`.
+Перед прямым запуском удалённого скрипта сначала просмотрите его, если хотите
+проверить содержимое.
 
 ### Linux
 
