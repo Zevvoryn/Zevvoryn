@@ -1,23 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
-SOURCE_DIR=""
-if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/CMakeLists.txt" ]]; then SOURCE_DIR="$SCRIPT_DIR"; fi
 LANGUAGE="ru"
 
 say() {
     if [[ "$LANGUAGE" == "en" ]]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi
-}
-
-get_target_name() {
-    local target
-    target="$(sed -nE 's/^[[:space:]]*add_executable[[:space:]]*\([[:space:]]*([[:alnum:]_.+-]+).*/\1/p' "$SOURCE_DIR/CMakeLists.txt" | head -n 1)"
-    if [[ -z "$target" ]]; then
-        say 'Не удалось определить имя серверной программы в CMakeLists.txt.' 'Could not determine the server executable name from CMakeLists.txt.'
-        exit 1
-    fi
-    printf '%s' "$target"
 }
 
 read_answer() {
@@ -30,46 +17,50 @@ read_answer() {
     REPLY="$answer"
 }
 
-printf '%s\n' '===== ZEVVORYN ====='
-printf '%s\n' 'Выберите язык / Select language:' '1) Русский / Russian' '2) English'
-read_answer 'Ваш выбор [1/2]: ' 'Choose [1/2]: '
-[[ "$REPLY" == "2" ]] && LANGUAGE="en"
-
 desktop="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
 if [[ -z "$desktop" || "$desktop" == "$HOME" ]]; then
     if [[ -d "$HOME/Рабочий стол" ]]; then desktop="$HOME/Рабочий стол"; else desktop="$HOME/Desktop"; fi
 fi
 DEFAULT_INSTALL="$desktop/zevvoryn/release"
 
-say '' ''
-say "Выберите путь установки (по умолчанию: [$DEFAULT_INSTALL]):" "Choose install path (default: [$DEFAULT_INSTALL]):"
-say '1) Умолчание' '1) Default'
-say '2) Ввести свой путь' '2) Enter a custom path'
-say '3) Открыть выбор папки (KDE/Dolphin)' '3) Open folder picker (KDE/Dolphin)'
-read_answer 'Ваш выбор [1/2/3]: ' 'Choose [1/2/3]: '
-case "$REPLY" in
-    2)
-        read_answer 'Введите полный путь установки: ' 'Enter the full install path: '
-        INSTALL_DIR="${REPLY/#\~/$HOME}"
-        ;;
-    3)
-        if command -v kdialog >/dev/null 2>&1; then
-            INSTALL_DIR="$(kdialog --getexistingdirectory "$desktop" 2>/dev/null || true)"
-            [[ -n "$INSTALL_DIR" ]] && INSTALL_DIR="$INSTALL_DIR/zevvoryn/release"
-        elif command -v zenity >/dev/null 2>&1; then
-            INSTALL_DIR="$(zenity --file-selection --directory --filename="$desktop/" 2>/dev/null || true)"
-            [[ -n "$INSTALL_DIR" ]] && INSTALL_DIR="$INSTALL_DIR/zevvoryn/release"
-        else
-            say 'Не найден KDE kdialog или zenity; введите путь вручную.' 'Neither KDE kdialog nor zenity is installed; enter the path manually.'
+while true; do
+    printf '%s\n' '===== ZEVVORYN ====='
+    printf '%s\n' 'Выберите язык / Select language:' '1) Русский / Russian' '2) English'
+    read_answer 'Ваш выбор [1/2]: ' 'Choose [1/2]: '
+    if [[ "$REPLY" == "2" ]]; then LANGUAGE="en"; else LANGUAGE="ru"; fi
+
+    say '' ''
+    say "Выберите путь установки (по умолчанию: [$DEFAULT_INSTALL]):" "Choose install path (default: [$DEFAULT_INSTALL]):"
+    say '1) Умолчание' '1) Default'
+    say '2) Ввести свой путь' '2) Enter a custom path'
+    say '3) Открыть выбор папки (KDE/Dolphin)' '3) Open folder picker (KDE/Dolphin)'
+    say '0) Назад к выбору языка' '0) Back to language selection'
+    read_answer 'Ваш выбор [0/1/2/3]: ' 'Choose [0/1/2/3]: '
+    case "$REPLY" in
+        0) continue ;;
+        2)
             read_answer 'Введите полный путь установки: ' 'Enter the full install path: '
             INSTALL_DIR="${REPLY/#\~/$HOME}"
-        fi
-        ;;
-    *) INSTALL_DIR="$DEFAULT_INSTALL" ;;
-esac
+            ;;
+        3)
+            if command -v kdialog >/dev/null 2>&1; then
+                INSTALL_DIR="$(kdialog --getexistingdirectory "$desktop" 2>/dev/null || true)"
+                [[ -n "$INSTALL_DIR" ]] && INSTALL_DIR="$INSTALL_DIR/zevvoryn/release"
+            elif command -v zenity >/dev/null 2>&1; then
+                INSTALL_DIR="$(zenity --file-selection --directory --filename="$desktop/" 2>/dev/null || true)"
+                [[ -n "$INSTALL_DIR" ]] && INSTALL_DIR="$INSTALL_DIR/zevvoryn/release"
+            else
+                say 'Не найден KDE kdialog или zenity; введите путь вручную.' 'Neither KDE kdialog nor zenity is installed; enter the path manually.'
+                read_answer 'Введите полный путь установки: ' 'Enter the full install path: '
+                INSTALL_DIR="${REPLY/#\~/$HOME}"
+            fi
+            ;;
+        *) INSTALL_DIR="$DEFAULT_INSTALL" ;;
+    esac
+    break
+done
 if [[ -z "${INSTALL_DIR:-}" ]]; then say 'Выбор папки отменён.' 'Folder selection was cancelled.'; exit 1; fi
 INSTALL_DIR="$(mkdir -p -- "$INSTALL_DIR" && cd -- "$INSTALL_DIR" && pwd)"
-BUILD_DIR="$INSTALL_DIR/.build"
 
 free_kib="$(df -Pk -- "$INSTALL_DIR" | awk 'NR == 2 { print $4 }')"
 if [[ ! "$free_kib" =~ ^[0-9]+$ ]]; then
@@ -84,98 +75,72 @@ if ((free_kib < minimum_kib)); then
 fi
 if ((free_kib < recommended_kib)); then
     free_gib="$(awk -v kib="$free_kib" 'BEGIN { printf "%.1f", kib / 1024 / 1024 }')"
-    say "Свободно только $free_gib ГБ. Для сборки и тестов рекомендуется не менее 5 ГБ." "Only $free_gib GB is free. At least 5 GB is recommended for building and testing."
+    say "Свободно только $free_gib ГБ. Для тестов рекомендуется не менее 5 ГБ." "Only $free_gib GB is free. At least 5 GB is recommended for testing."
     read_answer 'Продолжить всё равно? [1=да/2=нет]: ' 'Continue anyway? [1=yes/2=no]: '
     [[ "$REPLY" == "1" ]] || { say 'Установка остановлена.' 'Installation cancelled.'; exit 1; }
 fi
 
-pick_compiler() {
-    if [[ -n "${CXX:-}" ]] && command -v "$CXX" >/dev/null 2>&1; then
-        CXX_BIN="$(command -v "$CXX")"
-        return
-    fi
-    for candidate in c++ g++ clang++; do
-        if command -v "$candidate" >/dev/null 2>&1; then CXX_BIN="$(command -v "$candidate")"; return; fi
-    done
-    CXX_BIN=''
-}
-pick_compiler
-missing=()
-command -v cmake >/dev/null 2>&1 || missing+=(cmake)
-command -v make >/dev/null 2>&1 || missing+=(make)
-[[ -n "$CXX_BIN" ]] || missing+=(c++-compiler)
-if [[ -z "$SOURCE_DIR" ]]; then command -v git >/dev/null 2>&1 || missing+=(git); fi
-if ((${#missing[@]})); then
-    say 'Нужны cmake и компилятор C++23. Установить системные пакеты сейчас?' 'CMake and a C++23 compiler are required. Install the system packages now?'
-    read_answer 'Установить зависимости? [1=да/2=нет]: ' 'Install dependencies? [1=yes/2=no]: '
-    [[ "$REPLY" == "1" ]] || { say 'Установка остановлена; зависимости не установлены.' 'Installation stopped; no dependencies were installed.'; exit 1; }
-    if [[ -f /etc/arch-release ]] && command -v pacman >/dev/null 2>&1; then
-        sudo pacman -S --needed --noconfirm base-devel cmake zlib git
-    elif command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update
-        sudo apt-get install -y build-essential cmake zlib1g-dev git
-    elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y gcc-c++ cmake make zlib-devel git
-    elif command -v zypper >/dev/null 2>&1; then
-        sudo zypper --non-interactive install gcc-c++ cmake make zlib-devel git
-    else
-        say 'Не удалось определить менеджер пакетов; установите cmake, C++23 compiler, make и zlib-devel вручную.' 'Package manager not recognized; install cmake, a C++23 compiler, make, and zlib development files manually.'
-        exit 1
-    fi
+if [[ "$(uname -m)" != "x86_64" ]]; then
+    say 'Готовая сборка пока доступна только для Linux x86_64.' 'The prebuilt release is currently available for Linux x86_64 only.'
+    exit 1
 fi
-
-if [[ -z "$SOURCE_DIR" ]]; then
-    SOURCE_DIR="$INSTALL_DIR/.source"
-    if [[ ! -f "$SOURCE_DIR/CMakeLists.txt" ]]; then
-        source_tmp="$INSTALL_DIR/.source-download"
-        if [[ -e "$source_tmp" ]]; then
-            say "Папка загрузки уже существует: $source_tmp" "A source download folder already exists: $source_tmp"
-            exit 1
-        fi
-        say 'Загружаю исходники Zevvoryn с GitHub…' 'Downloading Zevvoryn sources from GitHub…'
-        if ! git clone --depth 1 https://github.com/Zevvoryn/Zevvoryn.git "$source_tmp"; then
-            if [[ -e "$source_tmp" ]]; then rm -rf -- "$source_tmp"; fi
-            if ! git clone --depth 1 https://github.com/xzz11222/Zevvoryn.git "$source_tmp"; then
-                if [[ -e "$source_tmp" ]]; then rm -rf -- "$source_tmp"; fi
-                say 'Не удалось загрузить исходники ни из одного репозитория.' 'Could not download sources from either repository.'
-                exit 1
-            fi
-        fi
-        if [[ ! -f "$source_tmp/CMakeLists.txt" ]]; then
-            say 'В загруженном репозитории не найден CMakeLists.txt.' 'The downloaded repository does not contain CMakeLists.txt.'
-            exit 1
-        fi
-        mv -- "$source_tmp" "$SOURCE_DIR"
-    fi
-fi
-
-pick_compiler
-if [[ -z "$CXX_BIN" ]] || ! "$CXX_BIN" -std=c++23 -x c++ -fsyntax-only - <<< 'int main() { return 0; }' >/dev/null 2>&1; then
-    say 'Компилятор по умолчанию не поддерживает C++23. Нужен GCC 13+ или Clang 17+.' 'The default compiler lacks C++23 support. GCC 13+ or Clang 17+ is required.'
+if ! command -v tar >/dev/null 2>&1 || { ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; }; then
+    say 'Нужны tar и curl или wget. Установите их и запустите установщик повторно.' 'tar and either curl or wget are required. Install them and rerun the installer.'
     exit 1
 fi
 
+download_dir="$(mktemp -d "$INSTALL_DIR/.zevvoryn-download.XXXXXX")"
+trap 'rm -rf -- "$download_dir"' EXIT
+archive="$download_dir/zevvoryn-linux-x86_64.tar.gz"
+release_url='https://github.com/Zevvoryn/Zevvoryn/releases/latest/download/zevvoryn-linux-x86_64.tar.gz'
 say '' ''
-say 'Собираю Zevvoryn; загружаются только недостающие пакеты сборки.' 'Building Zevvoryn; only missing build packages are downloaded.'
-TARGET_NAME="$(get_target_name)"
-cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CXX_COMPILER="$CXX_BIN" \
-    -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$INSTALL_DIR"
-cmake --build "$BUILD_DIR" --target "$TARGET_NAME" --parallel
+say 'Скачиваю готовую сборку Linux x86_64; компилятор не требуется.' 'Downloading the prebuilt Linux x86_64 release; no compiler is needed.'
+if command -v curl >/dev/null 2>&1; then
+    if ! curl -fL --progress-bar "$release_url" -o "$archive"; then
+        say 'Готовая Linux-сборка пока не опубликована или недоступна. Установщик не запускает долгую компиляцию; проверьте страницу релизов позже.' 'A prebuilt Linux release is not published or unavailable yet. The installer will not start a long source build; check the releases page later.'
+        exit 1
+    fi
+else
+    if ! wget --show-progress -O "$archive" "$release_url"; then
+        say 'Готовая Linux-сборка пока не опубликована или недоступна. Установщик не запускает долгую компиляцию; проверьте страницу релизов позже.' 'A prebuilt Linux release is not published or unavailable yet. The installer will not start a long source build; check the releases page later.'
+        exit 1
+    fi
+fi
+say 'Проверяю архив и устанавливаю сервер...' 'Checking the archive and installing the server...'
+tar -tzf "$archive" > "$download_dir/archive.list" || {
+    say 'Не удалось прочитать архив сборки.' 'Could not read the release archive.'
+    exit 1
+}
+grep -Fxq 'zevvoryn' "$download_dir/archive.list" || {
+    say 'В архиве не найден исполняемый файл zevvoryn.' 'The archive does not contain the zevvoryn executable.'
+    exit 1
+}
+tar -xzf "$archive" -C "$download_dir"
+install -m 755 "$download_dir/zevvoryn" "$INSTALL_DIR/.zevvoryn.new"
+mv -f -- "$INSTALL_DIR/.zevvoryn.new" "$INSTALL_DIR/zevvoryn"
 
 cat > "$INSTALL_DIR/run_server.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-cd -- "$INSTALL_DIR"
-exec "$INSTALL_DIR/$TARGET_NAME" "\$@"
+ROOT="\$(cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)"
+cd -- "\$ROOT"
+mkdir -p plugins/cpp plugins/luau plugins/jvm
+if [[ ! -f plugins/runtimes.json ]]; then
+    cat > plugins/runtimes.json <<'JSON'
+{
+  "schema_version": 1,
+  "notice": "Placeholder only: plugin runtimes are not implemented.",
+  "runtimes": {
+    "cpp": { "enabled": false },
+    "luau": { "enabled": false },
+    "jvm": { "enabled": false, "experimental": true }
+  }
+}
+JSON
+fi
+exec "\$ROOT/zevvoryn" "\$@"
 EOF
-cat > "$INSTALL_DIR/compile.sh" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-cmake --build "$BUILD_DIR" --target "$TARGET_NAME" --parallel
-EOF
-chmod 755 "$INSTALL_DIR/run_server.sh" "$INSTALL_DIR/compile.sh"
+chmod 755 "$INSTALL_DIR/run_server.sh"
 
 say '\nХотите настроить сервер сейчас?' '\nWould you like to configure the server now?'
 read_answer '1) Да  2) Нет: ' '1) Yes  2) No: '
@@ -187,8 +152,8 @@ fi
 
 printf '%s\n' '====== ZEVVORYN ======'
 if [[ "$LANGUAGE" == "en" ]]; then
-    printf 'Installation complete: %s\nRun with: %s/run_server.sh\nRecompile with: %s/compile.sh\n' "$INSTALL_DIR" "$INSTALL_DIR" "$INSTALL_DIR"
+    printf 'Installation complete: %s\nRun with: %s/run_server.sh\n' "$INSTALL_DIR" "$INSTALL_DIR"
 else
-    printf 'Установка завершена: %s\nЗапуск: %s/run_server.sh\nПересборка: %s/compile.sh\n' "$INSTALL_DIR" "$INSTALL_DIR" "$INSTALL_DIR"
+    printf 'Установка завершена: %s\nЗапуск: %s/run_server.sh\n' "$INSTALL_DIR" "$INSTALL_DIR"
 fi
 printf '%s\n' '====== ZEVVORYN ======'
