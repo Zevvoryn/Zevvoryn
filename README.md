@@ -107,8 +107,8 @@ Legend: ✅ works · 🚧 partial / buggy · ❌ not yet
 ## Requirements
 
 - **Windows 10/11 x64** or **Linux x64**
-- A compiler with full C++23 support: **MSVC 2022** (17.10+) or GCC 13+/Clang 17+
-- **CMake 3.21+**; **Ninja** is needed only for the manual Windows build, not the installers
+- A compiler with full C++23 support: **MSVC 2022** (17.10+) or GCC 13+/Clang 17+ (manual builds only)
+- **CMake 3.21+** and **Ninja** are needed only for manual builds
 - **Node.js 18+** — only if you want the Discord bot and web panel
 
 ---
@@ -138,14 +138,13 @@ notepad $installer
 powershell -ExecutionPolicy Bypass -File $installer
 ```
 
-It offers English or Russian and an installation folder, downloads the source,
-and builds a Release x64 executable. If CMake or Visual Studio 2022 C++ Build
-Tools are missing, it asks before installing them through `winget` (the Visual
-Studio toolchain is a large download and may request UAC approval). The output
-folder contains `run_server.bat` and `compile.bat`. You can also run the
-installer directly with `irm https://raw.githubusercontent.com/Zevvoryn/Zevvoryn/main/install_windows.ps1 | iex`; review the script first if you prefer not to execute a remote script directly.
+It offers English or Russian and an installation folder; enter `0` at the
+folder step to go back and change the language. It then downloads the
+prebuilt Windows x64 release; no compiler or build tools are required. The output
+folder contains `run_server.bat`. Rerun the installer to update. You can also run
+it directly with `irm https://raw.githubusercontent.com/Zevvoryn/Zevvoryn/main/install_windows.ps1 | iex`; review the script first if you prefer not to execute a remote script directly.
 The selected drive must have at least 1 GB free; 5 GB or more is recommended for
-builds and testing.
+testing.
 
 ### Linux
 
@@ -158,15 +157,13 @@ bash install_linux.sh
 ```
 
 The installer lets you choose English or Russian, an installation folder
-(default: `Desktop/zevvoryn/release`), or open a folder picker. If CMake, a
-compiler, or required libraries are missing, it asks before installing system
-dependencies. After building, you can launch the server setup wizard right away
-or do it later. The install folder contains `run_server.sh` to start the server
-and `compile.sh` to rebuild it. Run the installer as a regular user; `sudo` is
-used only to install dependencies and only if you approve. Linux build and
-gameplay still need further verification.
-The installation drive needs at least 1 GB free; 5 GB or more is recommended
-for builds and testing.
+(default: `Desktop/zevvoryn/release`), or open a folder picker; enter `0` to go
+back and change the language. It downloads a prebuilt Linux x86_64 release and
+does not compile source. A Linux release binary is not published yet, so the
+installer will explain this and stop rather than leave you waiting on a build.
+Once the asset is available, it will create `run_server.sh`; rerun the installer
+to update. The installation drive needs at least 1 GB free; 5 GB or more is
+recommended for testing.
 
 ---
 
