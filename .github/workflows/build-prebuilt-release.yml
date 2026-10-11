@@ -1,0 +1,94 @@
+name: Build prebuilt release binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to create (for example 0.2.1)
+        required: true
+        default: 0.2.1
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    container:
+      image: gcc:13-bullseye
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl make ninja-build tar zlib1g-dev
+          curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.30.5/cmake-3.30.5-linux-x86_64.tar.gz -o /tmp/cmake.tar.gz
+          mkdir -p /opt/cmake
+          tar -xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
+          /opt/cmake/bin/cmake --version
+          g++ --version
+      - name: Configure and build Linux x86_64 binary
+        run: |
+          /opt/cmake/bin/cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++
+          /opt/cmake/bin/cmake --build build --target zevvoryn --parallel 4
+          test -x build/zevvoryn
+          if ldd build/zevvoryn | grep -q 'not found'; then ldd build/zevvoryn; exit 1; fi
+          mkdir -p dist
+          tar -C build -czf dist/zevvoryn-linux-x86_64.tar.gz zevvoryn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zevvoryn-linux-x86_64
+          path: dist/zevvoryn-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Configure and build Windows x64 binary
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --target zevvoryn --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path build/Release/zevvoryn.exe)) { throw 'The Windows executable was not produced.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zevvoryn-windows-x86_64
+          path: build/Release/zevvoryn.exe
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zevvoryn-linux-x86_64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: zevvoryn-windows-x86_64
+          path: dist
+      - name: Publish prebuilt binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/zevvoryn-linux-x86_64.tar.gz dist/zevvoryn.exe --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Zevvoryn $RELEASE_TAG" \
+              --notes "Prebuilt x86_64 binaries for Windows and Linux. Source commit: $SOURCE_SHA."
+            gh release upload "$RELEASE_TAG" dist/zevvoryn-linux-x86_64.tar.gz dist/zevvoryn.exe --repo "$GITHUB_REPOSITORY"
+          fi
