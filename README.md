@@ -165,6 +165,8 @@ or do it later. The install folder contains `run_server.sh` to start the server
 and `compile.sh` to rebuild it. Run the installer as a regular user; `sudo` is
 used only to install dependencies and only if you approve. Linux build and
 gameplay still need further verification.
+The installation drive needs at least 1 GB free; 5 GB or more is recommended
+for builds and testing.
 
 ---
 
