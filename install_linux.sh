@@ -71,6 +71,24 @@ if [[ -z "${INSTALL_DIR:-}" ]]; then say 'Выбор папки отменён.'
 INSTALL_DIR="$(mkdir -p -- "$INSTALL_DIR" && cd -- "$INSTALL_DIR" && pwd)"
 BUILD_DIR="$INSTALL_DIR/.build"
 
+free_kib="$(df -Pk -- "$INSTALL_DIR" | awk 'NR == 2 { print $4 }')"
+if [[ ! "$free_kib" =~ ^[0-9]+$ ]]; then
+    say 'Не удалось проверить свободное место на диске; проверьте его вручную.' 'Could not check available disk space; check it manually.'
+    exit 1
+fi
+minimum_kib=$((1024 * 1024))
+recommended_kib=$((5 * 1024 * 1024))
+if ((free_kib < minimum_kib)); then
+    say 'Недостаточно места: нужно минимум 1 ГБ свободного места на диске установки.' 'Not enough space: at least 1 GB must be free on the installation drive.'
+    exit 1
+fi
+if ((free_kib < recommended_kib)); then
+    free_gib="$(awk -v kib="$free_kib" 'BEGIN { printf "%.1f", kib / 1024 / 1024 }')"
+    say "Свободно только $free_gib ГБ. Для сборки и тестов рекомендуется не менее 5 ГБ." "Only $free_gib GB is free. At least 5 GB is recommended for building and testing."
+    read_answer 'Продолжить всё равно? [1=да/2=нет]: ' 'Continue anyway? [1=yes/2=no]: '
+    [[ "$REPLY" == "1" ]] || { say 'Установка остановлена.' 'Installation cancelled.'; exit 1; }
+fi
+
 pick_compiler() {
     if [[ -n "${CXX:-}" ]] && command -v "$CXX" >/dev/null 2>&1; then
         CXX_BIN="$(command -v "$CXX")"
