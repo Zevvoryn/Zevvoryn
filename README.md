@@ -144,6 +144,8 @@ Tools are missing, it asks before installing them through `winget` (the Visual
 Studio toolchain is a large download and may request UAC approval). The output
 folder contains `run_server.bat` and `compile.bat`. You can also run the
 installer directly with `irm https://raw.githubusercontent.com/Zevvoryn/Zevvoryn/main/install_windows.ps1 | iex`; review the script first if you prefer not to execute a remote script directly.
+The selected drive must have at least 1 GB free; 5 GB or more is recommended for
+builds and testing.
 
 ### Linux
 
