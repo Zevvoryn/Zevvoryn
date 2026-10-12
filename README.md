@@ -2,8 +2,8 @@
 
 # Zevvoryn
 
-**A Minecraft: Java Edition 1.21.1 server in pure C++20.**
-No JVM. No JNI. No wrappers.
+**A Minecraft: Java Edition 1.21.1 server with a native C++ core.**
+Optional plugin runtimes: C++, Luau, and Java/JNI.
 
 [Русский](README.ru.md) · **English**
 
@@ -114,6 +114,21 @@ Legend: ✅ works · 🚧 partial / buggy · ❌ not yet
 ---
 
 ## Building
+
+### Plugin development
+
+Zevvoryn supports native C ABI plugins, an optional sandboxed Luau runtime, and
+an optional Java/JNI runtime. The runtime options are disabled by default and
+can be turned off at build time or in the server configuration. See the
+[English plugin guide](DevInfo/plugins/README.en.md) for setup, API, manifests,
+permissions, lifecycle, and security notes; the [Russian guide](DevInfo/plugins/README.ru.md)
+is also available. This update publishes documentation only; it does not include
+the plugin runtime source code.
+
+**Security:** native C++ and Java plugins execute trusted code inside the server
+process. Java permissions only restrict access through the Zevvoryn API; they do
+not sandbox Java code. Review plugin JARs and their full dependency trees for
+vulnerabilities such as Log4Shell. Luau is the sandboxed scripting option.
 
 ### Windows (MSVC + Ninja)
 
