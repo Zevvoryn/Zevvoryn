@@ -186,8 +186,21 @@ recommended for testing.
 
 On the first start (when there's no `settings.properties` yet) a setup wizard
 kicks in: language, port, game mode, difficulty, view distance, whitelist, RCON,
-Discord bot and web panel. Everything you pick is saved to
+Discord bot and web panel. Plugin-enabled builds also offer separate switches
+for C++, Luau, and Java/JVM plugins. Everything you pick is saved to
 `settings.properties`, and a `DiscrordBotRcon/.env` is created for the panel.
+
+On Linux, open a terminal in a dedicated server folder and run
+`./zevvoryn_server` (or use the generated `./run_server.sh` launcher). The
+first-run wizard appears in that terminal. `settings.properties` is created in
+the server folder when using the launcher; when running the binary directly,
+first-run setup writes it to the current working directory unless an existing
+config beside the executable takes precedence. Avoid launching from the source
+repository root if you do not want server files there. See the
+[plugin owner and developer guide](DevInfo/plugins/README.en.md) for package
+layout, runtime switches, permissions, and security. The public download in
+this documentation-only update does not add plugin runtime code; these plugin
+instructions apply to builds that include the corresponding runtime.
 
 After that the server starts normally:
 

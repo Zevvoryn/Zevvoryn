@@ -1,5 +1,41 @@
 # Zevvoryn Plugin System
 
+## For server owners
+
+On Linux, open a terminal in the server's installation folder and run
+`./zevvoryn_server`, or use the generated `./run_server.sh` launcher. The
+first-run setup wizard appears in that terminal. In a plugin-enabled build it asks whether to enable plugins,
+then lets you select C++, Luau, and Java/JVM independently; a runtime that was
+not compiled into the server cannot be enabled by a config switch alone.
+
+The Linux launcher sets the working directory to the installation folder, so
+`settings.properties` is created there. When launching a binary directly, an
+existing `settings.properties` beside it is preferred; if there is no such file
+yet, first-run setup saves to the current working directory. To keep generated
+worlds, logs, and configuration out of the source checkout, run the binary
+from a separate server folder.
+
+If the wizard has already run, change these keys in `settings.properties` and
+restart the server:
+
+```properties
+enable-plugins=true
+enable-cpp-plugins=false
+enable-luau-plugins=true
+enable-jvm-plugins=false
+```
+
+Put approved plugin packages in the matching runtime folder under the server
+installation (`plugins/cpp/<id>/`, `plugins/luau/<id>/`, or
+`plugins/jvm/<id>/`). The console reports each plugin's load result;
+`/plugins` lists statuses, `/reload` reloads, and `/stop` shuts down cleanly.
+Use only plugins you trust and review the security section before enabling
+native C++ or Java code.
+
+**Availability note:** this GitHub publication is documentation-only and does
+not add plugin runtime code to the public server binary. These instructions
+apply to builds that contain the corresponding plugin runtime.
+
 This guide documents the C++ C ABI, optional Luau VM, and optional Java/JNI
 runtimes. This documentation-only publication does not include their runtime
 source code. Runtime packages belong beside the installed server or in an
