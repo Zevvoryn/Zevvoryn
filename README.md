@@ -190,13 +190,16 @@ Discord bot and web panel. Plugin-enabled builds also offer separate switches
 for C++, Luau, and Java/JVM plugins. Everything you pick is saved to
 `settings.properties`, and a `DiscrordBotRcon/.env` is created for the panel.
 
-On Linux, open a terminal in a dedicated server folder and run
-`./zevvoryn_server` (or use the generated `./run_server.sh` launcher). The
-first-run wizard appears in that terminal. `settings.properties` is created in
-the server folder when using the launcher; when running the binary directly,
-first-run setup writes it to the current working directory unless an existing
-config beside the executable takes precedence. Avoid launching from the source
-repository root if you do not want server files there. See the
+On Linux, `bash install_linux.sh` installs the executable `zevvoryn` and creates
+an executable `run_server.sh` launcher in the selected server folder. Start it
+with `./run_server.sh`; the setup wizard appears in the terminal. The installer
+prints the exact folder and launch command when it finishes. The launcher starts
+the server with the installation folder as its working directory, so
+`settings.properties`, worlds, and logs stay there. If you run the binary
+directly, an existing config beside it takes precedence; otherwise first-run
+setup writes `settings.properties` in the current working directory. Avoid
+launching from the source repository root if you do not want server files there.
+See the
 [plugin owner and developer guide](DevInfo/plugins/README.en.md) for package
 layout, runtime switches, permissions, and security. The public download in
 this documentation-only update does not add plugin runtime code; these plugin

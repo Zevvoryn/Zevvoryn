@@ -2,9 +2,11 @@
 
 ## For server owners
 
-On Linux, open a terminal in the server's installation folder and run
-`./zevvoryn_server`, or use the generated `./run_server.sh` launcher. The
-first-run setup wizard appears in that terminal. In a plugin-enabled build it asks whether to enable plugins,
+The Linux Bash installer places the executable `zevvoryn` and an executable
+`run_server.sh` launcher in the chosen server folder. Start it with
+`./run_server.sh`; the first-run wizard appears in the terminal. The installer
+prints the exact install folder and launch command at the end. In a
+plugin-enabled build, the wizard asks whether to enable plugins,
 then lets you select C++, Luau, and Java/JVM independently; a runtime that was
 not compiled into the server cannot be enabled by a config switch alone.
 
